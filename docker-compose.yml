@@ -1,0 +1,11 @@
+services:
+  picnic-bot:
+    image: ghcr.io/${GITHUB_REPOSITORY}:latest
+    container_name: picnic-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - picnic-data:/app/data
+
+volumes:
+  picnic-data:
