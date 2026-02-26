@@ -376,6 +376,171 @@ Batch 3/5 ...
 - System prompt tuning
 - `ALLOWED_TELEGRAM_USER_IDS` access control
 
-### Phase 5 — Docs & deployment
+### Phase 5 — Deployment & docs
+- `Dockerfile`
+- `docker-compose.yml` (service snippet for the VPS)
+- `.github/workflows/deploy.yml` — `workflow_dispatch` CI/CD
 - `README.md` with setup instructions
-- Docker Compose file (optional)
+
+---
+
+## Deployment
+
+### Overview
+
+The bot uses **long polling** and exposes no inbound ports. No reverse proxy
+configuration is needed. The container simply needs outbound internet access
+(Telegram API + Picnic API + Anthropic API).
+
+The SQLite database lives in a named Docker volume mounted at `/app/data`.
+
+```
+VPS
+├── existing docker-compose (nginx-proxy + your other services)
+│
+└── picnic-meal-planner/
+    ├── docker-compose.yml      ← standalone, independent of nginx-proxy
+    ├── .env                    ← secrets, never committed
+    └── data/                   ← volume mount point for SQLite DB
+```
+
+### Dockerfile
+
+Multi-stage build using the official `uv` Docker image for fast, reproducible installs.
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=builder /app/.venv /app/.venv
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY pyproject.toml ./
+
+ENV PATH="/app/.venv/bin:$PATH"
+RUN mkdir -p /app/data
+
+ENTRYPOINT ["uv", "run"]
+CMD ["bot"]
+```
+
+Running the import script as a one-off (without restarting the bot):
+```bash
+docker compose run --rm picnic-bot import-history
+```
+
+### docker-compose.yml
+
+```yaml
+services:
+  picnic-bot:
+    image: ghcr.io/${GITHUB_REPOSITORY}:latest
+    container_name: picnic-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - picnic-data:/app/data
+
+volumes:
+  picnic-data:
+```
+
+No ports exposed — the bot is outbound-only (polling).
+
+### Environment file on VPS
+
+```
+/home/<user>/picnic-meal-planner/.env
+```
+
+Contains all secrets from the `.env.example` template. Never committed to git.
+Permissions should be `chmod 600 .env`.
+
+---
+
+## CI/CD
+
+### Strategy
+
+| Trigger | Action |
+|---------|--------|
+| Manual via `gh workflow run` (from Claude Code or GitHub UI) | Full deploy |
+| Manual SSH fallback | `docker compose pull && docker compose up -d` |
+
+There is no automatic deploy on push to `main` — deploys are always intentional.
+
+### GitHub Actions secrets required
+
+| Secret | Value |
+|--------|-------|
+| `VPS_HOST` | IP or hostname of the VPS |
+| `VPS_USER` | SSH user (e.g. `deploy`) |
+| `VPS_SSH_KEY` | Private key for SSH access |
+| `VPS_COMPOSE_DIR` | Absolute path to the compose directory on VPS |
+
+The workflow uses `GITHUB_TOKEN` (automatic) to push to `ghcr.io` — no extra registry secret needed.
+
+### `.github/workflows/deploy.yml`
+
+```yaml
+name: Build & Deploy
+
+on:
+  workflow_dispatch:           # trigger manually (e.g. gh workflow run deploy.yml)
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ${{ secrets.VPS_COMPOSE_DIR }}
+            docker compose pull
+            docker compose up -d
+            docker image prune -f
+```
+
+### Triggering from Claude Code
+
+```bash
+gh workflow run deploy.yml
+# Watch progress:
+gh run watch
+```
