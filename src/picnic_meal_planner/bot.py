@@ -65,16 +65,16 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     return _anthropic_client
 
 
-def _allowed_user_ids() -> set[int] | None:
+def _allowed_user_ids() -> set[int]:
     raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").strip()
-    if not raw:
-        return None  # allow everyone
     return {int(uid.strip()) for uid in raw.split(",") if uid.strip()}
 
 
 def _is_allowed(user_id: int) -> bool:
-    allowed = _allowed_user_ids()
-    return allowed is None or user_id in allowed
+    # Explicit opt-in required to allow all users (e.g. for local dev)
+    if os.getenv("ALLOW_ALL_USERS", "").lower() == "true":
+        return True
+    return user_id in _allowed_user_ids()
 
 
 async def _get_mcp_tools() -> list[dict]:
@@ -82,37 +82,15 @@ async def _get_mcp_tools() -> list[dict]:
     global _mcp_tools
     if _mcp_tools is not None:
         return _mcp_tools
-
-    # Import here to avoid circular imports and to defer Picnic auth
-    from .mcp_server import mcp  # noqa: PLC0415
-
-    tools = []
-    for tool_name, tool_fn in mcp._tool_manager._tools.items():  # type: ignore[attr-defined]
-        schema = tool_fn.parameters if hasattr(tool_fn, "parameters") else {}
-        tools.append(
-            {
-                "name": tool_name,
-                "description": tool_fn.description or "",
-                "input_schema": schema or {"type": "object", "properties": {}},
-            }
-        )
-    _mcp_tools = tools
+    from .mcp_server import get_tool_schemas  # noqa: PLC0415
+    _mcp_tools = get_tool_schemas()
     return _mcp_tools
 
 
 async def _call_mcp_tool(name: str, input_data: dict):
     """Dispatch a tool call to the MCP server in-process."""
-    from .mcp_server import mcp  # noqa: PLC0415
-
-    tool_fn = mcp._tool_manager._tools.get(name)  # type: ignore[attr-defined]
-    if tool_fn is None:
-        return {"error": f"Unknown tool: {name}"}
-    try:
-        result = await tool_fn.fn(**input_data)
-        return result
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("MCP tool %s raised an error", name)
-        return {"error": str(exc)}
+    from .mcp_server import call_tool  # noqa: PLC0415
+    return await call_tool(name, input_data)
 
 
 async def _run_claude(chat_id: int, user_text: str) -> str:
@@ -120,14 +98,13 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
     client = _get_anthropic_client()
     tools = await _get_mcp_tools()
 
-    history = _histories[chat_id]
-    history.append({"role": "user", "content": user_text})
+    # Work on a copy; only commit to canonical history on success so that a
+    # failed API call never leaves two consecutive "user" turns in the history.
+    messages = list(_histories[chat_id])
+    messages.append({"role": "user", "content": user_text})
 
-    # Keep history bounded
-    if len(history) > MAX_HISTORY_TURNS * 2:
-        history[:] = history[-(MAX_HISTORY_TURNS * 2):]
-
-    messages = list(history)
+    if len(messages) > MAX_HISTORY_TURNS * 2:
+        messages = messages[-(MAX_HISTORY_TURNS * 2):]
 
     while True:
         response = await client.messages.create(
@@ -174,8 +151,13 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
 # Command handlers
 # ---------------------------------------------------------------------------
 
+async def _reject_unauthorized(update: Update) -> None:
+    await update.message.reply_text("Sorry, you're not authorised to use this bot.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await update.message.reply_text(
         "Hi! I'm your family grocery and meal planning assistant.\n\n"
@@ -191,30 +173,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await _chat(update, context, "Let's plan meals for the week. What does the family feel like eating?")
 
 
 async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await _chat(update, context, "I'd like to do some grocery shopping. Can you help me search for products and manage the cart?")
 
 
 async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await _chat(update, context, "What groceries are we likely running low on based on our order history?")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await _chat(update, context, "Show me a summary of our recent grocery orders.")
 
 
 async def cmd_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
         return
     await _chat(update, context, "Show me what's currently in the Picnic cart.")
 
@@ -236,9 +223,9 @@ async def _chat(
 
     try:
         reply = await _run_claude(chat_id, message_text)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("Error running Claude for chat %d", chat_id)
-        reply = f"Sorry, something went wrong: {exc}"
+        reply = "Sorry, something went wrong. Please try again."
 
     # Telegram messages have a 4096 character limit
     for chunk in _split_message(reply):

@@ -8,8 +8,11 @@ Transport is selected via MCP_TRANSPORT env var:
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -84,8 +87,20 @@ async def remove_from_cart(product_id: str) -> dict:
 
 
 @mcp.tool()
-async def clear_cart() -> dict:
-    """Empty the entire Picnic cart."""
+async def clear_cart(confirm: bool = False) -> dict:
+    """Empty the entire Picnic cart.
+
+    Args:
+        confirm: Must be True to actually clear the cart. Returns a warning
+                 message otherwise, giving the user a chance to confirm first.
+    """
+    if not confirm:
+        return {
+            "warning": (
+                "This will remove ALL items from the cart. "
+                "Call clear_cart(confirm=True) to proceed."
+            )
+        }
     return await picnic.clear_cart()
 
 
@@ -202,6 +217,52 @@ async def get_reorder_due() -> list[dict]:
     async with db.get_db() as conn:
         all_stats = await db.get_all_product_stats(conn)
     return forecasting.get_reorder_due(all_stats)
+
+
+# ---------------------------------------------------------------------------
+# In-process helpers for bot.py
+# ---------------------------------------------------------------------------
+
+def get_tool_schemas() -> list[dict]:
+    """Return Anthropic-compatible tool schemas for all registered MCP tools.
+
+    Centralises access to FastMCP internals so bot.py stays free of private API
+    calls.  If FastMCP's internal structure changes the assertion below will
+    surface a clear error immediately rather than silently returning empty tools.
+    """
+    tool_manager = mcp._tool_manager  # noqa: SLF001
+    assert hasattr(tool_manager, "_tools"), (
+        "FastMCP internal API changed: ToolManager no longer has ._tools. "
+        "Update get_tool_schemas() in mcp_server.py."
+    )
+    schemas = []
+    for name, tool_fn in tool_manager._tools.items():  # noqa: SLF001
+        schema = getattr(tool_fn, "parameters", None) or {}
+        schemas.append(
+            {
+                "name": name,
+                "description": getattr(tool_fn, "description", "") or "",
+                "input_schema": schema or {"type": "object", "properties": {}},
+            }
+        )
+    return schemas
+
+
+async def call_tool(name: str, input_data: dict):
+    """Dispatch a tool call to the MCP server in-process."""
+    tool_manager = mcp._tool_manager  # noqa: SLF001
+    assert hasattr(tool_manager, "_tools"), (
+        "FastMCP internal API changed: ToolManager no longer has ._tools. "
+        "Update call_tool() in mcp_server.py."
+    )
+    tool_fn = tool_manager._tools.get(name)  # noqa: SLF001
+    if tool_fn is None:
+        return {"error": f"Unknown tool: {name}"}
+    try:
+        return await tool_fn.fn(**input_data)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("MCP tool %s raised an error", name)
+        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------

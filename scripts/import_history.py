@@ -4,7 +4,7 @@ Safe to run multiple times — already-imported deliveries are skipped via
 UNIQUE constraint on picnic_order_id.
 
 Usage:
-    uv run import-history
+    uv run python scripts/import_history.py
 
 Environment variables (from .env):
     IMPORT_BATCH_SIZE     — deliveries fetched per batch (default 10)
@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 
 # Ensure the src package is importable when run as a script
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -172,7 +171,7 @@ async def main() -> None:
 
         if i + batch_size < len(remaining):
             print(f"  [sleeping {delay_seconds}s]", flush=True)
-            time.sleep(delay_seconds)
+            await asyncio.sleep(delay_seconds)
         else:
             print()
 
