@@ -1,29 +1,42 @@
-"""Async query helpers for all database tables."""
+"""Async query helpers for all database tables.
+
+All public functions accept an :class:`~sqlalchemy.ext.asyncio.AsyncSession`
+as their first argument (conventionally named ``session``).  Obtain one via
+the :func:`get_db` context manager::
+
+    async with get_db() as session:
+        await upsert_product(session, product_dict)
+        await session.commit()
+
+Explicit ``await session.commit()`` calls are the caller's responsibility so
+that multiple writes can be batched into a single transaction.  The only
+exception is :func:`save_checkpoint`, which commits immediately because it is
+always the last write in a batch.
+"""
 
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-import aiosqlite
+from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from .schema import init_db
+from .engine import get_session_factory
+from .models import ImportCheckpoint, Order, OrderItem, Product
 
 
-def _db_path() -> str:
-    return os.getenv("DB_PATH", "data/picnic.db")
-
+# ---------------------------------------------------------------------------
+# Public context manager (re-exported here for backwards compat)
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def get_db():
-    """Async context manager that yields an open, initialised aiosqlite connection."""
-    async with aiosqlite.connect(_db_path()) as conn:
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await init_db(conn)
-        yield conn
+    """Async context manager that yields an open :class:`AsyncSession`."""
+    async with get_session_factory()() as session:
+        yield session
 
 
 def _now() -> str:
@@ -34,35 +47,47 @@ def _now() -> str:
 # Products
 # ---------------------------------------------------------------------------
 
-async def upsert_product(conn, product: dict) -> None:
-    await conn.execute(
-        """
-        INSERT INTO products (id, name, unit_price, unit_quantity, image_id, category, last_seen_at)
-        VALUES (:id, :name, :unit_price, :unit_quantity, :image_id, :category, :last_seen_at)
-        ON CONFLICT(id) DO UPDATE SET
-            name          = excluded.name,
-            unit_price    = excluded.unit_price,
-            unit_quantity = excluded.unit_quantity,
-            image_id      = excluded.image_id,
-            category      = excluded.category,
-            last_seen_at  = excluded.last_seen_at
-        """,
-        {
-            "id": product["id"],
-            "name": product.get("name", ""),
-            "unit_price": product.get("unit_price"),
-            "unit_quantity": product.get("unit_quantity"),
-            "image_id": product.get("image_id"),
-            "category": product.get("category"),
-            "last_seen_at": _now(),
-        },
+async def upsert_product(session: AsyncSession, product: dict) -> None:
+    """Insert or update a product row (keyed on ``product["id"]``)."""
+    stmt = (
+        sqlite_insert(Product)
+        .values(
+            id=product["id"],
+            name=product.get("name", ""),
+            unit_price=product.get("unit_price"),
+            unit_quantity=product.get("unit_quantity"),
+            image_id=product.get("image_id"),
+            category=product.get("category"),
+            last_seen_at=_now(),
+        )
+        .on_conflict_do_update(
+            index_elements=["id"],
+            set_=dict(
+                name=product.get("name", ""),
+                unit_price=product.get("unit_price"),
+                unit_quantity=product.get("unit_quantity"),
+                image_id=product.get("image_id"),
+                category=product.get("category"),
+                last_seen_at=_now(),
+            ),
+        )
     )
+    await session.execute(stmt)
 
 
-async def get_product(conn, product_id: str) -> dict | None:
-    async with conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)) as cur:
-        row = await cur.fetchone()
-        return dict(row) if row else None
+async def get_product(session: AsyncSession, product_id: str) -> dict | None:
+    row = await session.get(Product, product_id)
+    if row is None:
+        return None
+    return {
+        "id": row.id,
+        "name": row.name,
+        "unit_price": row.unit_price,
+        "unit_quantity": row.unit_quantity,
+        "image_id": row.image_id,
+        "category": row.category,
+        "last_seen_at": row.last_seen_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +95,7 @@ async def get_product(conn, product_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def insert_order(
-    conn,
+    session: AsyncSession,
     *,
     picnic_order_id: str | None = None,
     ordered_at: str,
@@ -78,88 +103,114 @@ async def insert_order(
     total_price: int | None = None,
     notes: str | None = None,
 ) -> int:
-    """Insert an order and return its local id."""
-    cur = await conn.execute(
-        """
-        INSERT OR IGNORE INTO orders (picnic_order_id, ordered_at, delivered_at, total_price, notes)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (picnic_order_id, ordered_at, delivered_at, total_price, notes),
+    """Insert an order and return its local integer id.
+
+    If *picnic_order_id* is provided and a row with that value already exists
+    (UNIQUE constraint), the existing row's id is returned without modifying
+    the row.
+    """
+    if picnic_order_id is not None:
+        stmt = (
+            sqlite_insert(Order)
+            .values(
+                picnic_order_id=picnic_order_id,
+                ordered_at=ordered_at,
+                delivered_at=delivered_at,
+                total_price=total_price,
+                notes=notes,
+            )
+            .on_conflict_do_nothing(index_elements=["picnic_order_id"])
+        )
+        result = await session.execute(stmt)
+        if result.rowcount:
+            return result.inserted_primary_key[0]
+        # Row already existed — fetch and return the existing id.
+        existing_id = await session.scalar(
+            select(Order.id).where(Order.picnic_order_id == picnic_order_id)
+        )
+        return existing_id  # type: ignore[return-value]
+
+    # No picnic_order_id: always insert a new row.
+    order = Order(
+        ordered_at=ordered_at,
+        delivered_at=delivered_at,
+        total_price=total_price,
+        notes=notes,
     )
-    if cur.lastrowid:
-        return cur.lastrowid
-    # Row already existed (picnic_order_id conflict) — fetch the existing id
-    async with conn.execute(
-        "SELECT id FROM orders WHERE picnic_order_id = ?", (picnic_order_id,)
-    ) as c:
-        row = await c.fetchone()
-        return row["id"]
+    session.add(order)
+    await session.flush()  # populate order.id
+    return order.id
 
 
 async def insert_order_item(
-    conn,
+    session: AsyncSession,
     *,
     order_id: int,
     product_id: str,
     quantity: int,
     unit_price: int | None = None,
 ) -> None:
-    await conn.execute(
-        """
-        INSERT INTO order_items (order_id, product_id, quantity, unit_price)
-        VALUES (?, ?, ?, ?)
-        """,
-        (order_id, product_id, quantity, unit_price),
+    session.add(
+        OrderItem(
+            order_id=order_id,
+            product_id=product_id,
+            quantity=quantity,
+            unit_price=unit_price,
+        )
     )
 
 
 async def get_order_history(
-    conn, *, limit: int = 20, days_back: int | None = None
+    session: AsyncSession, *, limit: int = 20, days_back: int | None = None
 ) -> list[dict]:
-    """Return recent orders with their line items."""
-    params: list[Any] = []
-    where = ""
+    """Return recent orders with their line items, newest first."""
+    stmt = (
+        select(
+            Order.id,
+            Order.picnic_order_id,
+            Order.ordered_at,
+            Order.delivered_at,
+            Order.total_price,
+            Order.notes,
+            OrderItem.product_id,
+            OrderItem.quantity,
+            OrderItem.unit_price.label("item_price"),
+            Product.name.label("product_name"),
+        )
+        .outerjoin(OrderItem, OrderItem.order_id == Order.id)
+        .outerjoin(Product, Product.id == OrderItem.product_id)
+        .order_by(Order.ordered_at.desc())
+    )
     if days_back is not None:
-        where = "WHERE o.ordered_at >= datetime('now', ?)"
-        params.append(f"-{days_back} days")
+        stmt = stmt.where(
+            Order.ordered_at >= func.datetime("now", f"-{days_back} days")
+        )
+    # Over-fetch rows then group in Python (multiple rows per order for items).
+    stmt = stmt.limit(limit * 20)
 
-    query = f"""
-        SELECT
-            o.id, o.picnic_order_id, o.ordered_at, o.delivered_at, o.total_price, o.notes,
-            oi.product_id, oi.quantity, oi.unit_price as item_price,
-            p.name as product_name
-        FROM orders o
-        LEFT JOIN order_items oi ON oi.order_id = o.id
-        LEFT JOIN products p ON p.id = oi.product_id
-        {where}
-        ORDER BY o.ordered_at DESC
-        LIMIT ?
-    """
-    params.append(limit * 20)  # over-fetch rows, then group in Python
-
+    result = await session.execute(stmt)
     orders: dict[int, dict] = {}
-    async with conn.execute(query, params) as cur:
-        async for row in cur:
-            oid = row["id"]
-            if oid not in orders:
-                orders[oid] = {
-                    "id": oid,
-                    "picnic_order_id": row["picnic_order_id"],
-                    "ordered_at": row["ordered_at"],
-                    "delivered_at": row["delivered_at"],
-                    "total_price": row["total_price"],
-                    "notes": row["notes"],
-                    "items": [],
+    for row in result.all():
+        oid = row.id
+        if oid not in orders:
+            orders[oid] = {
+                "id": oid,
+                "picnic_order_id": row.picnic_order_id,
+                "ordered_at": row.ordered_at,
+                "delivered_at": row.delivered_at,
+                "total_price": row.total_price,
+                "notes": row.notes,
+                "items": [],
+            }
+        if row.product_id:
+            orders[oid]["items"].append(
+                {
+                    "product_id": row.product_id,
+                    "product_name": row.product_name,
+                    "quantity": row.quantity,
+                    "unit_price": row.item_price,
                 }
-            if row["product_id"]:
-                orders[oid]["items"].append(
-                    {
-                        "product_id": row["product_id"],
-                        "product_name": row["product_name"],
-                        "quantity": row["quantity"],
-                        "unit_price": row["item_price"],
-                    }
-                )
+            )
 
     return list(orders.values())[:limit]
 
@@ -168,116 +219,112 @@ async def get_order_history(
 # Product stats (for forecasting)
 # ---------------------------------------------------------------------------
 
-async def get_product_order_stats(conn, product_id: str) -> dict | None:
+async def get_product_order_stats(session: AsyncSession, product_id: str) -> dict | None:
     """Return order count, average quantity, and average interval (days) for a product."""
-    async with conn.execute(
-        """
-        SELECT
-            COUNT(*)          AS order_count,
-            AVG(oi.quantity)  AS avg_quantity,
-            MAX(o.ordered_at) AS last_ordered_at,
-            MIN(o.ordered_at) AS first_ordered_at
-        FROM order_items oi
-        JOIN orders o ON o.id = oi.order_id
-        WHERE oi.product_id = ?
-        """,
-        (product_id,),
-    ) as cur:
-        row = await cur.fetchone()
+    stmt = (
+        select(
+            func.count().label("order_count"),
+            func.avg(OrderItem.quantity).label("avg_quantity"),
+            func.max(Order.ordered_at).label("last_ordered_at"),
+            func.min(Order.ordered_at).label("first_ordered_at"),
+        )
+        .select_from(OrderItem)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(OrderItem.product_id == product_id)
+    )
+    row = (await session.execute(stmt)).one_or_none()
 
-    if not row or row["order_count"] == 0:
+    if row is None or row.order_count == 0:
         return None
 
-    order_count = row["order_count"]
-    avg_quantity = row["avg_quantity"]
-    last_ordered_at = row["last_ordered_at"]
-    first_ordered_at = row["first_ordered_at"]
-
     avg_interval: float | None = None
-    if order_count >= 2:
-        first = datetime.fromisoformat(first_ordered_at)
-        last = datetime.fromisoformat(last_ordered_at)
+    if row.order_count >= 2:
+        first = datetime.fromisoformat(row.first_ordered_at)
+        last = datetime.fromisoformat(row.last_ordered_at)
         span_days = (last - first).total_seconds() / 86400
-        avg_interval = span_days / (order_count - 1)
+        avg_interval = span_days / (row.order_count - 1)
 
     return {
         "product_id": product_id,
-        "order_count": order_count,
-        "avg_quantity": avg_quantity,
+        "order_count": row.order_count,
+        "avg_quantity": row.avg_quantity,
         "avg_interval_days": avg_interval,
-        "last_ordered_at": last_ordered_at,
+        "last_ordered_at": row.last_ordered_at,
     }
 
 
-async def get_frequently_ordered(conn, limit: int = 20) -> list[dict]:
+async def get_frequently_ordered(session: AsyncSession, limit: int = 20) -> list[dict]:
     """Return products ranked by order frequency."""
-    async with conn.execute(
-        """
-        SELECT
-            oi.product_id,
-            p.name,
-            COUNT(*)         AS order_count,
-            AVG(oi.quantity) AS avg_quantity,
-            MAX(o.ordered_at) AS last_ordered_at
-        FROM order_items oi
-        JOIN orders o  ON o.id  = oi.order_id
-        JOIN products p ON p.id = oi.product_id
-        GROUP BY oi.product_id
-        ORDER BY order_count DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ) as cur:
-        rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+    stmt = (
+        select(
+            OrderItem.product_id,
+            Product.name,
+            func.count().label("order_count"),
+            func.avg(OrderItem.quantity).label("avg_quantity"),
+            func.max(Order.ordered_at).label("last_ordered_at"),
+        )
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(Product, Product.id == OrderItem.product_id)
+        .group_by(OrderItem.product_id)
+        .order_by(func.count().desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [row._asdict() for row in rows]
 
 
-async def get_all_product_stats(conn) -> list[dict]:
+async def get_all_product_stats(session: AsyncSession) -> list[dict]:
     """Return stats for every product that has been ordered at least twice."""
-    async with conn.execute(
-        """
-        SELECT
-            oi.product_id,
-            p.name,
-            COUNT(*)          AS order_count,
-            AVG(oi.quantity)  AS avg_quantity,
-            MAX(o.ordered_at) AS last_ordered_at,
-            MIN(o.ordered_at) AS first_ordered_at
-        FROM order_items oi
-        JOIN orders o  ON o.id  = oi.order_id
-        JOIN products p ON p.id = oi.product_id
-        GROUP BY oi.product_id
-        HAVING order_count >= 2
-        """,
-    ) as cur:
-        rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+    stmt = (
+        select(
+            OrderItem.product_id,
+            Product.name,
+            func.count().label("order_count"),
+            func.avg(OrderItem.quantity).label("avg_quantity"),
+            func.max(Order.ordered_at).label("last_ordered_at"),
+            func.min(Order.ordered_at).label("first_ordered_at"),
+        )
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(Product, Product.id == OrderItem.product_id)
+        .group_by(OrderItem.product_id)
+        .having(func.count() >= 2)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [row._asdict() for row in rows]
 
 
 # ---------------------------------------------------------------------------
 # Import checkpoints
 # ---------------------------------------------------------------------------
 
-async def get_latest_checkpoint(conn) -> dict | None:
-    async with conn.execute(
-        "SELECT * FROM import_checkpoints ORDER BY id DESC LIMIT 1"
-    ) as cur:
-        row = await cur.fetchone()
-        return dict(row) if row else None
+async def get_latest_checkpoint(session: AsyncSession) -> dict | None:
+    row = await session.scalar(
+        select(ImportCheckpoint).order_by(ImportCheckpoint.id.desc()).limit(1)
+    )
+    if row is None:
+        return None
+    return {
+        "id": row.id,
+        "last_delivery_id": row.last_delivery_id,
+        "imported_at": row.imported_at,
+        "total_imported": row.total_imported,
+        "finished": row.finished,
+    }
 
 
 async def save_checkpoint(
-    conn,
+    session: AsyncSession,
     *,
     last_delivery_id: str | None,
     total_imported: int,
     finished: bool = False,
 ) -> None:
-    await conn.execute(
-        """
-        INSERT INTO import_checkpoints (last_delivery_id, imported_at, total_imported, finished)
-        VALUES (?, ?, ?, ?)
-        """,
-        (last_delivery_id, _now(), total_imported, int(finished)),
+    session.add(
+        ImportCheckpoint(
+            last_delivery_id=last_delivery_id,
+            imported_at=_now(),
+            total_imported=total_imported,
+            finished=int(finished),
+        )
     )
-    await conn.commit()
+    await session.commit()

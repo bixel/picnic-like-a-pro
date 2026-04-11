@@ -7,7 +7,9 @@ dependencies = [
     "mcp[cli]>=1.9",
     "anthropic>=0.40",
     "python-telegram-bot[ext]>=22",
+    "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
+    "alembic>=1.13",
     "python-dotenv>=1.0",
 ]
 

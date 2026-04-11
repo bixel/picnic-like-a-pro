@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 from .db import queries as db
+from .db.engine import init_db
 from .picnic import client as picnic
 from .forecasting import engine as forecasting
 
@@ -270,6 +271,10 @@ async def call_tool(name: str, input_data: dict):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import asyncio
+    asyncio.run(init_db())
+    logger.info("Database initialised.")
+
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "stdio":
         mcp.run(transport="stdio")
