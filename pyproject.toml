@@ -14,7 +14,8 @@ dependencies = [
 [project.scripts]
 bot = "picnic_meal_planner.bot:main"
 mcp-server = "picnic_meal_planner.mcp_server:main"
-import-history = "scripts.import_history:main"
+# import-history is a standalone script (not a package); run it directly:
+#   uv run python scripts/import_history.py
 
 [build-system]
 requires = ["hatchling"]
