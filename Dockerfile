@@ -20,6 +20,9 @@ RUN uv sync --frozen --group dev --no-install-project 2>/dev/null || uv sync --g
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY tests/ ./tests/
+# tests/test_migrations.py runs `alembic upgrade head` against a temp database.
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src:/app" \
@@ -39,6 +42,10 @@ COPY --from=builder /app/.venv /app/.venv
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY pyproject.toml ./
+# Required so `alembic upgrade head` — the documented production deploy step —
+# can be run inside the container.
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 
 ENV PATH="/app/.venv/bin:$PATH"
 RUN mkdir -p /app/data

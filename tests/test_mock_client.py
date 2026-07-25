@@ -151,7 +151,9 @@ class TestCartPersistence:
 
     def test_no_persist_path_does_not_write_files(self, api, tmp_path):
         api.add_product("p_milk_whole", count=1)
-        assert list(tmp_path.iterdir()) == []
+        # tmp_path also holds the isolated test database, so assert specifically
+        # that no cart file was written rather than that the directory is empty.
+        assert not list(tmp_path.glob("*cart*.json"))
 
 
 class TestDeliverySlots:

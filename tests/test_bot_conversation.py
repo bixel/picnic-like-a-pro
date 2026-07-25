@@ -318,6 +318,7 @@ class TestMain:
         app = MagicMock()
         builder = MagicMock()
         builder.token.return_value = builder
+        builder.post_init.return_value = builder
         builder.build.return_value = app
         monkeypatch.setattr(bot.Application, "builder", lambda: builder)
 
@@ -325,8 +326,46 @@ class TestMain:
 
         assert app.add_handler.call_count == 7   # 6 commands + 1 message handler
         app.run_polling.assert_called_once()
+        # The DB must be initialised on startup, before any update is handled.
+        builder.post_init.assert_called_once_with(bot._post_init)
 
     def test_missing_token_raises(self, monkeypatch):
         monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         with pytest.raises(KeyError):
             bot.main()
+
+
+class TestPostInit:
+    """The post_init hook is what creates the schema on a fresh deployment."""
+
+    async def test_creates_schema_on_a_fresh_database(self, tmp_path, monkeypatch):
+        from sqlalchemy import inspect
+
+        from picnic_meal_planner.db import engine as engine_mod
+
+        # Point at a database that has never been initialised.
+        fresh = tmp_path / "fresh.db"
+        monkeypatch.setenv("DB_PATH", str(fresh))
+        await engine_mod._engine.dispose()
+        engine_mod._engine = None
+        engine_mod._session_factory = None
+
+        await bot._post_init(MagicMock())
+
+        async with engine_mod.get_engine().connect() as conn:
+            tables = await conn.run_sync(lambda c: inspect(c).get_table_names())
+        assert {"products", "orders", "order_items"} <= set(tables)
+
+    async def test_is_safe_to_run_against_an_existing_database(self, db_path):
+        """Restarting the bot must not fail or wipe data."""
+        from picnic_meal_planner.db.models import Product
+        from picnic_meal_planner.db.queries import get_db
+
+        async with get_db() as session:
+            session.add(Product(id="p_survivor", name="Survivor"))
+            await session.commit()
+
+        await bot._post_init(MagicMock())
+
+        async with get_db() as session:
+            assert await session.get(Product, "p_survivor") is not None

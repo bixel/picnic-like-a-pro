@@ -160,42 +160,42 @@ class TestGetReorderDue:
 class TestFullPipelineWithSeededDB:
     """End-to-end: seeded DB → get_all_product_stats → forecasting engine."""
 
-    async def test_weekly_items_are_overdue(self, seeded_db_conn):
-        overdue = forecasting.get_reorder_due(await get_all_product_stats(seeded_db_conn))
+    async def test_weekly_items_are_overdue(self, seeded_db_session):
+        overdue = forecasting.get_reorder_due(await get_all_product_stats(seeded_db_session))
         ids = {r["product_id"] for r in overdue}
         assert {"p_milk_whole", "p_bread_whole", "p_bananas"} <= ids
 
-    async def test_monthly_items_not_overdue(self, seeded_db_conn):
-        overdue = forecasting.get_reorder_due(await get_all_product_stats(seeded_db_conn))
+    async def test_monthly_items_not_overdue(self, seeded_db_session):
+        overdue = forecasting.get_reorder_due(await get_all_product_stats(seeded_db_session))
         ids = {r["product_id"] for r in overdue}
         assert "p_olive_oil" not in ids
         assert "p_rice" not in ids
 
-    async def test_biweekly_items_in_14_day_forecast(self, seeded_db_conn):
+    async def test_biweekly_items_in_14_day_forecast(self, seeded_db_session):
         forecast = forecasting.forecast_products(
-            await get_all_product_stats(seeded_db_conn), horizon_days=14
+            await get_all_product_stats(seeded_db_session), horizon_days=14
         )
         ids = {r["product_id"] for r in forecast}
         assert "p_coffee" in ids
         assert "p_butter" in ids
 
-    async def test_one_time_items_excluded_from_stats(self, seeded_db_conn):
-        ids = {s["product_id"] for s in await get_all_product_stats(seeded_db_conn)}
+    async def test_one_time_items_excluded_from_stats(self, seeded_db_session):
+        ids = {s["product_id"] for s in await get_all_product_stats(seeded_db_session)}
         assert "p_tomato_sauce" not in ids
 
-    async def test_forecast_results_sorted_by_urgency(self, seeded_db_conn):
+    async def test_forecast_results_sorted_by_urgency(self, seeded_db_session):
         forecast = forecasting.forecast_products(
-            await get_all_product_stats(seeded_db_conn), horizon_days=7
+            await get_all_product_stats(seeded_db_session), horizon_days=7
         )
         scores = [f["urgency_score"] for f in forecast]
         assert scores == sorted(scores, reverse=True)
 
-    async def test_weekly_urgency_is_about_1_14(self, seeded_db_conn):
-        stats = {s["product_id"]: s for s in await get_all_product_stats(seeded_db_conn)}
+    async def test_weekly_urgency_is_about_1_14(self, seeded_db_session):
+        stats = {s["product_id"]: s for s in await get_all_product_stats(seeded_db_session)}
         milk = forecasting.compute_urgency(stats["p_milk_whole"])
         assert 1.0 <= milk["urgency_score"] <= 1.3
 
-    async def test_monthly_urgency_is_well_below_1(self, seeded_db_conn):
-        stats = {s["product_id"]: s for s in await get_all_product_stats(seeded_db_conn)}
+    async def test_monthly_urgency_is_well_below_1(self, seeded_db_session):
+        stats = {s["product_id"]: s for s in await get_all_product_stats(seeded_db_session)}
         oil = forecasting.compute_urgency(stats["p_olive_oil"])
         assert oil["urgency_score"] < 0.5

@@ -39,26 +39,25 @@ def _order_time(reference: datetime, order_index: int) -> str:
     return (reference - timedelta(days=days_ago)).isoformat()
 
 
-async def seed_database(conn, reference_time: datetime | None = None) -> None:
-    """Populate *conn* with the full catalog, 25 orders, and their line items.
+async def seed_database(session, reference_time: datetime | None = None) -> None:
+    """Populate *session* with the full catalog, 25 orders, and their line items.
 
-    Must be called with an open aiosqlite connection; commits before returning.
+    Takes an open SQLAlchemy ``AsyncSession``; commits before returning. The
+    tables are expected to exist already (the ``isolated_db`` fixture in
+    conftest.py runs ``init_db()`` for every test).
     """
     from picnic_meal_planner.db.queries import (
         insert_order,
         insert_order_item,
         upsert_product,
     )
-    from picnic_meal_planner.db.schema import init_db
-
-    await init_db(conn)
 
     now = reference_time or datetime.now(timezone.utc)
     price_lookup = {p["id"]: p["price"] for p in CATALOG}
 
     # Every catalog product is upserted so order_items FK constraints pass.
     for product in CATALOG:
-        await upsert_product(conn, {
+        await upsert_product(session, {
             "id": product["id"],
             "name": product["name"],
             "unit_price": product["price"],
@@ -76,7 +75,7 @@ async def seed_database(conn, reference_time: datetime | None = None) -> None:
         ]
 
         order_id = await insert_order(
-            conn,
+            session,
             picnic_order_id=f"mock_delivery_{i + 1:03d}",
             ordered_at=ordered_at,
             delivered_at=(datetime.fromisoformat(ordered_at) + timedelta(days=1)).isoformat(),
@@ -85,14 +84,14 @@ async def seed_database(conn, reference_time: datetime | None = None) -> None:
 
         for product_id, quantity in items:
             await insert_order_item(
-                conn,
+                session,
                 order_id=order_id,
                 product_id=product_id,
                 quantity=quantity,
                 unit_price=price_lookup[product_id],
             )
 
-    await conn.commit()
+    await session.commit()
 
 
 def product_ids_with_frequency(frequency: str) -> list[str]:
