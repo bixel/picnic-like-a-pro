@@ -1,10 +1,17 @@
 name: Tests
 
 on:
+  # Only main on push: branch pushes are already covered by pull_request, and
+  # listening to both would run every PR twice.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Supersede in-flight runs when a branch is pushed again.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
