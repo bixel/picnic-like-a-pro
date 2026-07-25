@@ -233,7 +233,11 @@ async def get_frequently_ordered(conn, limit: int = 20) -> list[dict]:
 
 
 async def get_all_product_stats(conn) -> list[dict]:
-    """Return stats for every product that has been ordered at least twice."""
+    """Return stats for every product that has been ordered at least twice.
+
+    avg_interval_days must be computed here: the forecasting engine reads it
+    directly off each row and skips any product where it is missing.
+    """
     async with conn.execute(
         """
         SELECT
@@ -242,7 +246,9 @@ async def get_all_product_stats(conn) -> list[dict]:
             COUNT(*)          AS order_count,
             AVG(oi.quantity)  AS avg_quantity,
             MAX(o.ordered_at) AS last_ordered_at,
-            MIN(o.ordered_at) AS first_ordered_at
+            MIN(o.ordered_at) AS first_ordered_at,
+            (julianday(MAX(o.ordered_at)) - julianday(MIN(o.ordered_at)))
+                / (COUNT(*) - 1) AS avg_interval_days
         FROM order_items oi
         JOIN orders o  ON o.id  = oi.order_id
         JOIN products p ON p.id = oi.product_id

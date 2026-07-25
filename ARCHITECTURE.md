@@ -79,9 +79,16 @@ the `MCP_TRANSPORT` env var (`stdio` / `sse` / `http`). Default is `stdio`.
 
 ```
 picnic-like-a-pro/
-├── pyproject.toml              # uv project + dependencies
+├── pyproject.toml              # uv project + deps + pytest/coverage config
 ├── .python-version             # Python 3.11
-├── .env.example                # Required env vars template
+├── .env.example                # Production env vars template
+├── .env.mock.example           # Mock environment template
+├── .env.test                   # Test environment (no secrets, committed)
+├── Makefile                    # Targets for all three environments
+├── Dockerfile                  # builder → test → runtime stages
+├── docker-compose.yml          # Production
+├── docker-compose.mock.yml     # Mock playground
+├── docker-compose.test.yml     # Automated tests + coverage
 ├── .gitignore
 │
 ├── src/
@@ -98,7 +105,8 @@ picnic-like-a-pro/
 │       │
 │       ├── picnic/
 │       │   ├── __init__.py
-│       │   └── client.py       # Thin wrapper around python-picnic-api2
+│       │   ├── client.py       # Thin wrapper around python-picnic-api2
+│       │   └── mock_client.py  # In-process fake Picnic API (PICNIC_MOCK=true)
 │       │
 │       └── forecasting/
 │           ├── __init__.py
@@ -108,9 +116,65 @@ picnic-like-a-pro/
 │   └── import_history.py       # Optional stepwise import of Picnic delivery
 │                               # history (resumable, rate-limit safe)
 │
+├── tests/
+│   ├── conftest.py             # Shared fixtures (mock client, isolated DBs)
+│   ├── fixtures/
+│   │   ├── history.py          # Seeds 25 orders over ~6 months
+│   │   └── conversations.py    # Standard usage scenarios
+│   ├── test_mock_client.py
+│   ├── test_picnic_client.py
+│   ├── test_db_queries.py
+│   ├── test_forecasting.py
+│   ├── test_mcp_tools.py
+│   ├── test_bot_helpers.py
+│   ├── test_bot_conversation.py
+│   └── test_conversations.py   # End-to-end scenario replays
+│
 └── data/
     └── .gitkeep                # DB file lives here (gitignored)
 ```
+
+---
+
+## Environments
+
+Three instances run in parallel, each an isolated Compose project with its own
+container, volume, and configuration. Only production ever reaches the real
+Picnic API.
+
+| | Production | Mock | Test |
+|---|---|---|---|
+| Compose file | `docker-compose.yml` | `docker-compose.mock.yml` | `docker-compose.test.yml` |
+| Compose project | `picnic-like-a-pro` | `picnic-mock` | `picnic-test` |
+| Container | `picnic-bot` | `picnic-bot-mock` | `picnic-test` |
+| Volume | `picnic-data` | `picnic-mock-data` | anonymous (ephemeral) |
+| Env file | `.env` | `.env.mock` | `.env.test` |
+| Picnic API | **real** | mocked | mocked |
+| Persistence | permanent | permanent | wiped on demand |
+| Telegram bot | production token | separate token | none |
+
+```bash
+make prod-up      # production
+make mock-up      # persistent playground (make mock-seed to load history)
+make test         # local suite + coverage
+make test-docker  # containerised suite, matches CI
+make mock-reset   # wipe the playground
+make test-docker-wipe   # wipe the test environment
+```
+
+### Mock mode
+
+`PICNIC_MOCK=true` swaps `PicnicAPI` for `MockPicnicAPI` inside
+`picnic/client.py`. Everything above that boundary — MCP tools, forecasting,
+bot, database — runs unmodified, so the mock exercises real application code
+paths. The mock provides ~50 Dutch grocery products, a stateful cart, delivery
+slots, and 25 weekly deliveries generated relative to the current date (most
+recent 8 days ago) so forecasts are always meaningful. `PICNIC_MOCK_PERSIST_CART`
+keeps the cart across restarts.
+
+No checkout API is exposed by either the real or the mock client, and the test
+suite's autouse fixture injects a fresh mock into every test, so tests cannot
+reach the network even if `PICNIC_MOCK` is unset.
 
 ---
 

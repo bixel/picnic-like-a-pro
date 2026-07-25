@@ -11,12 +11,23 @@ build/
 uv.lock
 
 # Environment
+# .env.test is committed on purpose: it holds no secrets and CI needs it.
 .env
+.env.mock
+.env.*.local
 
 # Data / DB
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/mock_cart.json
+
+# Test & coverage artefacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # IDE
 .idea/

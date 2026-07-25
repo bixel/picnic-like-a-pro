@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # PICNIC_MOCK keeps the suite off the real Picnic API. No credentials
+      # are needed and no checkout can be triggered.
+      - name: Run test suite with coverage
+        env:
+          PICNIC_MOCK: "true"
+          PICNIC_MOCK_PERSIST_CART: "false"
+        run: |
+          uv run pytest \
+            --cov=picnic_meal_planner \
+            --cov-report=term-missing \
+            --cov-report=html \
+            --cov-report=xml \
+            --junitxml=junit.xml
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            uv run coverage report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            htmlcov/
+            coverage.xml
+            junit.xml
