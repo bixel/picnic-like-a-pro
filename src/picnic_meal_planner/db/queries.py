@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +13,8 @@ from typing import Any
 import aiosqlite
 
 from .schema import init_db
+
+logger = logging.getLogger(__name__)
 
 
 def _db_path() -> str:
@@ -279,5 +284,188 @@ async def save_checkpoint(
         VALUES (?, ?, ?, ?)
         """,
         (last_delivery_id, _now(), total_imported, int(finished)),
+    )
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Conversation history
+#
+# Messages are grouped into turns: one turn is everything produced by a single
+# exchange, which for a tool-using turn is several messages. Deletion always
+# operates on whole turns — removing a lone message would leave a tool_result
+# with no matching tool_use, which the Anthropic API rejects.
+# ---------------------------------------------------------------------------
+
+async def load_conversation(
+    conn, chat_id: int, *, limit: int | None = None
+) -> list[dict]:
+    """Return stored messages oldest-first as {"role", "content"} dicts.
+
+    `limit` keeps the most recent N messages (still returned oldest-first).
+    """
+    query = "SELECT role, content FROM conversation_messages WHERE chat_id = ? ORDER BY id"
+    params: list[Any] = [chat_id]
+    if limit is not None:
+        query += " DESC LIMIT ?"
+        params.append(limit)
+
+    messages: list[dict] = []
+    async with conn.execute(query, params) as cur:
+        async for row in cur:
+            try:
+                content = json.loads(row["content"])
+            except (TypeError, ValueError):
+                # One unreadable row must not make the whole chat unusable.
+                logger.warning("Skipping unparseable message for chat %d", chat_id)
+                continue
+            messages.append({"role": row["role"], "content": content})
+
+    if limit is not None:
+        messages.reverse()
+    return messages
+
+
+async def append_turn(conn, chat_id: int, messages: list[dict]) -> int:
+    """Append one turn's messages under a fresh turn_id. Returns the turn_id."""
+    async with conn.execute(
+        "SELECT COALESCE(MAX(turn_id), 0) + 1 AS next FROM conversation_messages WHERE chat_id = ?",
+        (chat_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        turn_id = row["next"]
+
+    now = _now()
+    await conn.executemany(
+        """
+        INSERT INTO conversation_messages (chat_id, turn_id, role, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (chat_id, turn_id, m["role"], json.dumps(m["content"]), now)
+            for m in messages
+        ],
+    )
+    await conn.commit()
+    return turn_id
+
+
+async def list_turns(conn, chat_id: int) -> list[dict]:
+    """Summarise a chat's turns, oldest first, for a future "what can I delete?" view."""
+    async with conn.execute(
+        """
+        SELECT
+            turn_id,
+            MIN(created_at) AS started_at,
+            COUNT(*)        AS message_count,
+            MIN(id)         AS first_id
+        FROM conversation_messages
+        WHERE chat_id = ?
+        GROUP BY turn_id
+        ORDER BY first_id
+        """,
+        (chat_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    turns = []
+    for row in rows:
+        async with conn.execute(
+            "SELECT content FROM conversation_messages WHERE id = ?", (row["first_id"],)
+        ) as c:
+            first = await c.fetchone()
+        try:
+            content = json.loads(first["content"]) if first else ""
+        except (TypeError, ValueError):
+            content = ""
+        preview = content if isinstance(content, str) else ""
+        turns.append(
+            {
+                "turn_id": row["turn_id"],
+                "started_at": row["started_at"],
+                "message_count": row["message_count"],
+                "preview": preview[:120],
+            }
+        )
+    return turns
+
+
+async def delete_conversation(conn, chat_id: int) -> int:
+    """Delete all stored messages for a chat. Returns the number of rows removed."""
+    cur = await conn.execute(
+        "DELETE FROM conversation_messages WHERE chat_id = ?", (chat_id,)
+    )
+    await conn.commit()
+    return cur.rowcount
+
+
+async def delete_turns(conn, chat_id: int, turn_ids: Iterable[int]) -> int:
+    """Delete the named turns in full. Returns the number of rows removed."""
+    ids = list(turn_ids)
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    cur = await conn.execute(
+        f"DELETE FROM conversation_messages WHERE chat_id = ? AND turn_id IN ({placeholders})",
+        [chat_id, *ids],
+    )
+    await conn.commit()
+    return cur.rowcount
+
+
+async def delete_turns_in_range(
+    conn, chat_id: int, *, since: str | None = None, until: str | None = None
+) -> int:
+    """Delete every turn that *started* within [since, until).
+
+    Resolving the range to whole turns first — rather than deleting rows by
+    timestamp — is what keeps a turn straddling the boundary from being split.
+    """
+    conditions = []
+    params: list[Any] = [chat_id]
+    if since is not None:
+        conditions.append("MIN(created_at) >= ?")
+        params.append(since)
+    if until is not None:
+        conditions.append("MIN(created_at) < ?")
+        params.append(until)
+    having = f"HAVING {' AND '.join(conditions)}" if conditions else ""
+
+    async with conn.execute(
+        f"""
+        SELECT turn_id FROM conversation_messages
+        WHERE chat_id = ?
+        GROUP BY turn_id
+        {having}
+        """,
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+
+    return await delete_turns(conn, chat_id, [r["turn_id"] for r in rows])
+
+
+# ---------------------------------------------------------------------------
+# Chat settings
+# ---------------------------------------------------------------------------
+
+async def get_chat_settings(conn, chat_id: int) -> dict | None:
+    async with conn.execute(
+        "SELECT * FROM chat_settings WHERE chat_id = ?", (chat_id,)
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def set_chat_persist_history(conn, chat_id: int, enabled: bool) -> None:
+    await conn.execute(
+        """
+        INSERT INTO chat_settings (chat_id, persist_history, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            persist_history = excluded.persist_history,
+            updated_at      = excluded.updated_at
+        """,
+        (chat_id, int(enabled), _now()),
     )
     await conn.commit()

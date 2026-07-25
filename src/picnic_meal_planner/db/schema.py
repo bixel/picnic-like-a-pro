@@ -43,11 +43,45 @@ CREATE TABLE IF NOT EXISTS import_checkpoints (
 );
 """
 
+CREATE_CONVERSATION_MESSAGES = """
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,   -- Telegram chat id
+    turn_id    INTEGER NOT NULL,   -- groups all messages of one exchange; unit of deletion
+    role       TEXT    NOT NULL,   -- 'user' | 'assistant'
+    content    TEXT    NOT NULL,   -- JSON: a string, or a list of content blocks
+    created_at TEXT    NOT NULL    -- ISO datetime
+);
+"""
+
+CREATE_CONVERSATION_MESSAGES_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_chat
+    ON conversation_messages (chat_id, id);
+"""
+
+# Supports deleting everything from a given day, and turn lookups by time.
+CREATE_CONVERSATION_MESSAGES_TIME_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_time
+    ON conversation_messages (chat_id, created_at);
+"""
+
+CREATE_CHAT_SETTINGS = """
+CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id         INTEGER PRIMARY KEY,
+    persist_history INTEGER NOT NULL DEFAULT 1,  -- 0 = chat opted out of persistence
+    updated_at      TEXT    NOT NULL             -- ISO datetime
+);
+"""
+
 ALL_TABLES = [
     CREATE_PRODUCTS,
     CREATE_ORDERS,
     CREATE_ORDER_ITEMS,
     CREATE_IMPORT_CHECKPOINTS,
+    CREATE_CONVERSATION_MESSAGES,
+    CREATE_CONVERSATION_MESSAGES_INDEX,
+    CREATE_CONVERSATION_MESSAGES_TIME_INDEX,
+    CREATE_CHAT_SETTINGS,
 ]
 
 
