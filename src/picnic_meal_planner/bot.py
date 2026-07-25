@@ -25,6 +25,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+from .db.engine import init_db  # noqa: E402
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -246,11 +248,18 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def _post_init(app: Application) -> None:
+    """Ensure database tables exist before the bot starts handling messages."""
+    await init_db()
+    logger.info("Database initialised.")
+
+
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = (
         Application.builder()
         .token(token)
+        .post_init(_post_init)
         .build()
     )
 

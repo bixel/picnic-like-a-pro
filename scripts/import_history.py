@@ -26,10 +26,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from picnic_meal_planner.db import queries as db
+from picnic_meal_planner.db.engine import init_db
 from picnic_meal_planner.picnic import client as picnic
 
 
 async def main() -> None:
+    await init_db()
+
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
