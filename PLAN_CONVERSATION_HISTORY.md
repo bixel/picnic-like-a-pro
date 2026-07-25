@@ -3,28 +3,49 @@
 ## Implementation status — RESUME HERE
 
 Implementation was started and then paused partway through. **The feature is not
-live yet:** `bot.py` is untouched and still keeps history in the in-memory dict,
-so nothing behaves differently at runtime. The committed code is inert — no
-caller reaches it.
+live yet:** `bot.py` still keeps history in the in-memory dict, so nothing
+behaves differently at runtime. The DB layer is in place but inert — no caller
+reaches it.
+
+`main` has been merged in. It replaced the hand-written DDL with **SQLAlchemy
+2.0 ORM models + Alembic migrations**, so the DB layer below was rewritten to
+match; see *Architecture note* immediately after this table.
 
 | Step | Status | Notes |
 |---|---|---|
-| 1. `db/schema.py` tables | **Done** (`36126f8`) | `conversation_messages` + `chat_settings` + both indexes, appended to `ALL_TABLES`. Compiles; **never run against a real DB.** |
-| 2. `db/queries.py` helpers | **Done** (`36126f8`) | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history`. Compiles; **SQL is unexercised.** |
-| 3. `history.py` | **Not started** | The whole module: `normalize_content`, `is_turn_start`, `trim_history`, caching, `invalidate`, opt-out policy. |
-| 4. `bot.py` wiring | **Not started** | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`; `_post_init`. |
-| 5. `/forget` + `/privacy` | **Not started** | |
-| 6. `.env.example` | **Not started** | `MAX_HISTORY_TURNS`, `PERSIST_CONVERSATIONS`. |
-| 7. `ARCHITECTURE.md` | **Not started** | Line 60 ("stored in memory per `chat_id`") is now wrong. |
-| Tests | **Not started** | |
+| 1. `db/models.py` models | **Done, verified** | `ConversationMessage` + `ChatSettings` with both indexes. |
+| 2. `alembic/versions/0002_conversation_history.py` | **Done, verified** | Applies on top of `0001`; autogenerate reports no drift from the models. |
+| 3. `db/queries.py` helpers | **Done, verified** | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history` — all rewritten in SQLAlchemy and commit-neutral. |
+| 4. `history.py` | **Not started** | The whole module: `normalize_content`, `is_turn_start`, `trim_history`, caching, `invalidate`, opt-out policy. |
+| 5. `bot.py` wiring | **Not started** | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`. |
+| 6. `/forget` + `/privacy` | **Not started** | |
+| 7. `.env.example` | **Not started** | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
+| 8. Docs | **Not started** | `CLAUDE.md` ("Conversation history is kept **per chat_id in memory** … lost on restart") and `ARCHITECTURE.md:60` both go stale the moment step 5 lands. |
+| Tests | **Not started** | Port the throwaway round-trip script into `tests/`; see *Verification*. |
 
-**First thing to do on resume:** exercise the Step 2 SQL, since it has only ever
-been syntax-checked. A round-trip of `append_turn` → `load_conversation` plus a
-`delete_turns_in_range` against a scratch DB will confirm it before anything is
-built on top of it.
+Steps 1-3 were exercised against a real SQLite DB — turn round-trip, tool-block
+fidelity, turn-granular and range deletes, and the settings upsert all pass, and
+`alembic upgrade` and `metadata.create_all()` now produce byte-identical schemas.
+**Next step is `history.py` (step 4).**
 
-**Before resuming, rebase on `main`** — this branch was cut for that purpose. See
-the *Merge surface* section near the end for exactly where conflicts can occur.
+### Architecture note — what the `main` merge changed
+
+The plan below was written against the old hand-rolled `db/schema.py` +
+`aiosqlite` layer, which no longer exists. What actually got built:
+
+| Plan said | Now |
+|---|---|
+| DDL constants in `db/schema.py`, appended to `ALL_TABLES` | ORM models in `db/models.py`, plus an explicit Alembic migration |
+| `CREATE TABLE IF NOT EXISTS` on every connect | `alembic upgrade head` in production; `init_db()` (`create_all`) for fresh installs |
+| Helpers take a raw `conn`, some commit internally | Helpers take an `AsyncSession` named `session` and are **commit-neutral** — the caller owns the transaction (per the session contract in `CLAUDE.md`) |
+| Add `_post_init` to `bot.py` | Already there — `main` added it. Extend it rather than duplicating it |
+
+Consequence for step 4: every `history.py` call site is
+`async with get_db() as session: ... await session.commit()`. The deletion
+helpers no longer commit on their own, so `history.py` must commit explicitly.
+
+Schema changes from here follow the documented workflow: edit `db/models.py`,
+`uv run alembic revision --autogenerate -m "..."`, review, `uv run alembic upgrade head`.
 
 ## Context
 
@@ -72,90 +93,36 @@ So every message gets a `turn_id`, and deletion always operates on whole turns. 
 
 ---
 
-## Step 1 — `src/picnic_meal_planner/db/schema.py`
+## Steps 1-3 — the DB layer (DONE)
 
-Purely additive. `init_db()` already runs every statement in `ALL_TABLES` as `IF NOT EXISTS` on every connect, so existing DBs gain these on next connection — no migration framework, no downtime.
+Implemented and verified against a real SQLite DB. The original hand-written
+DDL is superseded by the SQLAlchemy + Alembic layer; read the code rather than
+a stale copy of it here.
 
-```python
-CREATE_CONVERSATION_MESSAGES = """
-CREATE TABLE IF NOT EXISTS conversation_messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id    INTEGER NOT NULL,   -- Telegram chat id
-    turn_id    INTEGER NOT NULL,   -- groups all messages from one exchange; unit of deletion
-    role       TEXT    NOT NULL,   -- 'user' | 'assistant'
-    content    TEXT    NOT NULL,   -- JSON: a string, or a list of content blocks
-    created_at TEXT    NOT NULL    -- ISO datetime (UTC)
-);
-"""
+- **`src/picnic_meal_planner/db/models.py`** — `ConversationMessage`
+  (`id`, `chat_id`, `turn_id`, `role`, `content` JSON-as-Text, `created_at`)
+  with `idx_conversation_messages_chat` on `(chat_id, id)` for sequential reads
+  and `idx_conversation_messages_time` on `(chat_id, created_at)` for day-range
+  deletes; and `ChatSettings` (`chat_id` PK, `persist_history`, `updated_at`).
+  Both docstrings state the turn-as-deletion-unit rule.
+- **`alembic/versions/0002_conversation_history.py`** — additive migration on
+  top of `0001`. Touches no existing table, so it is safe on a populated DB and
+  safe to roll back.
+- **`src/picnic_meal_planner/db/queries.py`** — `load_conversation`,
+  `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`,
+  `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history`.
 
-CREATE_CONVERSATION_MESSAGES_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_conversation_messages_chat
-    ON conversation_messages (chat_id, id);
-"""
+Two behaviours worth knowing before writing `history.py`:
 
--- supports "delete everything from day X" and turn-scoped deletes
-CREATE_CONVERSATION_MESSAGES_TIME_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_conversation_messages_time
-    ON conversation_messages (chat_id, created_at);
-"""
+- **Commit-neutral.** None of these commit; the caller does. This follows the
+  session contract in `CLAUDE.md` and lets `history.py` batch a delete and a
+  settings write into one transaction.
+- **`delete_turns_in_range` resolves the range to whole turns first** (via
+  `HAVING MIN(created_at) ...`), then deletes by `turn_id`. Deleting rows by
+  timestamp directly would split a turn straddling the boundary and orphan a
+  `tool_result`.
 
-CREATE_CHAT_SETTINGS = """
-CREATE TABLE IF NOT EXISTS chat_settings (
-    chat_id         INTEGER PRIMARY KEY,
-    persist_history INTEGER NOT NULL DEFAULT 1,  -- 0 = chat opted out
-    updated_at      TEXT    NOT NULL
-);
-"""
-```
-
-Append all four to `ALL_TABLES`. `content` holds the whole content value as JSON (a bare string for plain user text, or a list of block dicts) — nothing queries inside blocks, so per-block rows would be over-normalized.
-
-`turn_id` is per-chat and monotonic, assigned once per turn via `SELECT COALESCE(MAX(turn_id), 0) + 1 FROM conversation_messages WHERE chat_id = ?` inside the append transaction. One extra query per *turn*, not per message. It is deliberately not reused after deletion — gaps are fine and harmless.
-
-## Step 2 — `src/picnic_meal_planner/db/queries.py`
-
-New section at the bottom, following the existing style (take an open `conn`, `_now()` for timestamps, `ON CONFLICT ... DO UPDATE` like `upsert_product`). Write helpers commit, like `save_checkpoint`.
-
-```python
-async def load_conversation(conn, chat_id: int, *, limit: int | None = None) -> list[dict]:
-    """Return stored messages oldest-first as {"role", "content"} dicts.
-    `limit` keeps the most recent N rows (still returned oldest-first)."""
-
-async def append_turn(conn, chat_id: int, messages: list[dict]) -> int:
-    """Append one turn's messages under a fresh turn_id, in one transaction.
-    Returns the turn_id. Commits."""
-
-# --- deletion ---
-
-async def delete_conversation(conn, chat_id: int) -> int:
-    """Delete all stored messages for a chat. Returns rows deleted. Commits."""
-
-async def delete_turns(conn, chat_id: int, turn_ids: Iterable[int]) -> int:
-    """Delete the named turns in full. Returns rows deleted. Commits."""
-
-async def delete_turns_in_range(conn, chat_id: int, *, since: str | None,
-                                until: str | None) -> int:
-    """Delete every turn that *started* within [since, until) (ISO datetimes).
-    Whole turns only, so a turn straddling the boundary goes entirely.
-    Returns rows deleted. Commits."""
-
-async def list_turns(conn, chat_id: int) -> list[dict]:
-    """Summarise turns for a chat: turn_id, started_at, message_count, and the
-    first user message truncated as a preview. Backs a future delete UI."""
-
-# --- settings ---
-
-async def get_chat_settings(conn, chat_id: int) -> dict | None: ...
-async def set_chat_persist_history(conn, chat_id: int, enabled: bool) -> None:
-    """Upsert chat_settings.persist_history. Commits."""
-```
-
-- `load_conversation` with a limit: `... ORDER BY id DESC LIMIT ?` then reverse in Python (N ≤ 40).
-- `content` is `json.dumps`'d on write, `json.loads`'d on read. A row whose JSON fails to parse is **skipped with a log line, not raised** — one corrupt row must not brick a chat.
-- `delete_turns_in_range` resolves the range to a turn set first (`SELECT DISTINCT turn_id ... GROUP BY turn_id HAVING MIN(created_at) >= ? AND MIN(created_at) < ?`), then deletes by `turn_id`. Selecting rows by timestamp directly would slice a turn in half.
-- `list_turns` is the read side of partial deletion and costs nothing to add now; it's what a `/history` browser or `/forget <day>` would call.
-
-## Step 3 — new file `src/picnic_meal_planner/history.py`
+## Step 4 — new file `src/picnic_meal_planner/history.py` ← NEXT
 
 The only file that knows about policy. Nothing here imports `bot`.
 
@@ -248,7 +215,7 @@ Behaviour:
 - `is_persistence_enabled` — env check first (no I/O), then `_persist_flags` cache, then one `get_chat_settings` query. A missing row means enabled (default-on). Result cached.
 - **Fail-soft is deliberate.** `get_context` and `commit_turn` never raise: DB errors are logged and degrade to memory-only. `_chat()` already wraps `_run_claude` in a broad `except`; if these raised, an unwritable DB would kill every conversation instead of just losing persistence. Deletion functions *do* propagate errors — silently failing to delete when a user asked you to is the wrong default.
 
-## Step 4 — `src/picnic_meal_planner/bot.py`
+## Step 5 — `src/picnic_meal_planner/bot.py`
 
 Remove `from collections import defaultdict` (line 12), `MAX_HISTORY_TURNS` (line 50), and `_histories` (lines 52-53). Add `from . import history`.
 
@@ -290,7 +257,7 @@ async def _post_init(app: Application) -> None:
                 "on" if history._persistence_enabled_globally() else "off (kill-switch)")
 ```
 
-## Step 5 — opt-out and deletion commands in `bot.py`
+## Step 6 — opt-out and deletion commands in `bot.py`
 
 Both follow the existing handler shape (`_is_allowed` guard → `_reject_unauthorized`).
 
@@ -320,7 +287,7 @@ Register both in `main()` and add them to `cmd_start`'s help text. Turning persi
 
 Partial deletion (`/forget 2026-07-24`, or an interactive turn picker built on `list_turns`) is **not wired up now** — but `delete_day`, `delete_turns`, and `list_turns` exist and are tested, so adding the command later is a handler and nothing else.
 
-## Step 6 — `.env.example`
+## Step 7 — `.env.example`
 
 Under `# App config`:
 
@@ -332,7 +299,7 @@ PERSIST_CONVERSATIONS=true      # global kill-switch; false = in-memory only
 
 `MAX_HISTORY_TURNS` is already read by the code today but was never documented.
 
-## Step 7 — docs
+## Step 8 — docs
 
 Update `ARCHITECTURE.md`: the multi-user note at line 60 ("stored in memory per `chat_id`") is now wrong, and the schema section should gain the two new tables, the turn-as-deletion-unit rule, and the `/forget` + `/privacy` commands.
 
@@ -353,15 +320,63 @@ Worth stating plainly, since retention is unbounded by default:
 - **Multi-process.** The in-memory cache is per-process; a second replica would go stale, and `invalidate()` would only affect the local one. Single container today — note it in a comment in `history.py`.
 - **Rollback.** Purely additive DDL; reverting to the previous image simply ignores the new tables.
 
-## Merge surface (for re-applying after `main` moves)
+## Merge surface (for the next time `main` moves)
 
-`history.py` is new and cannot conflict. Conflicts are only possible in `bot.py` (lines 12, 50-53, 96-147, and `main()`), `ALL_TABLES` in `schema.py`, the bottom of `queries.py`, and the bottom of `.env.example`. If `main` rewrites `_run_claude`, re-application is mechanical: trim-then-append at the top, `normalize_content` on the assistant append, `commit_turn(chat_id, messages, new_from)` at the return.
+The SQLAlchemy/Alembic merge is done. What it cost, for calibration: `schema.py`
+was deleted upstream and `queries.py` conflicted, but the *design* survived
+untouched — only its expression in code changed. The turn model, the deletion
+semantics, and the truncation rules were unaffected.
+
+Remaining exposure, since steps 4-8 are still unwritten:
+
+- **`history.py`** is a new file and cannot conflict.
+- **`bot.py`** is the real risk — `_run_claude` and `main()`. If `main` rewrites
+  it, re-application is mechanical: trim-then-append at the top,
+  `normalize_content` on the assistant append, `commit_turn(chat_id, messages,
+  new_from)` at the return, and register the two commands.
+- **`db/models.py` + a new Alembic revision** if the schema needs to change
+  again. If someone else adds `0003`, renumber rather than branching the
+  migration history.
+- **`queries.py`** — the conversation section is appended at the end, which is
+  the lowest-conflict position available.
 
 ---
 
 ## Verification
 
-**Manual end-to-end (the real acceptance test).** Point `DB_PATH` at a scratch file, start the bot.
+### Already done (steps 1-3, the DB layer)
+
+Exercised against a real SQLite DB with a throwaway script, not committed. All
+passed; port these assertions into `tests/` when the test harness lands:
+
+- `alembic upgrade head` applies `0001` → `0002` cleanly.
+- `alembic revision --autogenerate` produces an **empty** migration — the models
+  and `0002` agree.
+- `alembic upgrade head` and `init_db()`/`create_all` produce byte-identical
+  schemas for both new tables. (This initially differed: the migration had
+  `server_default="1"` on `persist_history` where the model had only a
+  Python-side `default=1`. Fixed by adding `server_default` to the model.)
+- `append_turn` → `load_conversation` round-trips a tool-using turn **unchanged**,
+  including `tool_use` blocks and their nested `input` dicts.
+- Turn ids are monotonic per chat; `load_conversation(limit=N)` returns the most
+  recent N, oldest-first.
+- `list_turns` groups correctly, counts messages per turn, and previews the
+  opening user message.
+- `delete_turns` on a 4-message tool turn removes exactly those 4 rows, leaves
+  neighbours intact, leaves **no orphaned `tool_result`**, and leaves a valid
+  turn start at index 0.
+- `delete_turns_in_range` removes whole turns; a non-matching range is a no-op
+  rather than a wipe.
+- `set_chat_persist_history` inserts then upserts; `get_chat_settings` returns
+  `None` when unset.
+
+**Not yet verified:** anything above the DB layer. There is no `history.py` and
+`bot.py` is unchanged, so none of the end-to-end behaviour below has been
+observed.
+
+### Manual end-to-end (the real acceptance test)
+
+Point `DB_PATH` at a scratch file, start the bot.
 
 1. Send `/plan`, then 2-3 follow-ups referencing earlier context. Confirm coherent replies.
 2. `sqlite3 <db> "SELECT id, turn_id, role, substr(content,1,60) FROM conversation_messages ORDER BY id;"` — expect valid JSON, assistant rows like `[{"type": "text", ...}]`, and one `turn_id` shared by every message of an exchange.
