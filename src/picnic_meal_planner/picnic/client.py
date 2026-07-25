@@ -11,7 +11,7 @@ import os
 from functools import partial
 from typing import Any
 
-from python_picnic_api import PicnicAPI
+from python_picnic_api2 import PicnicAPI
 
 
 _client: PicnicAPI | None = None
