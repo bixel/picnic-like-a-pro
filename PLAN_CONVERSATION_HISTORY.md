@@ -1,5 +1,31 @@
 # Persist conversation history
 
+## Implementation status — RESUME HERE
+
+Implementation was started and then paused partway through. **The feature is not
+live yet:** `bot.py` is untouched and still keeps history in the in-memory dict,
+so nothing behaves differently at runtime. The committed code is inert — no
+caller reaches it.
+
+| Step | Status | Notes |
+|---|---|---|
+| 1. `db/schema.py` tables | **Done** (`36126f8`) | `conversation_messages` + `chat_settings` + both indexes, appended to `ALL_TABLES`. Compiles; **never run against a real DB.** |
+| 2. `db/queries.py` helpers | **Done** (`36126f8`) | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history`. Compiles; **SQL is unexercised.** |
+| 3. `history.py` | **Not started** | The whole module: `normalize_content`, `is_turn_start`, `trim_history`, caching, `invalidate`, opt-out policy. |
+| 4. `bot.py` wiring | **Not started** | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`; `_post_init`. |
+| 5. `/forget` + `/privacy` | **Not started** | |
+| 6. `.env.example` | **Not started** | `MAX_HISTORY_TURNS`, `PERSIST_CONVERSATIONS`. |
+| 7. `ARCHITECTURE.md` | **Not started** | Line 60 ("stored in memory per `chat_id`") is now wrong. |
+| Tests | **Not started** | |
+
+**First thing to do on resume:** exercise the Step 2 SQL, since it has only ever
+been syntax-checked. A round-trip of `append_turn` → `load_conversation` plus a
+`delete_turns_in_range` against a scratch DB will confirm it before anything is
+built on top of it.
+
+**Before resuming, rebase on `main`** — this branch was cut for that purpose. See
+the *Merge surface* section near the end for exactly where conflicts can occur.
+
 ## Context
 
 Conversation history between the user, the bot, and the Anthropic API currently lives **only in process memory**:
