@@ -2,6 +2,9 @@
 
 The underlying library is synchronous, so every call is run in a thread pool
 executor to avoid blocking the event loop.
+
+Set PICNIC_MOCK=true to swap the real Picnic API for the in-process mock
+(useful for demos, automated tests, and local development without credentials).
 """
 
 from __future__ import annotations
@@ -11,21 +14,31 @@ import os
 from functools import partial
 from typing import Any
 
-from python_picnic_api2 import PicnicAPI
+
+_client = None  # PicnicAPI | MockPicnicAPI | None
 
 
-_client: PicnicAPI | None = None
-
-
-def _get_client() -> PicnicAPI:
+def _get_client():
     global _client
     if _client is None:
-        _client = PicnicAPI(
-            username=os.environ["PICNIC_USERNAME"],
-            password=os.environ["PICNIC_PASSWORD"],
-            country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL"),
-        )
+        if os.getenv("PICNIC_MOCK", "").lower() == "true":
+            from .mock_client import get_mock_client  # noqa: PLC0415
+            _client = get_mock_client()
+        else:
+            # Deferred so mock mode never requires the real library to import.
+            from python_picnic_api2 import PicnicAPI  # noqa: PLC0415
+            _client = PicnicAPI(
+                username=os.environ["PICNIC_USERNAME"],
+                password=os.environ["PICNIC_PASSWORD"],
+                country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL"),
+            )
     return _client
+
+
+def reset_client() -> None:
+    """Discard the client singleton so the next call builds a fresh instance."""
+    global _client
+    _client = None
 
 
 async def _run(func, *args, **kwargs) -> Any:

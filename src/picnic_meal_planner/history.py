@@ -156,6 +156,13 @@ def invalidate(chat_id: int) -> None:
     _loaded_chats.discard(chat_id)
 
 
+def _reset_caches() -> None:
+    """Drop every cached chat. Equivalent to a process restart, for tests."""
+    _contexts.clear()
+    _loaded_chats.clear()
+    _persist_flags.clear()
+
+
 # ---------------------------------------------------------------------------
 # Opt-out
 # ---------------------------------------------------------------------------

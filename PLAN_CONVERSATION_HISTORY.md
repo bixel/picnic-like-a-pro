@@ -26,12 +26,14 @@ see *Architecture note* immediately after this table.
 | 6. `/forget` + `/privacy` | **Done, verified** | Both handlers, registered in `main()` and listed in `/start`. Failure paths never report success. |
 | 7. `.env.example` | **Done** | `MAX_HISTORY_TURNS` + `PERSIST_CONVERSATIONS`, with a note on what is capped vs stored. |
 | 8. Docs | **Done** | `CLAUDE.md` gained a Conversation History design section; `ARCHITECTURE.md` gained both tables, the new commands, and a corrected file tree. |
-| Tests | **Not started** ← NEXT | Everything so far is verified by throwaway scripts outside the repo. See *Verification*. |
+| Tests | **Done** | `tests/test_history.py` (55 tests) plus `/forget` and `/privacy` coverage in `tests/test_bot_conversation.py`. Runs in CI with the rest of the suite. |
 
-Steps 1-8 are done. The feature is complete and documented: history persists,
-and users can inspect, disable, and delete it. **The remaining gap is a real
-test suite** — every verification so far lives in throwaway scripts outside the
-repo, so none of it runs in CI.
+**All steps are done.** History persists, users can inspect, disable, and
+delete it, it is documented, and it is covered by the repo's test suite
+(427 tests pass, 66 of them new).
+
+`main` has been merged twice: first for the SQLAlchemy/Alembic refactor, then
+for the test suite and Docker/CI work. See *Merge surface* for what that cost.
 
 ### Architecture note — what the `main` merge changed
 
