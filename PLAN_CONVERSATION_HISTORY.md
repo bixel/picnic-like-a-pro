@@ -16,17 +16,16 @@ match; see *Architecture note* immediately after this table.
 | 1. `db/models.py` models | **Done, verified** | `ConversationMessage` + `ChatSettings` with both indexes. |
 | 2. `alembic/versions/0002_conversation_history.py` | **Done, verified** | Applies on top of `0001`; autogenerate reports no drift from the models. |
 | 3. `db/queries.py` helpers | **Done, verified** | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history` — all rewritten in SQLAlchemy and commit-neutral. |
-| 4. `history.py` | **Not started** | The whole module: `normalize_content`, `is_turn_start`, `trim_history`, caching, `invalidate`, opt-out policy. |
-| 5. `bot.py` wiring | **Not started** | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`. |
+| 4. `history.py` | **Done, verified** | `normalize_content`, `is_turn_start`, `trim_history`, lazy cache + `invalidate`, `get_context`/`commit_turn`, deletion, opt-out. |
+| 5. `bot.py` wiring | **Not started** ← NEXT | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`. |
 | 6. `/forget` + `/privacy` | **Not started** | |
 | 7. `.env.example` | **Not started** | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
 | 8. Docs | **Not started** | `CLAUDE.md` ("Conversation history is kept **per chat_id in memory** … lost on restart") and `ARCHITECTURE.md:60` both go stale the moment step 5 lands. |
 | Tests | **Not started** | Port the throwaway round-trip script into `tests/`; see *Verification*. |
 
-Steps 1-3 were exercised against a real SQLite DB — turn round-trip, tool-block
-fidelity, turn-granular and range deletes, and the settings upsert all pass, and
-`alembic upgrade` and `metadata.create_all()` now produce byte-identical schemas.
-**Next step is `history.py` (step 4).**
+Steps 1-4 were exercised against a real SQLite DB and all pass. **Next step is
+wiring `bot.py` (step 5)** — until that lands, nothing in the feature is
+reachable at runtime.
 
 ### Architecture note — what the `main` merge changed
 
@@ -122,7 +121,7 @@ Two behaviours worth knowing before writing `history.py`:
   timestamp directly would split a turn straddling the boundary and orphan a
   `tool_result`.
 
-## Step 4 — new file `src/picnic_meal_planner/history.py` ← NEXT
+## Step 4 — `src/picnic_meal_planner/history.py` (DONE)
 
 The only file that knows about policy. Nothing here imports `bot`.
 
@@ -215,7 +214,7 @@ Behaviour:
 - `is_persistence_enabled` — env check first (no I/O), then `_persist_flags` cache, then one `get_chat_settings` query. A missing row means enabled (default-on). Result cached.
 - **Fail-soft is deliberate.** `get_context` and `commit_turn` never raise: DB errors are logged and degrade to memory-only. `_chat()` already wraps `_run_claude` in a broad `except`; if these raised, an unwritable DB would kill every conversation instead of just losing persistence. Deletion functions *do* propagate errors — silently failing to delete when a user asked you to is the wrong default.
 
-## Step 5 — `src/picnic_meal_planner/bot.py`
+## Step 5 — `src/picnic_meal_planner/bot.py` ← NEXT
 
 Remove `from collections import defaultdict` (line 12), `MAX_HISTORY_TURNS` (line 50), and `_histories` (lines 52-53). Add `from . import history`.
 
@@ -370,9 +369,29 @@ passed; port these assertions into `tests/` when the test harness lands:
 - `set_chat_persist_history` inserts then upserts; `get_chat_settings` returns
   `None` when unset.
 
-**Not yet verified:** anything above the DB layer. There is no `history.py` and
-`bot.py` is unchanged, so none of the end-to-end behaviour below has been
-observed.
+### Already done (step 4, `history.py`)
+
+51 assertions against a real DB, plus a fail-soft suite. Highlights:
+
+- `normalize_content` dumps SDK blocks, drops `None` fields, passes strings and
+  plain dicts through, falls back to `to_dict`, and raises on unknown types.
+  Output is `json.dumps`-able.
+- `trim_history` cuts only at a turn start. The test builds the exact history
+  where a naive slice *would* orphan a `tool_result` and asserts it doesn't.
+- History survives a simulated restart with `tool_use` input dicts intact.
+- **Deleting a turn does not leave it lingering in the live cache** — the
+  invalidation path the plan called the easiest thing to get wrong.
+- Opting out deletes stored rows but keeps the in-progress conversation in
+  memory; opting back in resumes writing.
+- The `PERSIST_CONVERSATIONS` kill-switch stops all reads and writes while
+  leaving in-session memory working.
+- **Fail-soft asymmetry:** with an unwritable DB, `get_context`/`commit_turn`
+  degrade to memory-only and `is_persistence_enabled` fails *closed* (never
+  store when consent can't be confirmed), while `clear_history`/`delete_turns`
+  propagate — silently failing to delete is the wrong default.
+
+**Not yet verified:** anything above `history.py`. `bot.py` is unchanged, so
+none of the end-to-end behaviour below has been observed.
 
 ### Manual end-to-end (the real acceptance test)
 
