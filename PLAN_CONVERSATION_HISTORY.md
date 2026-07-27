@@ -2,14 +2,19 @@
 
 ## Implementation status — RESUME HERE
 
-Implementation was started and then paused partway through. **The feature is not
-live yet:** `bot.py` still keeps history in the in-memory dict, so nothing
-behaves differently at runtime. The DB layer is in place but inert — no caller
-reaches it.
+**The feature is live as of step 5.** `bot.py` now reads its context from
+`history.py` and commits each completed turn, so conversations survive a
+restart. What remains is the opt-out *commands*, config docs, and tests — the
+opt-out mechanism itself already works and is enforced on the bot path.
 
 `main` has been merged in. It replaced the hand-written DDL with **SQLAlchemy
-2.0 ORM models + Alembic migrations**, so the DB layer below was rewritten to
-match; see *Architecture note* immediately after this table.
+2.0 ORM models + Alembic migrations**, so the DB layer was rewritten to match;
+see *Architecture note* immediately after this table.
+
+> **Deploy note:** this adds a migration. Run `uv run alembic upgrade head`
+> before restarting the bot. On a database bootstrapped by `init_db()`
+> (`create_all`) rather than Alembic, `uv run alembic stamp head` first — see
+> `CLAUDE.md`.
 
 | Step | Status | Notes |
 |---|---|---|
@@ -17,15 +22,15 @@ match; see *Architecture note* immediately after this table.
 | 2. `alembic/versions/0002_conversation_history.py` | **Done, verified** | Applies on top of `0001`; autogenerate reports no drift from the models. |
 | 3. `db/queries.py` helpers | **Done, verified** | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history` — all rewritten in SQLAlchemy and commit-neutral. |
 | 4. `history.py` | **Done, verified** | `normalize_content`, `is_turn_start`, `trim_history`, lazy cache + `invalidate`, `get_context`/`commit_turn`, deletion, opt-out. |
-| 5. `bot.py` wiring | **Not started** ← NEXT | Remove `_histories`/`defaultdict`/`MAX_HISTORY_TURNS`; the 4 changed lines in `_run_claude`. |
-| 6. `/forget` + `/privacy` | **Not started** | |
+| 5. `bot.py` wiring | **Done, verified** | `_histories`/`defaultdict`/`MAX_HISTORY_TURNS` removed; `_run_claude` trims-then-appends, normalizes, and commits; `_post_init` logs the persistence state. |
+| 6. `/forget` + `/privacy` | **Not started** ← NEXT | `history.clear_history` / `set_persistence` already exist and are tested; this is handlers + registration only. |
 | 7. `.env.example` | **Not started** | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
 | 8. Docs | **Not started** | `CLAUDE.md` ("Conversation history is kept **per chat_id in memory** … lost on restart") and `ARCHITECTURE.md:60` both go stale the moment step 5 lands. |
 | Tests | **Not started** | Port the throwaway round-trip script into `tests/`; see *Verification*. |
 
-Steps 1-4 were exercised against a real SQLite DB and all pass. **Next step is
-wiring `bot.py` (step 5)** — until that lands, nothing in the feature is
-reachable at runtime.
+Steps 1-5 were exercised against a real SQLite DB and all pass. **Next step is
+the `/forget` and `/privacy` commands (step 6)**, which expose deletion and
+opt-out to users; both are reachable from code today but not from Telegram.
 
 ### Architecture note — what the `main` merge changed
 
@@ -214,7 +219,7 @@ Behaviour:
 - `is_persistence_enabled` — env check first (no I/O), then `_persist_flags` cache, then one `get_chat_settings` query. A missing row means enabled (default-on). Result cached.
 - **Fail-soft is deliberate.** `get_context` and `commit_turn` never raise: DB errors are logged and degrade to memory-only. `_chat()` already wraps `_run_claude` in a broad `except`; if these raised, an unwritable DB would kill every conversation instead of just losing persistence. Deletion functions *do* propagate errors — silently failing to delete when a user asked you to is the wrong default.
 
-## Step 5 — `src/picnic_meal_planner/bot.py` ← NEXT
+## Step 5 — `src/picnic_meal_planner/bot.py` (DONE)
 
 Remove `from collections import defaultdict` (line 12), `MAX_HISTORY_TURNS` (line 50), and `_histories` (lines 52-53). Add `from . import history`.
 
@@ -256,7 +261,7 @@ async def _post_init(app: Application) -> None:
                 "on" if history._persistence_enabled_globally() else "off (kill-switch)")
 ```
 
-## Step 6 — opt-out and deletion commands in `bot.py`
+## Step 6 — opt-out and deletion commands in `bot.py` ← NEXT
 
 Both follow the existing handler shape (`_is_allowed` guard → `_reject_unauthorized`).
 
@@ -390,8 +395,26 @@ passed; port these assertions into `tests/` when the test harness lands:
   store when consent can't be confirmed), while `clear_history`/`delete_turns`
   propagate — silently failing to delete is the wrong default.
 
-**Not yet verified:** anything above `history.py`. `bot.py` is unchanged, so
-none of the end-to-end behaviour below has been observed.
+### Already done (step 5, `bot.py` wiring)
+
+22 assertions driving the real `_run_claude` against a stubbed Anthropic client
+and MCP layer:
+
+- A plain turn and a tool-using turn both persist and reload across a simulated
+  restart, with `tool_use` blocks intact.
+- **No raw SDK objects reach the API** — every content value sent is a string or
+  a list of plain dicts.
+- **A failed API call leaves the archive untouched** and produces no dangling
+  user message, so the next request cannot open with two consecutive user turns.
+- Under a deliberately tiny window the outgoing request still starts at a turn
+  boundary and never on a `tool_result`.
+- An opted-out chat writes nothing yet keeps in-session context, and starts
+  fresh after a restart.
+
+**Not yet verified:** the Telegram surface. `_chat`/`cmd_*` handlers and the
+`/forget`+`/privacy` commands have not been exercised against a live bot, and
+no real Anthropic API call has been made. The manual script below is still the
+acceptance test.
 
 ### Manual end-to-end (the real acceptance test)
 

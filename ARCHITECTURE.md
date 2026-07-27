@@ -57,8 +57,9 @@ future orders based on historical purchasing patterns.
 
 ### Multi-user design notes
 - The **Picnic account is shared** (one family account). Cart and orders are global.
-- Each **Telegram user gets their own conversation history** with Claude, stored in
-  memory per `chat_id`. There is no cross-user memory leakage.
+- Each **Telegram user gets their own conversation history** with Claude, stored
+  per `chat_id` in SQLite and cached in memory. It survives restarts, and there
+  is no cross-user memory leakage. Storage can be disabled per chat or globally.
 - All family members talk to the same bot instance and can see/modify the shared cart.
 - The optional `ALLOWED_TELEGRAM_USER_IDS` env var restricts access to known family
   members. Leave empty to allow any Telegram user.

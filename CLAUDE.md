@@ -39,7 +39,7 @@ that the caller can batch multiple writes into one transaction.
 
 ### Models: `db/models.py`
 
-Four ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
+Six ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
 columns:
 
 | Model | Table | Notes |
@@ -48,6 +48,8 @@ columns:
 | `Order` | `orders` | Delivery records |
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
 | `ImportCheckpoint` | `import_checkpoints` | Resumable import progress |
+| `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
+| `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out |
 
 Datetime values are stored as **ISO-8601 strings** (`String` column type,
 not `DateTime`) to avoid SQLite timezone edge-cases and to keep the existing
@@ -148,8 +150,15 @@ JSON-serialisable without extra steps.
   process).  The MCP tools are registered with FastMCP and called **in-process**
   via `mcp_server.call_tool()`.
 - The model is `claude-sonnet-4-6` (configurable in `bot.py`).
-- Conversation history is kept **per chat_id in memory** (capped at
-  `MAX_HISTORY_TURNS * 2` messages, default 40).  History is lost on restart.
+- Conversation history is **persisted to SQLite per chat_id** and survives
+  restarts.  All policy lives in `history.py`; `bot.py` only calls
+  `get_context()` and `commit_turn()`.
+  - The full transcript is archived; only the window *sent to the API* is
+    capped (`MAX_HISTORY_TURNS * 2` messages, default 40).
+  - Messages are grouped into **turns**, and a turn is the unit of deletion —
+    deleting a lone message could orphan a `tool_result` and cause an API 400.
+  - Storage can be disabled per chat (`chat_settings.persist_history`) or
+    globally (`PERSIST_CONVERSATIONS=false`).
 
 ---
 

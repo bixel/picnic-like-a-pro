@@ -1,7 +1,10 @@
 """Telegram bot entry point.
 
-Each family member has their own per-chat conversation history with Claude.
-All MCP tools are available in every conversation.
+Each family member has their own per-chat conversation history with Claude,
+persisted across restarts. All MCP tools are available in every conversation.
+
+History policy — truncation, serialization, storage, opt-out — lives in
+``history.py``; this module only reads a context and commits a completed turn.
 """
 
 from __future__ import annotations
@@ -9,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections import defaultdict
 
 import anthropic
 from dotenv import load_dotenv
@@ -25,6 +27,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+# Imported after load_dotenv(): both modules read configuration at import time.
+from . import history  # noqa: E402
 from .db.engine import init_db  # noqa: E402
 
 logging.basicConfig(
@@ -48,11 +52,6 @@ You have access to tools that let you:
 The Picnic account is shared across all family members. Be conversational and helpful.
 When suggesting items to add to the cart, always confirm with the user before adding them.
 """
-
-MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "20"))
-
-# Per-chat conversation history: chat_id → list of messages
-_histories: dict[int, list[dict]] = defaultdict(list)
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
 _mcp_tools: list[dict] | None = None
@@ -102,11 +101,15 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
 
     # Work on a copy; only commit to canonical history on success so that a
     # failed API call never leaves two consecutive "user" turns in the history.
-    messages = list(_histories[chat_id])
+    #
+    # Trim BEFORE appending the new turn, and only at a safe boundary: trimming
+    # afterwards could slice away the message the user just sent, and a blind
+    # slice can leave an orphaned tool_result at the front, which the API
+    # rejects. Everything from new_from onwards is what this turn produced.
+    base = await history.get_context(chat_id)
+    messages = history.trim_history(base, history.MAX_HISTORY_MESSAGES - 1)
+    new_from = len(messages)
     messages.append({"role": "user", "content": user_text})
-
-    if len(messages) > MAX_HISTORY_TURNS * 2:
-        messages = messages[-(MAX_HISTORY_TURNS * 2):]
 
     while True:
         response = await client.messages.create(
@@ -126,8 +129,15 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
             elif block.type == "tool_use":
                 tool_uses.append(block)
 
-        # Append the assistant message to the conversation
-        messages.append({"role": "assistant", "content": response.content})
+        # Append the assistant message to the conversation. Normalizing the SDK
+        # blocks to plain dicts here keeps one representation for both the next
+        # request and the stored row.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": history.normalize_content(response.content),
+            }
+        )
 
         if response.stop_reason == "tool_use" and tool_uses:
             # Execute all requested tool calls
@@ -144,8 +154,8 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Final response — update canonical history and return text
-        _histories[chat_id] = messages
+        # Final response — commit the turn (memory + archive) and return text
+        await history.commit_turn(chat_id, messages, new_from)
         return assistant_text or "(no reply)"
 
 
@@ -251,7 +261,12 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 async def _post_init(app: Application) -> None:
     """Ensure database tables exist before the bot starts handling messages."""
     await init_db()
-    logger.info("Database initialised.")
+    logger.info(
+        "Database initialised. Conversation persistence: %s",
+        "on"
+        if history._persistence_enabled_globally()
+        else "off (PERSIST_CONVERSATIONS)",
+    )
 
 
 def main() -> None:
