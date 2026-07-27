@@ -1,0 +1,37 @@
+# Test environment — ephemeral, automated, wipeable on demand.
+#
+# Standalone compose project ("picnic-test") that builds the Dockerfile's
+# `test` stage (production deps + pytest + the test suite) and runs the suite
+# with coverage. The database lives in an anonymous volume, so every
+# `down -v` returns the environment to a pristine state.
+#
+#   # Full suite + HTML coverage report (written to ./htmlcov):
+#   docker compose -f docker-compose.test.yml run --rm picnic-test
+#
+#   # A single file or filter:
+#   docker compose -f docker-compose.test.yml run --rm picnic-test \
+#       pytest tests/test_forecasting.py -v
+#
+#   # Wipe database + containers:
+#   docker compose -f docker-compose.test.yml down -v
+
+name: picnic-test
+
+services:
+  picnic-test:
+    build:
+      context: .
+      target: test
+    image: picnic-meal-planner:test
+    container_name: picnic-test
+    env_file: .env.test
+    environment:
+      PICNIC_MOCK: "true"
+      PICNIC_MOCK_PERSIST_CART: "false"
+      # Ephemeral: lives in the anonymous volume below, never on the host
+      DB_PATH: /app/data/picnic-test.db
+    volumes:
+      # Coverage report surfaced to the host for browsing
+      - ./htmlcov:/app/htmlcov
+      # Anonymous volume — discarded by `down -v`
+      - /app/data

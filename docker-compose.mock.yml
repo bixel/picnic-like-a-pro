@@ -1,0 +1,33 @@
+# Mock environment — persistent demo/playground bot.
+#
+# Standalone compose project ("picnic-mock"): its own container, its own
+# volume, its own Telegram bot token. Runs the *same image* as production but
+# with PICNIC_MOCK=true, so it can never touch the real Picnic account or
+# trigger a checkout. State survives restarts.
+#
+#   docker compose -f docker-compose.mock.yml up -d
+#   docker compose -f docker-compose.mock.yml logs -f
+#   docker compose -f docker-compose.mock.yml down
+#
+# Reset the playground back to a clean slate (drops the volume):
+#   docker compose -f docker-compose.mock.yml down -v
+
+name: picnic-mock
+
+services:
+  picnic-bot-mock:
+    image: ghcr.io/${GITHUB_REPOSITORY:-bixel/picnic-like-a-pro}:latest
+    container_name: picnic-bot-mock
+    restart: unless-stopped
+    env_file: .env.mock
+    environment:
+      PICNIC_MOCK: "true"
+      PICNIC_MOCK_PERSIST_CART: "true"
+      DB_PATH: data/picnic-mock.db
+    volumes:
+      - picnic-mock-data:/app/data
+    command: ["bot"]
+
+volumes:
+  picnic-mock-data:
+    name: picnic-mock-data

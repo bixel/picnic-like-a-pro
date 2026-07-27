@@ -274,7 +274,13 @@ async def get_frequently_ordered(session: AsyncSession, limit: int = 20) -> list
 
 
 async def get_all_product_stats(session: AsyncSession) -> list[dict]:
-    """Return stats for every product that has been ordered at least twice."""
+    """Return stats for every product that has been ordered at least twice.
+
+    ``avg_interval_days`` must be selected here: the forecasting engine reads
+    it straight off each row and treats a missing value as "no interval known",
+    silently skipping the product.  The HAVING clause guarantees a count of at
+    least 2, so the divisor is never zero.
+    """
     stmt = (
         select(
             OrderItem.product_id,
@@ -283,6 +289,13 @@ async def get_all_product_stats(session: AsyncSession) -> list[dict]:
             func.avg(OrderItem.quantity).label("avg_quantity"),
             func.max(Order.ordered_at).label("last_ordered_at"),
             func.min(Order.ordered_at).label("first_ordered_at"),
+            (
+                (
+                    func.julianday(func.max(Order.ordered_at))
+                    - func.julianday(func.min(Order.ordered_at))
+                )
+                / (func.count() - 1)
+            ).label("avg_interval_days"),
         )
         .join(Order, Order.id == OrderItem.order_id)
         .join(Product, Product.id == OrderItem.product_id)
