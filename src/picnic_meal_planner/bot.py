@@ -178,7 +178,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/order — open a shopping session\n"
         "/forecast — see what you might be running low on\n"
         "/history — recent order summary\n"
-        "/cart — current Picnic cart\n\n"
+        "/cart — current Picnic cart\n"
+        "/forget — delete our stored conversation\n"
+        "/privacy — control whether our conversation is saved\n\n"
         "Or just chat with me naturally!"
     )
 
@@ -216,6 +218,74 @@ async def cmd_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reject_unauthorized(update)
         return
     await _chat(update, context, "Show me what's currently in the Picnic cart.")
+
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete this chat's stored conversation and start fresh."""
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+
+    chat_id = update.effective_chat.id
+    # history.clear_history deliberately propagates DB failures rather than
+    # failing silently, so never report success without catching them first.
+    try:
+        removed = await history.clear_history(chat_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not clear history for chat %d", chat_id)
+        await update.message.reply_text(
+            "Sorry, I couldn't clear the history just now. Please try again."
+        )
+        return
+
+    if removed:
+        await update.message.reply_text(
+            f"Forgotten — deleted {removed} stored message(s). We're starting fresh."
+        )
+    else:
+        await update.message.reply_text(
+            "There was nothing stored. We're starting fresh."
+        )
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/privacy`` shows the current setting; ``/privacy on|off`` changes it."""
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+
+    chat_id = update.effective_chat.id
+    arg = context.args[0].lower() if context.args else ""
+
+    if arg not in ("on", "off"):
+        enabled = await history.is_persistence_enabled(chat_id)
+        await update.message.reply_text(
+            f"Saving our conversation is currently {'ON' if enabled else 'OFF'}.\n\n"
+            "/privacy off — stop saving, and delete what's already stored\n"
+            "/privacy on — start saving again\n"
+            "/forget — clear the history either way"
+        )
+        return
+
+    enable = arg == "on"
+    try:
+        await history.set_persistence(chat_id, enable)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not change persistence for chat %d", chat_id)
+        await update.message.reply_text(
+            "Sorry, I couldn't change that setting just now. Please try again."
+        )
+        return
+
+    if enable:
+        await update.message.reply_text(
+            "Saving is ON. I'll remember our conversations between restarts."
+        )
+    else:
+        await update.message.reply_text(
+            "Saving is OFF, and anything already stored has been deleted. "
+            "I'll still remember this conversation until the bot restarts."
+        )
 
 
 async def _chat(
@@ -284,6 +354,8 @@ def main() -> None:
     app.add_handler(CommandHandler("forecast", cmd_forecast))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("cart", cmd_cart))
+    app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _chat))
 
     logger.info("Starting bot with long polling...")

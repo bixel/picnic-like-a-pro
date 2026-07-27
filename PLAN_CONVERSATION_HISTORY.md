@@ -23,14 +23,15 @@ see *Architecture note* immediately after this table.
 | 3. `db/queries.py` helpers | **Done, verified** | `load_conversation`, `append_turn`, `list_turns`, `delete_conversation`, `delete_turns`, `delete_turns_in_range`, `get_chat_settings`, `set_chat_persist_history` — all rewritten in SQLAlchemy and commit-neutral. |
 | 4. `history.py` | **Done, verified** | `normalize_content`, `is_turn_start`, `trim_history`, lazy cache + `invalidate`, `get_context`/`commit_turn`, deletion, opt-out. |
 | 5. `bot.py` wiring | **Done, verified** | `_histories`/`defaultdict`/`MAX_HISTORY_TURNS` removed; `_run_claude` trims-then-appends, normalizes, and commits; `_post_init` logs the persistence state. |
-| 6. `/forget` + `/privacy` | **Not started** ← NEXT | `history.clear_history` / `set_persistence` already exist and are tested; this is handlers + registration only. |
-| 7. `.env.example` | **Not started** | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
+| 6. `/forget` + `/privacy` | **Done, verified** | Both handlers, registered in `main()` and listed in `/start`. Failure paths never report success. |
+| 7. `.env.example` | **Not started** ← NEXT | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
 | 8. Docs | **Not started** | `CLAUDE.md` ("Conversation history is kept **per chat_id in memory** … lost on restart") and `ARCHITECTURE.md:60` both go stale the moment step 5 lands. |
 | Tests | **Not started** | Port the throwaway round-trip script into `tests/`; see *Verification*. |
 
-Steps 1-5 were exercised against a real SQLite DB and all pass. **Next step is
-the `/forget` and `/privacy` commands (step 6)**, which expose deletion and
-opt-out to users; both are reachable from code today but not from Telegram.
+Steps 1-6 were exercised against a real SQLite DB and all pass. The feature is
+functionally complete: history persists, and users can inspect, disable, and
+delete it. **What remains is documentation and tests** (steps 7-8) — no
+behaviour changes.
 
 ### Architecture note — what the `main` merge changed
 
@@ -261,7 +262,7 @@ async def _post_init(app: Application) -> None:
                 "on" if history._persistence_enabled_globally() else "off (kill-switch)")
 ```
 
-## Step 6 — opt-out and deletion commands in `bot.py` ← NEXT
+## Step 6 — opt-out and deletion commands in `bot.py` (DONE)
 
 Both follow the existing handler shape (`_is_allowed` guard → `_reject_unauthorized`).
 
@@ -291,7 +292,7 @@ Register both in `main()` and add them to `cmd_start`'s help text. Turning persi
 
 Partial deletion (`/forget 2026-07-24`, or an interactive turn picker built on `list_turns`) is **not wired up now** — but `delete_day`, `delete_turns`, and `list_turns` exist and are tested, so adding the command later is a handler and nothing else.
 
-## Step 7 — `.env.example`
+## Step 7 — `.env.example` ← NEXT
 
 Under `# App config`:
 
@@ -411,10 +412,30 @@ and MCP layer:
 - An opted-out chat writes nothing yet keeps in-session context, and starts
   fresh after a restart.
 
-**Not yet verified:** the Telegram surface. `_chat`/`cmd_*` handlers and the
-`/forget`+`/privacy` commands have not been exercised against a live bot, and
-no real Anthropic API call has been made. The manual script below is still the
-acceptance test.
+### Already done (step 6, the commands)
+
+33 assertions across the handlers and registration:
+
+- `/forget` reports the number of messages deleted, says so plainly when there
+  was nothing stored, clears both the archive and the live context, and is
+  durable across a restart.
+- `/privacy` reports status, accepts `on`/`off` case-insensitively, and falls
+  back to showing status for an unrecognised argument.
+- `/privacy off` deletes stored rows, disables writing, and **keeps the
+  in-progress conversation in memory**; `/privacy on` resumes writing.
+- Both reject unauthorised users and change nothing when they do.
+- **Neither reports success when the DB fails.** `history.clear_history` and
+  `set_persistence` propagate by design, so the handlers catch, log, and reply
+  with a failure message — verified by forcing both to raise.
+- `main()` really registers both commands (checked by running `main()` against
+  a fake `Application`), pre-existing handlers still register, and `/start`
+  lists the two new commands.
+
+**Not yet verified:** anything requiring a live bot or a real Anthropic call.
+Every test above uses stubs. The manual script below is still the acceptance
+test — in particular nothing here proves the Telegram transport, `_chat`'s
+typing indicator and message splitting, or that a real `messages.create`
+accepts our normalized content.
 
 ### Manual end-to-end (the real acceptance test)
 
