@@ -69,7 +69,8 @@ Alembic manages all schema changes.
 |---|---|
 | `alembic.ini` | Alembic config; DB URL is overridden at runtime from `DB_PATH` |
 | `alembic/env.py` | Async migration env using `async_engine_from_config` + `asyncio.run` |
-| `alembic/versions/0001_*.py` | Initial schema (all four tables) |
+| `alembic/versions/0001_*.py` | Initial schema (products, orders, order_items, import_checkpoints) |
+| `alembic/versions/0002_*.py` | Conversation history (`conversation_messages`, `chat_settings`) — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -125,7 +126,9 @@ idempotent for re-imports.
 
 ```
 src/picnic_meal_planner/
-├── bot.py            # Telegram bot, long-polling, per-chat conversation history
+├── bot.py            # Telegram bot, long-polling; calls history.py for context
+├── history.py        # Conversation history policy: serialization, truncation,
+│                     #   caching, persistence, opt-out, deletion
 ├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting
 ├── db/
 │   ├── __init__.py   # Re-exports: Base, models, get_db, init_db
@@ -162,6 +165,65 @@ JSON-serialisable without extra steps.
 
 ---
 
+## Conversation History
+
+All policy lives in `history.py`.  `bot.py` calls only `get_context()` and
+`commit_turn()`; `queries.py` stores what it is handed and decides nothing.
+
+### A turn is the unit of deletion
+
+One `_run_claude` call can produce several messages:
+
+```
+user  →  assistant (tool_use)  →  user (tool_result)  →  assistant (text)
+```
+
+Deleting an arbitrary *message* out of that leaves a `tool_result` with no
+matching `tool_use`, and the Messages API rejects the next request with a 400.
+So every message carries a `turn_id` and **all deletion operates on whole
+turns**.  Because each turn begins with a plain-text `user` message, removing
+any set of turns leaves a valid alternating sequence.
+
+Deletion is available by chat (`clear_history`), by turn (`delete_turns`), and
+by day (`delete_day`).  Only the first is exposed over Telegram today, via
+`/forget`; the others are ready for a UI whenever one is wanted.
+
+### Truncation must land on a turn boundary
+
+`trim_history()` never cuts mid-turn.  It scans *forward* from the naive cut
+point to the next real turn start, so it may drop more than strictly necessary
+— always the safe direction — and returns `[]` if no safe boundary exists.
+It also runs on load, so a tail left ragged by a deletion cannot produce a bad
+request.  `bot.py` trims *before* appending the new user message; trimming
+afterwards could discard the message the user just sent.
+
+### Serialization
+
+`response.content` is a list of pydantic SDK blocks, which are not
+JSON-serialisable.  `normalize_content()` converts them once, at append time,
+via `model_dump(mode="json", exclude_none=True)`, so a single representation
+serves both the next API request and the stored row.
+
+### Failure behaviour
+
+Deliberately asymmetric:
+
+| Operation | On DB failure |
+|---|---|
+| `get_context`, `commit_turn` | Log and degrade to memory-only — an unwritable DB must not break every conversation |
+| `is_persistence_enabled` | Fail **closed** — never store when consent cannot be confirmed |
+| `clear_history`, `delete_*` | **Propagate** — silently failing to delete what a user asked to delete is the wrong default.  Callers in `bot.py` catch these and report the failure rather than claiming success |
+
+### Caching
+
+The in-memory window is per-process, so every deletion path calls
+`invalidate()`; otherwise a deleted turn keeps living in memory and gets
+re-sent to the API until restart.  A second replica would see stale caches —
+fine for the current single-container deployment, but it is why the cache is
+not treated as authoritative.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -179,7 +241,8 @@ JSON-serialisable without extra steps.
 | `MCP_PORT` | `8000` | MCP server port (sse/http only) |
 | `IMPORT_BATCH_SIZE` | `10` | Deliveries per batch in import script |
 | `IMPORT_DELAY_SECONDS` | `2` | Pause between import batches |
-| `MAX_HISTORY_TURNS` | `20` | Per-chat conversation turns kept in memory |
+| `MAX_HISTORY_TURNS` | `20` | Per-chat turns sent to the API (× 2 = messages). Does **not** limit what is stored. |
+| `PERSIST_CONVERSATIONS` | `true` | Global kill-switch; `false` = in-memory only, nothing written |
 
 Copy `.env.example` to `.env` and fill in your values.
 

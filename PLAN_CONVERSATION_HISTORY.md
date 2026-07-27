@@ -24,14 +24,14 @@ see *Architecture note* immediately after this table.
 | 4. `history.py` | **Done, verified** | `normalize_content`, `is_turn_start`, `trim_history`, lazy cache + `invalidate`, `get_context`/`commit_turn`, deletion, opt-out. |
 | 5. `bot.py` wiring | **Done, verified** | `_histories`/`defaultdict`/`MAX_HISTORY_TURNS` removed; `_run_claude` trims-then-appends, normalizes, and commits; `_post_init` logs the persistence state. |
 | 6. `/forget` + `/privacy` | **Done, verified** | Both handlers, registered in `main()` and listed in `/start`. Failure paths never report success. |
-| 7. `.env.example` | **Not started** ← NEXT | `PERSIST_CONVERSATIONS` (`MAX_HISTORY_TURNS` is already documented in `CLAUDE.md`). |
-| 8. Docs | **Not started** | `CLAUDE.md` ("Conversation history is kept **per chat_id in memory** … lost on restart") and `ARCHITECTURE.md:60` both go stale the moment step 5 lands. |
-| Tests | **Not started** | Port the throwaway round-trip script into `tests/`; see *Verification*. |
+| 7. `.env.example` | **Done** | `MAX_HISTORY_TURNS` + `PERSIST_CONVERSATIONS`, with a note on what is capped vs stored. |
+| 8. Docs | **Done** | `CLAUDE.md` gained a Conversation History design section; `ARCHITECTURE.md` gained both tables, the new commands, and a corrected file tree. |
+| Tests | **Not started** ← NEXT | Everything so far is verified by throwaway scripts outside the repo. See *Verification*. |
 
-Steps 1-6 were exercised against a real SQLite DB and all pass. The feature is
-functionally complete: history persists, and users can inspect, disable, and
-delete it. **What remains is documentation and tests** (steps 7-8) — no
-behaviour changes.
+Steps 1-8 are done. The feature is complete and documented: history persists,
+and users can inspect, disable, and delete it. **The remaining gap is a real
+test suite** — every verification so far lives in throwaway scripts outside the
+repo, so none of it runs in CI.
 
 ### Architecture note — what the `main` merge changed
 
@@ -292,7 +292,7 @@ Register both in `main()` and add them to `cmd_start`'s help text. Turning persi
 
 Partial deletion (`/forget 2026-07-24`, or an interactive turn picker built on `list_turns`) is **not wired up now** — but `delete_day`, `delete_turns`, and `list_turns` exist and are tested, so adding the command later is a handler and nothing else.
 
-## Step 7 — `.env.example` ← NEXT
+## Step 7 — `.env.example` (DONE)
 
 Under `# App config`:
 
@@ -304,7 +304,7 @@ PERSIST_CONVERSATIONS=true      # global kill-switch; false = in-memory only
 
 `MAX_HISTORY_TURNS` is already read by the code today but was never documented.
 
-## Step 8 — docs
+## Step 8 — docs (DONE)
 
 Update `ARCHITECTURE.md`: the multi-user note at line 60 ("stored in memory per `chat_id`") is now wrong, and the schema section should gain the two new tables, the turn-as-deletion-unit rule, and the `/forget` + `/privacy` commands.
 
