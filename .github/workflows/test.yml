@@ -60,3 +60,70 @@ jobs:
             htmlcov/
             coverage.xml
             junit.xml
+
+  # The suite above runs directly on the runner, which says nothing about
+  # whether the images actually build. This job builds both targets and runs
+  # the suite inside the test image, i.e. what `make test-docker` does locally.
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: picnic-meal-planner:runtime
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          push: false
+          load: true
+          tags: picnic-meal-planner:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A plain `docker build` must keep producing the production image, not
+      # the test stage that sits in front of it in the Dockerfile.
+      - name: Default build target is the production runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: picnic-meal-planner:default
+          cache-from: type=gha
+
+      - name: Default target matches the runtime target
+        run: |
+          default=$(docker image inspect picnic-meal-planner:default --format '{{.Config.Cmd}} {{.Config.Entrypoint}}')
+          runtime=$(docker image inspect picnic-meal-planner:runtime --format '{{.Config.Cmd}} {{.Config.Entrypoint}}')
+          echo "default=$default"
+          echo "runtime=$runtime"
+          [ "$default" = "$runtime" ]
+
+      # Guards the documented production deploy step, `alembic upgrade head`,
+      # which needs these files present inside the image.
+      - name: Production image can run migrations
+        run: |
+          docker run --rm --entrypoint sh picnic-meal-planner:runtime -c '
+            test -f alembic.ini && test -d alembic/versions && echo "alembic present"
+          '
+          docker run --rm --entrypoint sh \
+            -e DB_PATH=/tmp/deploy-check.db picnic-meal-planner:runtime -c '
+              alembic upgrade head && echo "migrations applied"
+            '
+
+      - name: Run the suite inside the test image
+        run: docker compose -f docker-compose.test.yml run --rm picnic-test
