@@ -188,14 +188,32 @@ Deletion is available by chat (`clear_history`), by turn (`delete_turns`), and
 by day (`delete_day`).  Only the first is exposed over Telegram today, via
 `/forget`; the others are ready for a UI whenever one is wanted.
 
-### Truncation must land on a turn boundary
+### The window must never open mid-turn
 
-`trim_history()` never cuts mid-turn.  It scans *forward* from the naive cut
-point to the next real turn start, so it may drop more than strictly necessary
-— always the safe direction — and returns `[]` if no safe boundary exists.
-It also runs on load, so a tail left ragged by a deletion cannot produce a bad
-request.  `bot.py` trims *before* appending the new user message; trimming
-afterwards could discard the message the user just sent.
+Two mechanisms, at different layers:
+
+1. **Loading is turn-aware.** `load_recent_turns()` picks the most recent
+   *whole* turns that fit in `MAX_HISTORY_MESSAGES`, using the stored
+   `turn_id` rather than inferring boundaries.  A turn too large for the
+   window is dropped entirely, never truncated.
+2. **`trim_history()` is the backstop.** It scans *forward* from the naive cut
+   point to the next real turn start, so it may drop more than strictly
+   necessary — always the safe direction — and returns `[]` if no safe
+   boundary exists.  It validates the head **even when the input already
+   fits**; an earlier version short-circuited on length, which made it a no-op
+   in exactly the case it existed for.
+
+`bot.py` trims *before* appending the new user message; trimming afterwards
+could discard the message the user just sent.
+
+### A turn is only archived if it ended cleanly
+
+`_run_claude` discards, rather than persists, a turn whose final assistant
+message contains an unanswered `tool_use` (generation cut off mid-block, so
+`stop_reason` is `max_tokens` and the tool branch never runs) or whose content
+is empty.  Storing either would poison the chat permanently: the next request
+400s, and no later turn can repair it because `commit_turn` only runs on
+success.
 
 ### Serialization
 

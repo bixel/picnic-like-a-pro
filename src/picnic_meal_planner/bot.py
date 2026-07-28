@@ -99,8 +99,11 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
     client = _get_anthropic_client()
     tools = await _get_mcp_tools()
 
-    # Work on a copy; only commit to canonical history on success so that a
-    # failed API call never leaves two consecutive "user" turns in the history.
+    # Work on a copy; only commit to canonical history on success, so a failed
+    # API call leaves no half-written turn behind. (Two consecutive "user"
+    # messages are not themselves an error — the API merges same-role messages.
+    # The shapes that actually 400 are a non-user first message, an orphaned
+    # tool_result, and a dangling tool_use; see the guards before commit_turn.)
     #
     # Trim BEFORE appending the new turn, and only at a safe boundary: trimming
     # afterwards could slice away the message the user just sent, and a blind
@@ -132,12 +135,8 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
         # Append the assistant message to the conversation. Normalizing the SDK
         # blocks to plain dicts here keeps one representation for both the next
         # request and the stored row.
-        messages.append(
-            {
-                "role": "assistant",
-                "content": history.normalize_content(response.content),
-            }
-        )
+        normalized = history.normalize_content(response.content)
+        messages.append({"role": "assistant", "content": normalized})
 
         if response.stop_reason == "tool_use" and tool_uses:
             # Execute all requested tool calls
@@ -153,6 +152,34 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
                 )
             messages.append({"role": "user", "content": tool_results})
             continue
+
+        # The turn ended without the tool_use branch running. Two shapes are
+        # unsafe to archive, and both permanently break the chat if stored:
+        #
+        #  - a tool_use that will never be answered. Generation cut off mid
+        #    block (stop_reason "max_tokens") leaves tool_uses set while
+        #    stop_reason is not "tool_use", so control lands here.
+        #  - empty content, which the API rejects on the next request.
+        #
+        # Neither is repairable later: trim_history only fixes the head, and
+        # commit_turn runs only on success, so no subsequent turn can advance
+        # past a poisoned one. Discard rather than persist.
+        if tool_uses:
+            logger.warning(
+                "Discarding turn for chat %d: stop_reason=%r left a tool_use "
+                "unanswered", chat_id, response.stop_reason,
+            )
+            return (
+                "Sorry, I ran out of room mid-thought and didn't finish that. "
+                "Could you ask again, ideally a bit more specifically?"
+            )
+
+        if not normalized:
+            logger.warning(
+                "Discarding empty response for chat %d (stop_reason=%r)",
+                chat_id, response.stop_reason,
+            )
+            return "(no reply)"
 
         # Final response — commit the turn (memory + archive) and return text
         await history.commit_turn(chat_id, messages, new_from)

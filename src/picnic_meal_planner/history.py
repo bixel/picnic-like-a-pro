@@ -22,6 +22,7 @@ single-container deployment; a second replica would see stale caches and
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Iterable
@@ -34,7 +35,7 @@ from .db.queries import (
     delete_turns_in_range,
     get_chat_settings,
     get_db,
-    load_conversation,
+    load_recent_turns,
     set_chat_persist_history,
 )
 from .db.queries import delete_turns as _delete_turns_rows
@@ -119,12 +120,15 @@ def trim_history(messages: list[dict], max_messages: int) -> list[dict]:
     necessary — always the safe direction. Returns ``[]`` when no safe boundary
     exists inside the window, which starts the conversation fresh rather than
     sending a request the API would reject.
+
+    The head is validated **even when the input already fits**. An earlier
+    version returned a short list untouched, which made this function a no-op
+    in precisely the case it was written for: a list that is already at or
+    under the limit but begins mid-turn.
     """
     if max_messages <= 0:
         return []
-    if len(messages) <= max_messages:
-        return list(messages)
-    for i in range(len(messages) - max_messages, len(messages)):
+    for i in range(max(0, len(messages) - max_messages), len(messages)):
         if is_turn_start(messages[i]):
             return list(messages[i:])
     return []
@@ -135,15 +139,27 @@ def trim_history(messages: list[dict], max_messages: int) -> list[dict]:
 #
 # _loaded_chats is what distinguishes "not yet read from the DB" from
 # "genuinely empty" — a defaultdict cannot express that difference.
-#
-# Telegram updates for one chat are processed sequentially by python-telegram-
-# bot, so two turns for the same chat_id do not interleave and no lock is
-# needed here. If that ever changes, add a per-chat asyncio.Lock.
 # ---------------------------------------------------------------------------
 
 _contexts: dict[int, list[dict]] = {}
 _loaded_chats: set[int] = set()
 _persist_flags: dict[int, bool] = {}
+
+# append_turn allocates a turn id with MAX(turn_id) + 1, which is read-then-
+# write and therefore racy: concurrent commits for one chat would all read the
+# same maximum and collapse into a single turn, silently merging conversations
+# that later get deleted together.
+#
+# python-telegram-bot happens to serialise updates process-wide today (it
+# awaits each one unless `concurrent_updates` is set), so the race is not
+# reachable — but that is a property of the caller's configuration, not a
+# guarantee this module should depend on. Setting `concurrent_updates=True` in
+# bot.py would otherwise silently corrupt turn grouping.
+_turn_locks: dict[int, asyncio.Lock] = {}
+
+
+def _turn_lock(chat_id: int) -> asyncio.Lock:
+    return _turn_locks.setdefault(chat_id, asyncio.Lock())
 
 
 def invalidate(chat_id: int) -> None:
@@ -161,6 +177,7 @@ def _reset_caches() -> None:
     _contexts.clear()
     _loaded_chats.clear()
     _persist_flags.clear()
+    _turn_locks.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +239,12 @@ async def get_context(chat_id: int) -> list[dict]:
     if await is_persistence_enabled(chat_id):
         try:
             async with get_db() as session:
-                stored = await load_conversation(
-                    session, chat_id, limit=MAX_HISTORY_MESSAGES
+                # Loads whole turns, so the window cannot begin mid-turn.
+                stored = await load_recent_turns(
+                    session, chat_id, max_messages=MAX_HISTORY_MESSAGES
                 )
-            # Re-trim on load: a tail left ragged by a deletion (or written by
-            # an older, looser version) must not produce a bad request.
+            # Belt and braces: repairs a head left ragged by a skipped corrupt
+            # row, which turn-aware loading alone does not cover.
             messages = trim_history(stored, MAX_HISTORY_MESSAGES)
         except Exception:  # noqa: BLE001
             logger.exception("Could not load history for chat %d", chat_id)
@@ -251,11 +269,17 @@ async def commit_turn(chat_id: int, messages: list[dict], new_from: int) -> None
         return
 
     try:
-        async with get_db() as session:
-            await append_turn(session, chat_id, new_messages)
-            await session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("Could not persist turn for chat %d", chat_id)
+        # Serialises turn-id allocation for this chat; see _turn_locks above.
+        async with _turn_lock(chat_id):
+            async with get_db() as session:
+                await append_turn(session, chat_id, new_messages)
+                await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately not logger.exception: a DBAPIError traceback can carry
+        # the statement being executed, and the row here is the message itself.
+        logger.error(
+            "Could not persist turn for chat %d: %s", chat_id, type(exc).__name__
+        )
 
 
 # ---------------------------------------------------------------------------

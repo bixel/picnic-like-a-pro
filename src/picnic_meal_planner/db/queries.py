@@ -381,20 +381,86 @@ async def load_conversation(
         stmt = stmt.order_by(ConversationMessage.id.desc()).limit(limit)
 
     rows = (await session.execute(stmt)).all()
+    messages = _rows_to_messages(rows, chat_id)
 
+    if limit is not None:
+        messages.reverse()
+    return messages
+
+
+def _rows_to_messages(rows, chat_id: int) -> list[dict]:
+    """Decode ``(role, content)`` rows, skipping any whose JSON will not parse.
+
+    Content is always written with ``json.dumps``, so an unparseable row means
+    corruption or manual editing rather than anything a user can cause.
+
+    Skipping keeps the chat *loadable*, but note it does not guarantee the
+    result is a valid request: dropping a row from the middle of a turn can
+    orphan a ``tool_result``. ``trim_history`` repairs the head only. Fully
+    repairing this means dropping the whole turn — see the C2 note in
+    PLAN_CONVERSATION_HISTORY.md.
+    """
     messages: list[dict] = []
     for row in rows:
         try:
             content = json.loads(row.content)
         except (TypeError, ValueError):
-            # One unreadable row must not make the whole chat unusable.
             logger.warning("Skipping unparseable message for chat %d", chat_id)
             continue
         messages.append({"role": row.role, "content": content})
-
-    if limit is not None:
-        messages.reverse()
     return messages
+
+
+async def load_recent_turns(
+    session: AsyncSession, chat_id: int, *, max_messages: int
+) -> list[dict]:
+    """Return the most recent *whole* turns that fit within *max_messages*.
+
+    Loading by message count instead would cut mid-turn whenever the boundary
+    fell inside one, handing back a window that opens on an orphaned
+    ``tool_result`` — a 400 from the Messages API. Turn ids exist precisely so
+    the read path does not have to infer boundaries; this uses them.
+
+    A turn larger than *max_messages* on its own is dropped rather than
+    truncated, so the result may be empty.
+    """
+    if max_messages <= 0:
+        return []
+
+    counts = (
+        await session.execute(
+            select(
+                ConversationMessage.turn_id,
+                func.count().label("size"),
+            )
+            .where(ConversationMessage.chat_id == chat_id)
+            .group_by(ConversationMessage.turn_id)
+            .order_by(func.min(ConversationMessage.id).desc())
+        )
+    ).all()
+
+    keep: list[int] = []
+    total = 0
+    for row in counts:                      # newest turn first
+        if total + row.size > max_messages:
+            break                           # stop at the first turn that overflows
+        keep.append(row.turn_id)
+        total += row.size
+
+    if not keep:
+        return []
+
+    rows = (
+        await session.execute(
+            select(ConversationMessage.role, ConversationMessage.content)
+            .where(
+                ConversationMessage.chat_id == chat_id,
+                ConversationMessage.turn_id.in_(keep),
+            )
+            .order_by(ConversationMessage.id)
+        )
+    ).all()
+    return _rows_to_messages(rows, chat_id)
 
 
 async def append_turn(

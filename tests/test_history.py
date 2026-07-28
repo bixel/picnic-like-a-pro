@@ -189,6 +189,15 @@ class TestTrimHistory:
         unsafe = [{"role": "assistant", "content": "x"}] * 5
         assert history.trim_history(unsafe, 2) == []
 
+    def test_validates_the_head_even_when_input_already_fits(self):
+        """Regression: the length fast-path made this a no-op for a short list
+        that began mid-turn — exactly the case the function exists for."""
+        ragged = TOOL_TURN[2:]          # starts on the tool_result
+        assert not history.is_turn_start(ragged[0])
+
+        trimmed = history.trim_history(ragged, 99)   # comfortably under the limit
+        assert trimmed == [] or history.is_turn_start(trimmed[0])
+
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -229,6 +238,54 @@ class TestPersistence:
 
         assert len(await history.get_context(CHAT)) == 2      # window
         assert len(await history.list_turns(CHAT)) == 3       # archive
+
+    async def test_window_never_opens_mid_turn(self, db_path, monkeypatch):
+        """Regression (C1): loading by message count cut tool turns in half and
+        handed back a window starting on an orphaned tool_result — a 400."""
+        await _commit(CHAT, TOOL_TURN)
+        await _commit(CHAT, PLAIN_TURN)
+
+        # Every window size, including ones that fall inside the 4-message turn.
+        for size in range(1, 9):
+            monkeypatch.setattr(history, "MAX_HISTORY_MESSAGES", size)
+            history._reset_caches()
+            window = await history.get_context(CHAT)
+            assert not window or history.is_turn_start(window[0]), (
+                f"window of {size} opened mid-turn: {window[0]}"
+            )
+
+    async def test_window_never_contains_a_partial_turn(self, db_path, monkeypatch):
+        """A turn is loaded whole or not at all."""
+        await _commit(CHAT, TOOL_TURN)
+        await _commit(CHAT, PLAIN_TURN)
+
+        for size in range(1, 9):
+            monkeypatch.setattr(history, "MAX_HISTORY_MESSAGES", size)
+            history._reset_caches()
+            window = await history.get_context(CHAT)
+            # Only whole turns fit: 0, the 2-message turn, or both (6).
+            assert len(window) in (0, 2, 6), f"size={size} gave {len(window)}"
+
+    async def test_a_turn_larger_than_the_window_is_dropped_not_truncated(
+        self, db_path, monkeypatch
+    ):
+        await _commit(CHAT, TOOL_TURN)          # 4 messages
+        monkeypatch.setattr(history, "MAX_HISTORY_MESSAGES", 2)
+        history._reset_caches()
+        assert await history.get_context(CHAT) == []
+
+    async def test_concurrent_commits_get_distinct_turn_ids(self, db_path):
+        """Regression (M1): MAX(turn_id)+1 is read-then-write. Concurrent
+        commits used to collapse into one turn, so deleting 'a turn' would
+        delete several unrelated ones."""
+        import asyncio
+
+        await asyncio.gather(
+            *[history.commit_turn(CHAT, list(PLAIN_TURN), 0) for _ in range(8)]
+        )
+        turns = await history.list_turns(CHAT)
+        assert len(turns) == 8
+        assert [t["message_count"] for t in turns] == [2] * 8
 
     async def test_chats_are_isolated(self, db_path):
         await _commit(1, TOOL_TURN)
@@ -404,3 +461,48 @@ class TestFailureBehaviour:
     async def test_delete_turns_propagates(self, broken_db):
         with pytest.raises(Exception):
             await history.delete_turns(CHAT, [1])
+
+
+class TestWriteFailuresDoNotLeakContent:
+    """Regression (H1): a failed write used to log the message content.
+
+    SQLAlchemy appends "[parameters: ...]" to DBAPIError, and the parameters of
+    a conversation_messages INSERT *are* the conversation. Logs are typically
+    less protected than the database, so this defeated /privacy off entirely.
+    """
+
+    SECRET = "peanut allergy and the alarm code is 1234"
+
+    @pytest.fixture
+    async def poisoned_table(self, db_path):
+        """Recreate the table so every INSERT fails at execute time."""
+        from sqlalchemy import text
+
+        from picnic_meal_planner.db import engine as engine_mod
+
+        async with engine_mod.get_engine().begin() as conn:
+            await conn.execute(text("DROP TABLE conversation_messages"))
+            await conn.execute(text(
+                "CREATE TABLE conversation_messages ("
+                " id INTEGER PRIMARY KEY, chat_id INTEGER, turn_id INTEGER,"
+                " role TEXT, content TEXT, created_at TEXT,"
+                " CHECK (role = 'this-never-matches'))"
+            ))
+
+    async def test_content_is_absent_from_logs(self, poisoned_table, caplog):
+        caplog.set_level(0)          # capture everything, not just WARNING+
+
+        await history.commit_turn(
+            CHAT, [{"role": "user", "content": self.SECRET}], 0
+        )
+
+        assert self.SECRET not in caplog.text
+        assert "parameters" not in caplog.text.lower()
+
+    async def test_the_failure_is_still_reported(self, poisoned_table, caplog):
+        """Suppressing content must not suppress the fact that a write failed."""
+        caplog.set_level(0)
+        await history.commit_turn(
+            CHAT, [{"role": "user", "content": self.SECRET}], 0
+        )
+        assert "Could not persist turn" in caplog.text

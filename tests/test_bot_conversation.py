@@ -253,6 +253,62 @@ class TestRunClaudeToolUse:
         assert await bot._run_claude(1, "go") == "recovered"
 
 
+class TestRunClaudeUnfinishedTurns:
+    """Regression (C3): a turn that ends mid-tool_use must never be archived.
+
+    When generation is cut off inside a tool_use block, stop_reason is
+    "max_tokens" rather than "tool_use", so the tool-execution branch is
+    skipped. Persisting that message leaves a tool_use with no tool_result,
+    which the Messages API rejects — and nothing can repair it afterwards,
+    because trimming only fixes the head and commit_turn only runs on success.
+    The chat would 400 forever.
+    """
+
+    async def test_truncated_tool_use_is_not_persisted(self, fake_claude, db_path):
+        fake_claude([_Response(
+            [_TextBlock("let me look"), _ToolUseBlock("get_cart", {})],
+            stop_reason="max_tokens",
+        )])
+        await bot._run_claude(100, "what's in the cart?")
+
+        history._reset_caches()
+        assert await history.get_context(100) == []
+        assert await history.list_turns(100) == []
+
+    async def test_truncated_tool_use_tells_the_user(self, fake_claude, db_path):
+        fake_claude([_Response(
+            [_ToolUseBlock("get_cart", {})], stop_reason="max_tokens",
+        )])
+        reply = await bot._run_claude(100, "hi")
+        assert "ran out of room" in reply.lower()
+
+    async def test_chat_still_works_after_a_truncated_turn(
+        self, fake_claude, db_path
+    ):
+        """The proof that the poisoning is gone: the next turn succeeds."""
+        client = fake_claude([
+            _Response([_ToolUseBlock("get_cart", {})], stop_reason="max_tokens"),
+            _Response([_TextBlock("all good")]),
+        ])
+        await bot._run_claude(100, "first")
+        assert await bot._run_claude(100, "second") == "all good"
+
+        # The retry must not carry the abandoned tool_use forward.
+        sent = client.calls[1]["messages"]
+        assert not any(
+            isinstance(m["content"], list)
+            and any(b.get("type") == "tool_use" for b in m["content"])
+            for m in sent
+        )
+        assert len(await history.list_turns(100)) == 1   # only the good turn
+
+    async def test_empty_response_is_not_persisted(self, fake_claude, db_path):
+        fake_claude([_Response([])])
+        assert await bot._run_claude(100, "hi") == "(no reply)"
+        history._reset_caches()
+        assert await history.get_context(100) == []
+
+
 # ---------------------------------------------------------------------------
 # _chat handler
 # ---------------------------------------------------------------------------

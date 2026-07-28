@@ -62,8 +62,9 @@ future orders based on historical purchasing patterns.
   per `chat_id` in SQLite and cached in memory. It survives restarts, and there
   is no cross-user memory leakage. Storage can be disabled per chat or globally.
 - All family members talk to the same bot instance and can see/modify the shared cart.
-- The optional `ALLOWED_TELEGRAM_USER_IDS` env var restricts access to known family
-  members. Leave empty to allow any Telegram user.
+- `ALLOWED_TELEGRAM_USER_IDS` restricts access to known family members. It is
+  the only control protecting stored conversations: an empty value denies
+  everyone (set `ALLOW_ALL_USERS=true` for local dev instead).
 
 ### MCP transport modes
 | Mode | Transport | Use case |
@@ -137,6 +138,9 @@ picnic-like-a-pro/
 │   ├── test_mcp_tools.py
 │   ├── test_bot_helpers.py
 │   ├── test_bot_conversation.py
+│   ├── test_history.py         # Conversation history policy & persistence
+│   ├── test_db_engine.py
+│   ├── test_migrations.py
 │   └── test_conversations.py   # End-to-end scenario replays
 │
 └── data/
@@ -386,10 +390,10 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # App config
 DB_PATH=data/picnic.db
-ALLOWED_TELEGRAM_USER_IDS=123456789,987654321   # comma-separated, leave empty to allow all
+ALLOWED_TELEGRAM_USER_IDS=123456789,987654321   # comma-separated; leave empty to DENY all
 
 # Conversation history
-MAX_HISTORY_TURNS=20          # turns sent to the API per chat (messages = 2 x this)
+MAX_HISTORY_TURNS=20          # message cap for the API window = 2 x this (a tool turn is 4+ messages)
 PERSIST_CONVERSATIONS=true    # global kill-switch; false = in-memory only
 
 # MCP server (when run standalone)

@@ -28,9 +28,37 @@ see *Architecture note* immediately after this table.
 | 8. Docs | **Done** | `CLAUDE.md` gained a Conversation History design section; `ARCHITECTURE.md` gained both tables, the new commands, and a corrected file tree. |
 | Tests | **Done** | `tests/test_history.py` (55 tests) plus `/forget` and `/privacy` coverage in `tests/test_bot_conversation.py`. Runs in CI with the rest of the suite. |
 
-**All steps are done.** History persists, users can inspect, disable, and
-delete it, it is documented, and it is covered by the repo's test suite
-(427 tests pass, 66 of them new).
+**All steps are done, and a post-implementation review pass has been applied.**
+History persists, users can inspect, disable, and delete it, it is documented,
+and it is covered by the repo's test suite (438 tests pass).
+
+### Review findings fixed
+
+An independent architecture review and security review ran against the finished
+feature. Four defects were confirmed by reproduction and fixed:
+
+| | Defect | Fix |
+|---|---|---|
+| **C3** | A turn cut off mid-`tool_use` (`stop_reason="max_tokens"`) was archived with no `tool_result`, 400-ing the chat **permanently** — unrepairable, since `commit_turn` only runs on success | `_run_claude` discards a turn ending with an unanswered `tool_use` or empty content |
+| **C1** | `get_context` could return a window opening on an orphaned `tool_result`; `trim_history` short-circuited on length so its guard never ran, and only an off-by-one in `bot.py` prevented a 400 | `load_recent_turns` loads whole turns via `turn_id`; `trim_history` validates the head unconditionally |
+| **H1** | A failed write logged the message content — SQLAlchemy appends `[parameters: ...]` to `DBAPIError`, and `aiosqlite` logs statements at DEBUG | `hide_parameters=True`, driver logging clamped, and the handler logs the exception *type* only |
+| **M1** | `MAX(turn_id)+1` is read-then-write; concurrent commits collapsed 8 turns into 1 | Per-chat `asyncio.Lock` around allocation |
+
+Each has a regression test that fails against the old code.
+
+### Open, not fixed
+
+- **C2** — a corrupt row is skipped individually, which can orphan a
+  `tool_result` mid-list. Correct fix is to drop the whole turn. Requires
+  DB corruption to reach, so not user-triggerable.
+- **m1** — `idx_conversation_messages_time` is used by no query
+  (`EXPLAIN QUERY PLAN` confirmed); `(chat_id, turn_id)` would be useful
+  instead. Needs a migration.
+- **M3/m7** — the tool-use loop in `_run_claude` is unbounded.
+- **M2** — `tool_result` is unbounded `str(result)`; ~10 KB per
+  `get_order_history`, re-uploaded every request while in the window.
+- **Security M1** — a de-authorized user can no longer `/forget` their own data.
+- **L5** — `uv.lock` is gitignored, so Docker/CI resolve dependencies unpinned.
 
 `main` has been merged twice: first for the SQLAlchemy/Alembic refactor, then
 for the test suite and Docker/CI work. See *Merge surface* for what that cost.
@@ -109,8 +137,10 @@ a stale copy of it here.
 - **`src/picnic_meal_planner/db/models.py`** — `ConversationMessage`
   (`id`, `chat_id`, `turn_id`, `role`, `content` JSON-as-Text, `created_at`)
   with `idx_conversation_messages_chat` on `(chat_id, id)` for sequential reads
-  and `idx_conversation_messages_time` on `(chat_id, created_at)` for day-range
-  deletes; and `ChatSettings` (`chat_id` PK, `persist_history`, `updated_at`).
+  and `idx_conversation_messages_time` on `(chat_id, created_at)`, intended for
+  day-range deletes but **in fact unused** — `delete_turns_in_range` filters on
+  `HAVING MIN(created_at)` after grouping, which that index cannot serve
+  (`EXPLAIN QUERY PLAN` confirms no query uses it; see open items); and `ChatSettings` (`chat_id` PK, `persist_history`, `updated_at`).
   Both docstrings state the turn-as-deletion-unit rule.
 - **`alembic/versions/0002_conversation_history.py`** — additive migration on
   top of `0001`. Touches no existing table, so it is safe on a populated DB and
@@ -166,7 +196,9 @@ def trim_history(messages: list[dict], max_messages: int) -> list[dict]:
     necessary — always the safe direction. Returns [] if no safe boundary exists."""
 ```
 
-Guarantees the current slice violates: the first message is never an `assistant` message, and never contains an orphaned `tool_result`. This also runs on load, so a tail left ragged by a deletion can't produce a bad request.
+Guarantees the current slice violates: the first message is never an `assistant` message, and never contains an orphaned `tool_result`.
+
+> **Corrected after review.** This section originally claimed trimming "also runs on load, so a tail left ragged by a deletion can't produce a bad request". It did not: `trim_history` short-circuited when the input was already under the limit, which is exactly the case on load. Fixed two ways — `load_recent_turns` now loads whole turns using `turn_id`, and `trim_history` validates the head unconditionally.
 
 **Call-order change:** trim the *base* history first, then append the new user message. Today `bot.py` appends first and trims after, which can slice away the message the user just sent when the previous turn was tool-heavy.
 
