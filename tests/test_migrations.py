@@ -106,9 +106,16 @@ class TestMigrationRuns:
     def test_upgrade_head_creates_database(self, migrated_db):
         assert migrated_db.exists()
 
-    def test_upgrade_head_creates_all_four_tables(self, migrated_db):
+    def test_upgrade_head_creates_all_tables(self, migrated_db):
         tables = set(_schema_snapshot(migrated_db))
-        assert tables == {"products", "orders", "order_items", "import_checkpoints"}
+        assert tables == {
+            "products",
+            "orders",
+            "order_items",
+            "import_checkpoints",
+            "conversation_messages",
+            "chat_settings",
+        }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):
         engine = create_engine(f"sqlite:///{migrated_db}")

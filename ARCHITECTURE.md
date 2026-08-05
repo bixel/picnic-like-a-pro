@@ -51,17 +51,20 @@ future orders based on historical purchasing patterns.
 │                   │   │  products    orders    order_items            │
 │  Shared family    │   │  meal_plans  meal_plan_items                  │
 │  account          │   │  import_checkpoints  (for stepwise sync)      │
+│                   │   │  conversation_messages  chat_settings         │
 │  NL / DE / BE     │   │                                               │
 └───────────────────┘   └──────────────────────────────────────────────┘
 ```
 
 ### Multi-user design notes
 - The **Picnic account is shared** (one family account). Cart and orders are global.
-- Each **Telegram user gets their own conversation history** with Claude, stored in
-  memory per `chat_id`. There is no cross-user memory leakage.
+- Each **Telegram user gets their own conversation history** with Claude, stored
+  per `chat_id` in SQLite and cached in memory. It survives restarts, and there
+  is no cross-user memory leakage. Storage can be disabled per chat or globally.
 - All family members talk to the same bot instance and can see/modify the shared cart.
-- The optional `ALLOWED_TELEGRAM_USER_IDS` env var restricts access to known family
-  members. Leave empty to allow any Telegram user.
+- `ALLOWED_TELEGRAM_USER_IDS` restricts access to known family members. It is
+  the only control protecting stored conversations: an empty value denies
+  everyone (set `ALLOW_ALL_USERS=true` for local dev instead).
 
 ### MCP transport modes
 | Mode | Transport | Use case |
@@ -91,16 +94,23 @@ picnic-like-a-pro/
 ├── docker-compose.test.yml     # Automated tests + coverage
 ├── .gitignore
 │
+├── alembic.ini                 # Alembic config (DB URL from DB_PATH at runtime)
+├── alembic/
+│   ├── env.py                  # Async migration env
+│   └── versions/               # 0001 initial schema, 0002 conversation history
+│
 ├── src/
 │   └── picnic_meal_planner/
 │       ├── __init__.py
 │       │
 │       ├── bot.py              # Telegram bot entry point
+│       ├── history.py          # Conversation history policy & persistence
 │       ├── mcp_server.py       # FastMCP server (all tools)
 │       │
 │       ├── db/
 │       │   ├── __init__.py
-│       │   ├── schema.py       # Table definitions (CREATE TABLE statements)
+│       │   ├── engine.py       # Async engine, session factory, init_db()
+│       │   ├── models.py       # SQLAlchemy ORM models
 │       │   └── queries.py      # Async query helpers
 │       │
 │       ├── picnic/
@@ -128,6 +138,9 @@ picnic-like-a-pro/
 │   ├── test_mcp_tools.py
 │   ├── test_bot_helpers.py
 │   ├── test_bot_conversation.py
+│   ├── test_history.py         # Conversation history policy & persistence
+│   ├── test_db_engine.py
+│   ├── test_migrations.py
 │   └── test_conversations.py   # End-to-end scenario replays
 │
 └── data/
@@ -229,6 +242,33 @@ without re-fetching already-imported deliveries or hammering the Picnic API.
 | total_imported | INTEGER | Cumulative count of deliveries imported |
 | finished      | INTEGER | 0 = more pages remain, 1 = fully done   |
 
+### `conversation_messages`
+Per-chat conversation history with Claude. Messages are grouped into **turns**
+(`turn_id`); a turn is everything one exchange produced, and is the unit of
+deletion — removing a single message could orphan a `tool_result` block and
+cause an API 400.
+
+| Column     | Type    | Notes                                    |
+|------------|---------|------------------------------------------|
+| id         | INTEGER PK AUTOINCREMENT | Insertion order == conversation order |
+| chat_id    | INTEGER | Telegram chat id (no FK; external)       |
+| turn_id    | INTEGER | Per-chat, monotonic; groups one exchange |
+| role       | TEXT    | `user` or `assistant`                    |
+| content    | TEXT    | JSON: a string, or a list of content blocks |
+| created_at | TEXT    | ISO datetime                             |
+
+Indexed on `(chat_id, id)` for sequential reads and `(chat_id, created_at)` for
+day-range deletion.
+
+### `chat_settings`
+Per-chat preferences; currently just the storage opt-out.
+
+| Column          | Type    | Notes                              |
+|-----------------|---------|------------------------------------|
+| chat_id         | INTEGER PK | Telegram chat id                |
+| persist_history | INTEGER | 0 = chat opted out of storage      |
+| updated_at      | TEXT    | ISO datetime                       |
+
 ### `meal_plans`
 Optional: track planned meals to drive shopping list generation.
 
@@ -312,14 +352,25 @@ decomposition) can replace just the `engine.py` file later without touching anyt
 | `/forecast` | Ask Claude what you're likely running low on |
 | `/history` | Show recent order summary |
 | `/cart` | Show current Picnic cart |
+| `/forget` | Delete this chat's stored conversation |
+| `/privacy` | Show or change whether the conversation is saved (`on` / `off`) |
 
 ### Conversation model
 Each message in a chat session is forwarded to the Anthropic API with:
-- Full conversation history (last N turns, configurable)
+- Recent conversation history (last N turns, configurable via `MAX_HISTORY_TURNS`)
 - All MCP tools available
 - A system prompt describing the assistant's role as a family grocery/meal planner
 
 Claude autonomously decides which MCP tools to call and presents results conversationally.
+
+History is **persisted to SQLite** and survives restarts. The full transcript is
+archived; only the window sent to the API is capped. Policy lives in
+`history.py` — `bot.py` just reads a context and commits a completed turn.
+
+Storage is opt-out at two levels: per chat via `/privacy off` (which also
+deletes what is already stored), and globally via `PERSIST_CONVERSATIONS=false`.
+Disabling storage does not wipe the in-progress conversation from memory — it
+simply stops being written down.
 
 ---
 
@@ -339,7 +390,11 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # App config
 DB_PATH=data/picnic.db
-ALLOWED_TELEGRAM_USER_IDS=123456789,987654321   # comma-separated, leave empty to allow all
+ALLOWED_TELEGRAM_USER_IDS=123456789,987654321   # comma-separated; leave empty to DENY all
+
+# Conversation history
+MAX_HISTORY_TURNS=20          # message cap for the API window = 2 x this (a tool turn is 4+ messages)
+PERSIST_CONVERSATIONS=true    # global kill-switch; false = in-memory only
 
 # MCP server (when run standalone)
 MCP_TRANSPORT=stdio           # stdio | sse | http
