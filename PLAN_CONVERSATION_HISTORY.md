@@ -48,17 +48,15 @@ Each has a regression test that fails against the old code.
 
 ### Open, not fixed
 
-- **C2** — a corrupt row is skipped individually, which can orphan a
-  `tool_result` mid-list. Correct fix is to drop the whole turn. Requires
-  DB corruption to reach, so not user-triggerable.
-- **m1** — `idx_conversation_messages_time` is used by no query
-  (`EXPLAIN QUERY PLAN` confirmed); `(chat_id, turn_id)` would be useful
-  instead. Needs a migration.
-- **M3/m7** — the tool-use loop in `_run_claude` is unbounded.
-- **M2** — `tool_result` is unbounded `str(result)`; ~10 KB per
-  `get_order_history`, re-uploaded every request while in the window.
-- **Security M1** — a de-authorized user can no longer `/forget` their own data.
-- **L5** — `uv.lock` is gitignored, so Docker/CI resolve dependencies unpinned.
+Extracted to **`OPEN_POINTS.md`** — the live list, kept condensed, grouped by
+whether it is worth doing next. Nothing there is a known-broken user-facing
+behaviour.
+
+### Verifying this branch
+
+**`VERIFY_LOCALLY.md`** walks through it in three tiers: the suite and
+migrations, then the feature against a real SQLite file with no credentials at
+all, then end to end over Telegram with a mocked Picnic API.
 
 `main` has been merged twice: first for the SQLAlchemy/Alembic refactor, then
 for the test suite and Docker/CI work. See *Merge surface* for what that cost.
