@@ -1,11 +1,15 @@
 # Verifying the conversation-history branch locally
 
-Three tiers, cheapest first. **Tier 0 and 1 need no credentials at all.**
-Tier 2 is the only one that proves the Telegram transport and that the real
-Anthropic API accepts what we store — everything below it uses stubs.
+Cheapest first. **Tiers 0 and 1 need no credentials and no Docker.** Tier 2
+runs the real bot locally with plain Python — the first tier that proves the
+Telegram transport and that the Anthropic API accepts what we store, since
+everything below it uses stubs. Tier 3 is Docker, and is optional: it proves
+packaging, not behaviour.
 
 Every command was run on this branch before being written down; the expected
-output is what it actually produced.
+output is what it actually produced. The exceptions are the steps that need
+outbound Telegram/Anthropic access or a Docker daemon — neither was available
+where this was written, and those are called out where they appear.
 
 ```bash
 git checkout claude/persist-conversation-history-90CmU
@@ -211,66 +215,131 @@ deletion safe. (Uses Python's stdlib, so no `sqlite3` CLI needed.)
 
 ---
 
-## Tier 2 — end to end over Telegram (~30 min)
+## Tier 2 — the real bot, run locally with plain Python (~30 min)
 
-This is the only tier that exercises the Telegram transport and a **real**
-Anthropic call. Nothing below Tier 2 proves the API accepts our normalized
-content, because every test above stubs the client.
+No Docker. This runs the same `uv run bot` entry point the container runs, just
+directly on your machine, so a "restart" is Ctrl-C and up-arrow.
+
+This is the first tier that exercises the Telegram transport and a **real**
+Anthropic call. Nothing below it proves the API accepts our normalized content,
+because every test above stubs the client.
 
 **You need:** a *second* Telegram bot token (never the production one — talk to
-@BotFather), an `ANTHROPIC_API_KEY`, and Docker. The Picnic API is mocked, so
-no real order can be placed and no Picnic credentials are used.
+@BotFather) and an `ANTHROPIC_API_KEY`. The Picnic API is mocked, so no Picnic
+credentials are used and no real order can be placed.
+
+### Configure
+
+Export everything rather than editing `.env`. `load_dotenv()` runs with
+`override=False`, so exported variables win — but anything you *don't* export
+is still filled in from a `.env` in the repo root, and that includes
+`TELEGRAM_BOT_TOKEN`.
+
+> **Export the token explicitly.** If you have a production `.env`, an
+> unexported token means this local process starts polling with your
+> **production** bot. Two pollers on one token fight over updates and Telegram
+> will error — and your family would be talking to this test process.
 
 ```bash
-cp .env.mock.example .env.mock
-# edit .env.mock: TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY,
-#                 ALLOWED_TELEGRAM_USER_IDS=<your telegram user id>
+export TELEGRAM_BOT_TOKEN='<your TEST bot token>'
+export ANTHROPIC_API_KEY='sk-ant-...'
+export ALLOWED_TELEGRAM_USER_IDS='<your telegram user id>'   # or ALLOW_ALL_USERS=true
+export PICNIC_MOCK=true
+export DB_PATH="$PWD/data/verify.db"
+export PERSIST_CONVERSATIONS=true
 ```
 
-The mock image is pulled from ghcr by default. To run *your* branch, build it:
+### Create the schema, then start
 
 ```bash
-docker build --target runtime -t picnic-local:verify .
-# then in docker-compose.mock.yml point image: at picnic-local:verify
-make mock-up && make mock-logs
+rm -f "$DB_PATH"
+uv run alembic upgrade head     # 0001, then 0002
+uv run bot
 ```
 
-**Startup check:** the log should show
-`Database initialised. Conversation persistence: on`.
+Run `alembic upgrade head` yourself rather than relying on startup. `bot.py`'s
+`_post_init` does call `init_db()`, but PTB runs `post_init` *after* it has
+bootstrapped a Telegram connection — so on a fresh DB no tables exist until
+Telegram is reachable, and doing it explicitly also matches the production
+deploy step.
 
-> The image runs `alembic upgrade head`? **No** — it is the documented deploy
-> step, not automatic. `init_db()` in `_post_init` creates missing tables on a
-> fresh volume, which is fine here. On a volume that predates this branch, run
-> `docker compose -f docker-compose.mock.yml run --rm picnic-bot-mock \
-> alembic upgrade head` first, and `alembic stamp head` if that DB was
-> originally created by `init_db()`.
+**Startup looks like:**
+```
+... - picnic_meal_planner.bot - INFO - Database initialised. Conversation persistence: on
+... - picnic_meal_planner.bot - INFO - Starting bot with long polling...
+```
 
-Then, in Telegram:
+If instead you get `Network Retry Loop (Bootstrap Initialize Application)` with
+an httpx/proxy error, that is Telegram connectivity — a bad token, or a network
+that blocks `api.telegram.org`. It is not a problem with this branch.
+
+### Walk through it in Telegram
+
+**Restart** below means: `Ctrl-C` in the terminal, then `uv run bot` again.
 
 | # | Do this | Expect |
 |---|---|---|
 | 1 | `/start` | Help text listing `/forget` and `/privacy` |
 | 2 | "we usually buy oat milk on Fridays" | A normal reply |
 | 3 | "what did I just tell you?" | It remembers — in-session context works |
-| 4 | `make mock-down && make mock-up` | Container restarts |
+| 4 | **Restart** | Comes back up |
 | 5 | "what did I tell you about Fridays?" | **It still remembers.** This is the feature |
-| 6 | `/forecast` (forces tool use), then restart, then a follow-up | Coherent — a tool turn survived storage and replay. This is the case most likely to 400 if serialization were wrong |
+| 6 | `/forecast` (forces tool use), **restart**, then a follow-up | Coherent. A tool turn survived storage and replay — the case most likely to 400 if serialization were wrong |
 | 7 | `/privacy` | Reports `ON` and explains the options |
 | 8 | `/privacy off` | Confirms it stopped saving **and deleted** what was stored |
-| 9 | Chat, then restart, then ask about it | Forgotten — nothing was written while off |
-| 10 | `/privacy on`, chat, restart, ask | Remembers again |
+| 9 | Chat, **restart**, ask about it | Forgotten — nothing was written while off |
+| 10 | `/privacy on`, chat, **restart**, ask | Remembers again |
 | 11 | `/forget` | "deleted N stored message(s)"; the bot loses the thread |
 | 12 | `/forget` again | "There was nothing stored." |
 
-Confirm on disk between steps:
+### Watch the database while it runs
+
+In a second terminal, `export DB_PATH=...` to the same path and run this after
+each step:
+
 ```bash
-docker compose -f docker-compose.mock.yml exec picnic-bot-mock \
-  python -c "import sqlite3;print(sqlite3.connect('data/picnic-mock.db')\
-.execute('SELECT COUNT(*) FROM conversation_messages').fetchone())"
+uv run python -c "
+import sqlite3, os
+c = sqlite3.connect(os.environ['DB_PATH'])
+print('messages:', c.execute('SELECT COUNT(*) FROM conversation_messages').fetchone()[0])
+print('turns   :', c.execute('SELECT COUNT(DISTINCT turn_id) FROM conversation_messages').fetchone()[0])
+print('settings:', c.execute('SELECT * FROM chat_settings').fetchall())
+"
 ```
 
-**Tear down:** `make mock-down` — or `docker compose -f docker-compose.mock.yml
-down -v` to drop the volume too.
+SQLite handles the concurrent read fine while the bot is running. Wrap it in
+`watch -n2 '...'` if you want it live — using single quotes outside, since the
+snippet already contains double quotes (and note `watch` is not installed by
+default on macOS).
+
+Step 6 is the interesting one: a `/forecast` turn should add **4+** messages
+under a *single* `turn_id`, not 2. That grouping is what makes `/forget` and
+turn-level deletion safe.
+
+**Clean up:** `rm -f "$DB_PATH"`, and unset the exports (or just close the
+shell) so you don't leave `PICNIC_MOCK=true` lying around.
+
+---
+
+## Tier 3 (optional) — the same thing in Docker
+
+Only worth doing if you want parity with CI and production images; it proves
+packaging, not behaviour. Tier 2 already covered the feature.
+
+```bash
+docker build --target runtime -t picnic-local:verify .
+cp .env.mock.example .env.mock     # fill in the TEST token + Anthropic key
+# point `image:` in docker-compose.mock.yml at picnic-local:verify
+make mock-up && make mock-logs
+```
+
+Here `_post_init`'s `init_db()` does create the tables on a fresh volume. On a
+volume that predates this branch, run
+`docker compose -f docker-compose.mock.yml run --rm picnic-bot-mock alembic
+upgrade head` first — and `alembic stamp head` before that if the DB was
+originally created by `init_db()` rather than Alembic.
+
+**Tear down:** `make mock-down`, or add `-v` to drop the volume.
 
 ---
 
@@ -281,6 +350,7 @@ down -v` to drop the volume too.
 | 0 | Logic, migrations, no regressions | Anything about real I/O |
 | 1 | Persistence, turn integrity, deletion, opt-out, log hygiene against a real SQLite file | Telegram, or that the Anthropic API accepts our messages |
 | 2 | The whole path, including a real API round-trip | Behaviour against a *large* archive, or the real Picnic API |
+| 3 | The image builds and runs the same way | Nothing about the feature that tier 2 didn't |
 
 ---
 
