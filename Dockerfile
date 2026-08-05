@@ -3,8 +3,10 @@
 # ---------------------------------------------------------------------------
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
 WORKDIR /app
-COPY pyproject.toml uv.lock* ./
-RUN uv sync --frozen --no-dev --no-install-project 2>/dev/null || uv sync --no-dev --no-install-project
+COPY pyproject.toml uv.lock ./
+# --frozen with no fallback: a missing or stale lock must fail the build rather
+# than silently resolving fresh from PyPI. Run `uv lock` after editing deps.
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ---------------------------------------------------------------------------
 # Stage 2: test image (dev dependencies + test suite)
@@ -15,8 +17,8 @@ RUN uv sync --frozen --no-dev --no-install-project 2>/dev/null || uv sync --no-d
 # ---------------------------------------------------------------------------
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS test
 WORKDIR /app
-COPY pyproject.toml uv.lock* ./
-RUN uv sync --frozen --group dev --no-install-project 2>/dev/null || uv sync --group dev --no-install-project
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --group dev --no-install-project
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY tests/ ./tests/

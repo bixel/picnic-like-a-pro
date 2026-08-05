@@ -12,6 +12,10 @@ git checkout claude/persist-conversation-history-90CmU
 make install          # uv sync --group dev
 ```
 
+`uv.lock` is committed, so this installs the exact versions CI uses. If you
+have a pre-existing `.venv` from before that change, `uv sync --frozen --group
+dev` will reconcile it.
+
 ---
 
 ## Tier 0 — the suite and the migration (~2 min)

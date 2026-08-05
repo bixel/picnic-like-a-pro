@@ -14,15 +14,19 @@ Sizes: **XS** minutes · **S** under an hour · **M** half a day.
 
 ## 1. Worth doing next
 
-### 1.1 Commit `uv.lock` — XS, supply chain
-`.gitignore:11` ignores it and it is untracked. `Dockerfile:7,19` runs
-`uv sync --frozen ... || uv sync ...`, and `COPY pyproject.toml uv.lock* ./`
-globs to nothing, so `--frozen` fails and the fallback resolves fresh from
-PyPI. Every image build and CI run pulls whatever PyPI serves that day; a
-compromised transitive dependency would land with no diff and no reproducible
-build to compare against.
-**Fix:** untrack from `.gitignore`, commit the lock, drop the `||` fallback so
-a missing lock fails loudly.
+### 1.1 Migrate to `mcp` 2.x — M
+Pinned to `<2` in `pyproject.toml` because mcp 2.0 removed
+`mcp.server.fastmcp`, which `mcp_server.py` imports. The pin is a stopgap:
+staying on 1.x indefinitely means missing fixes and, eventually, a harder
+migration. Porting means reworking how the 15 tools are registered and how
+`get_tool_schemas()` introspects them.
+
+> ~~**1.1 Commit `uv.lock`**~~ — **done.** It was gitignored, so Docker and CI
+> resolved dependencies fresh from PyPI on every build. That is precisely how
+> `mcp` 2.0 entered CI and broke the build while local runs stayed green on a
+> stale 1.28.1. The lock is now committed and the `|| uv sync` fallback removed
+> from the `Dockerfile`, so a stale lock fails the build loudly instead of
+> silently re-resolving.
 
 ### 1.2 Bound the tool-use loop — S, cost/availability
 `bot.py` runs `while True` with no iteration cap and no request timeout. The
