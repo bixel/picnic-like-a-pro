@@ -273,6 +273,80 @@ If instead you get `Network Retry Loop (Bootstrap Initialize Application)` with
 an httpx/proxy error, that is Telegram connectivity — a bad token, or a network
 that blocks `api.telegram.org`. It is not a problem with this branch.
 
+### If you get `AuthenticationError: 401 — API key is invalid`
+
+The bot is fine — Telegram connected, the DB initialised, and the request
+reached Anthropic, which rejected the key. Nothing was stored (a failed turn is
+never persisted), so the database is untouched.
+
+`bot.py` reads `os.environ["ANTHROPIC_API_KEY"]`, which would raise `KeyError`
+if it were unset. So *something* supplied a value Anthropic doesn't accept.
+Three placeholders in this repo are the usual culprits:
+
+| File | Value |
+|---|---|
+| `.env.example` | `sk-ant-...` |
+| `.env.mock.example` | `REPLACE_WITH_API_KEY` |
+| `.env.test` | `sk-ant-test-key-not-real` |
+
+If you copied one of those to `.env` and did not export a real key, `load_dotenv()`
+supplies the placeholder. Find out which source wins:
+
+```bash
+uv run python - <<'EOF'
+import os
+from dotenv import dotenv_values, find_dotenv, load_dotenv
+
+PLACEHOLDERS = {"sk-ant-...", "REPLACE_WITH_API_KEY", "sk-ant-test-key-not-real"}
+
+def shape(v):
+    if v is None:
+        return "<unset>"
+    clean = v.strip().strip('"').strip("'")
+    notes = []
+    if v != clean:            notes.append("HAS SURROUNDING WHITESPACE/QUOTES")
+    if clean in PLACEHOLDERS: notes.append("IS A PLACEHOLDER FROM THE REPO")
+    if "\n" in v or "\r" in v: notes.append("CONTAINS A NEWLINE")
+    if not clean.startswith("sk-ant-"):
+        notes.append(f"DOES NOT START WITH sk-ant- (starts {clean[:7]!r})")
+    return (f"len={len(v)} {clean[:11]}...{clean[-4:] if len(clean) > 15 else ''}"
+            + ("  <-- " + "; ".join(notes) if notes else "  (looks well-formed)"))
+
+print("1. exported in your shell :", shape(os.environ.get("ANTHROPIC_API_KEY")))
+path = find_dotenv(usecwd=True)
+print("2. dotenv file found      :", path or "<none>")
+if path:
+    print("   value inside it        :", shape(dotenv_values(path).get("ANTHROPIC_API_KEY")))
+load_dotenv()          # exactly what bot.py does; override=False
+print("3. what bot.py will use   :", shape(os.environ.get("ANTHROPIC_API_KEY")))
+EOF
+```
+
+It prints only the length and the first/last few characters, never the key.
+Line 3 is what the bot uses; a shell export wins over the dotenv file, so if
+line 1 is `<unset>` the value in line 2 is the one being sent.
+
+Then confirm the key independently of the bot:
+
+```bash
+uv run python -c "
+import anthropic, os
+try:
+    anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY']).messages.create(
+        model='claude-sonnet-4-6', max_tokens=8,
+        messages=[{'role':'user','content':'hi'}])
+    print('KEY WORKS')
+except anthropic.AuthenticationError:
+    print('AUTH FAILED (401) — reached Anthropic and was rejected')
+"
+```
+
+If that says `AUTH FAILED`, the key itself is the problem, not this project.
+Common causes beyond the placeholders: a trailing newline from copy-paste, a
+Console *session* token rather than an API key, or a key from a different
+workspace. Mint a fresh one at console.anthropic.com and
+`export ANTHROPIC_API_KEY='sk-ant-...'` in the shell you run `uv run bot` from.
+
 ### Walk through it in Telegram
 
 **Restart** below means: `Ctrl-C` in the terminal, then `uv run bot` again.
