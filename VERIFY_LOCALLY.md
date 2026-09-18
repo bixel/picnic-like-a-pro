@@ -249,12 +249,12 @@ export DB_PATH="$PWD/data/verify.db"
 export PERSIST_CONVERSATIONS=true
 ```
 
-### Create the schema, then start
+### Create the schema, then preflight
 
 ```bash
 rm -f "$DB_PATH"
 uv run alembic upgrade head     # 0001, then 0002
-uv run bot
+uv run python scripts/preflight.py
 ```
 
 Run `alembic upgrade head` yourself rather than relying on startup. `bot.py`'s
@@ -262,6 +262,32 @@ Run `alembic upgrade head` yourself rather than relying on startup. `bot.py`'s
 bootstrapped a Telegram connection — so on a fresh DB no tables exist until
 Telegram is reachable, and doing it explicitly also matches the production
 deploy step.
+
+**`scripts/preflight.py` checks everything the bot needs before it starts**, so
+a bad value surfaces here rather than as a 401 halfway through the walkthrough.
+It validates both tokens against the live APIs, flags placeholder values copied
+from the env templates, checks the allowlist actually allows you, confirms the
+conversation tables exist, and reports whether persistence is on. Secrets are
+never printed — only length and first/last characters. Add `--offline` to skip
+the two network calls.
+
+The Telegram check prints the bot's `@username`:
+
+```
+PASS  telegram api   token valid — bot is @my_test_bot  <-- confirm this is your TEST bot
+```
+
+Check that name. If it is your production bot, stop: two pollers on one token
+fight over updates, and your family is talking to this process.
+
+A clean run ends with `All checks passed. Safe to run uv run bot.` Anything
+marked `FAIL` is listed again at the bottom with what to do about it.
+
+### Start it
+
+```bash
+uv run bot
+```
 
 **Startup looks like:**
 ```
@@ -274,6 +300,10 @@ an httpx/proxy error, that is Telegram connectivity — a bad token, or a networ
 that blocks `api.telegram.org`. It is not a problem with this branch.
 
 ### If you get `AuthenticationError: 401 — API key is invalid`
+
+`uv run python scripts/preflight.py` diagnoses this directly — it is the
+`anthropic api` line. The rest of this section is the manual version, and
+explains why it happens.
 
 The bot is fine — Telegram connected, the DB initialised, and the request
 reached Anthropic, which rejected the key. Nothing was stored (a failed turn is
