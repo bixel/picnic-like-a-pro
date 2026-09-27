@@ -7,7 +7,7 @@ import string
 
 import pytest
 
-from picnic_meal_planner import bot
+from picnic_meal_planner import bot, llm
 
 
 class TestSplitMessage:
@@ -97,22 +97,23 @@ class TestAccessControl:
         assert bot._allowed_user_ids() == {123, 456}
 
 
-class TestAnthropicClient:
+class TestLlmClient:
     def test_client_is_built_from_env_key(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        assert bot._get_anthropic_client() is not None
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        client = llm.get_client()
+        assert str(client.base_url).startswith("https://openrouter.ai/api/v1")
 
     def test_client_is_cached(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        assert bot._get_anthropic_client() is bot._get_anthropic_client()
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        assert llm.get_client() is llm.get_client()
 
     def test_missing_api_key_raises(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         with pytest.raises(KeyError):
-            bot._get_anthropic_client()
+            llm.get_client()
 
 
 class TestMcpToolWiring:

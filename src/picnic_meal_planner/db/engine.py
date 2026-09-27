@@ -16,7 +16,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -92,6 +92,31 @@ async def init_db() -> None:
     """
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def missing_columns() -> list[str]:
+    """``table.column`` for every model column absent from the live database.
+
+    ``create_all`` creates missing *tables* but never alters an existing one,
+    so a database bootstrapped by :func:`init_db` and then upgraded without
+    ``alembic upgrade head`` silently lacks newly added columns — and every
+    ORM read of that table then fails. Tables that do not exist at all are
+    skipped; ``create_all`` handles those.
+    """
+
+    def _diff(sync_conn) -> list[str]:
+        inspector = inspect(sync_conn)
+        existing = set(inspector.get_table_names())
+        missing = []
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing:
+                continue
+            live = {c["name"] for c in inspector.get_columns(table.name)}
+            missing += [f"{table.name}.{c.name}" for c in table.columns if c.name not in live]
+        return missing
+
+    async with get_engine().connect() as conn:
+        return await conn.run_sync(_diff)
 
 
 @asynccontextmanager

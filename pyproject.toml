@@ -8,12 +8,12 @@ dependencies = [
     "python-picnic-api2>=2.0.1",
     # <2: mcp 2.0 removed mcp.server.fastmcp, which mcp_server.py imports.
     "mcp[cli]>=1.9,<2",
-    "anthropic>=0.40",
     "python-telegram-bot[ext]>=22",
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
     "alembic>=1.13",
     "python-dotenv>=1.0",
+    "openai>=1.40",
 ]
 
 [project.scripts]

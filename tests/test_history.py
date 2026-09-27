@@ -49,7 +49,7 @@ PLAIN_TURN = [
 
 
 async def _commit(chat_id: int, turn: list[dict]) -> None:
-    """Append a turn the way bot._run_claude does."""
+    """Append a turn the way bot._run_llm does."""
     base = await history.get_context(chat_id)
     messages = history.trim_history(base, history.MAX_HISTORY_MESSAGES - 1)
     new_from = len(messages)

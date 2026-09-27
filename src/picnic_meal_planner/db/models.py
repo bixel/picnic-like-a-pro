@@ -107,7 +107,7 @@ class ConversationMessage(Base):
 
 
 class ChatSettings(Base):
-    """Per-chat preferences. Currently just the history-persistence opt-out."""
+    """Per-chat preferences: the history-persistence opt-out and the LLM model."""
 
     __tablename__ = "chat_settings"
 
@@ -117,4 +117,8 @@ class ChatSettings(Base):
     persist_history: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+    # OpenRouter model id for this conversation, e.g. "openai/gpt-5". NULL means
+    # "follow the deployment default" (LLM_MODEL), so changing the default
+    # moves every chat that has not chosen a model of its own.
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime

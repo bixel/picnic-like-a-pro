@@ -8,8 +8,8 @@ Guidance for Claude Code (and human contributors) working in this repo.
 
 **Picnic Like a Pro** is a multi-user Telegram bot that acts as a family
 grocery and meal planning assistant.  It wraps the Picnic grocery API
-(NL/DE/BE), stores order history locally, and uses an Anthropic Claude model
-with MCP tools to answer natural-language queries.
+(NL/DE/BE), stores order history locally, and uses an LLM (any model on
+OpenRouter, chosen per chat) with MCP tools to answer natural-language queries.
 
 ---
 
@@ -49,7 +49,7 @@ columns:
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
 | `ImportCheckpoint` | `import_checkpoints` | Resumable import progress |
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
-| `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out |
+| `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
 
 Datetime values are stored as **ISO-8601 strings** (`String` column type,
 not `DateTime`) to avoid SQLite timezone edge-cases and to keep the existing
@@ -71,6 +71,7 @@ Alembic manages all schema changes.
 | `alembic/env.py` | Async migration env using `async_engine_from_config` + `asyncio.run` |
 | `alembic/versions/0001_*.py` | Initial schema (products, orders, order_items, import_checkpoints) |
 | `alembic/versions/0002_*.py` | Conversation history (`conversation_messages`, `chat_settings`) — purely additive |
+| `alembic/versions/0003_*.py` | Per-chat LLM model (`chat_settings.model`, nullable) — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -127,6 +128,8 @@ idempotent for re-imports.
 ```
 src/picnic_meal_planner/
 ├── bot.py            # Telegram bot, long-polling; calls history.py for context
+├── llm.py            # OpenRouter client, Anthropic<->OpenAI message translation,
+│                     #   per-chat model selection
 ├── history.py        # Conversation history policy: serialization, truncation,
 │                     #   caching, persistence, opt-out, deletion
 ├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting
@@ -149,10 +152,21 @@ JSON-serialisable without extra steps.
 
 ## AI / MCP Integration
 
-- The Telegram bot calls the Anthropic API directly (not via the MCP server
-  process).  The MCP tools are registered with FastMCP and called **in-process**
+- Every LLM request goes through **OpenRouter** (OpenAI-compatible Chat
+  Completions, via the `openai` SDK) in `llm.py` — not via the MCP server
+  process.  The MCP tools are registered with FastMCP and called **in-process**
   via `mcp_server.call_tool()`.
-- The model is `claude-sonnet-4-6` (configurable in `bot.py`).
+- **History stays in the Anthropic content-block shape** (`text` / `tool_use` /
+  `tool_result`).  `llm.create_message()` translates it to the OpenAI wire
+  format on every request and translates the reply back, so `history.py`'s
+  turn invariants and the stored rows are provider-independent.  Do not store
+  OpenAI-shaped messages.
+- **The model is per chat.** `llm.get_chat_model(chat_id)` returns
+  `chat_settings.model`, or `LLM_MODEL` when that is NULL.  It is resolved once
+  per turn (never mid tool loop) and deliberately not cached, so a backend
+  switch (`scripts/chat_model.py`) applies on the next message.
+  `llm.set_chat_model()` enforces `LLM_ALLOWED_MODELS` and is the function a
+  future user-facing picker should call; `/model` is read-only today.
 - Conversation history is **persisted to SQLite per chat_id** and survives
   restarts.  All policy lives in `history.py`; `bot.py` only calls
   `get_context()` and `commit_turn()`.
@@ -251,7 +265,12 @@ not treated as authoritative.
 | `PICNIC_PASSWORD` | — | Picnic account password |
 | `PICNIC_COUNTRY_CODE` | — | `NL`, `DE`, or `BE` |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (all LLM requests) |
+| `LLM_MODEL` | `anthropic/claude-sonnet-4.6` | Default OpenRouter model id for chats without their own |
+| `LLM_MAX_TOKENS` | `4096` | Output token cap per request |
+| `LLM_ALLOWED_MODELS` | — | Comma-separated allowlist for per-chat models; empty = any |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Override only for a proxy/gateway |
+| `OPENROUTER_APP_NAME` / `OPENROUTER_APP_URL` | `Picnic Like a Pro` / — | Optional attribution headers |
 | `ALLOWED_TELEGRAM_USER_IDS` | — | Comma-separated list of allowed user IDs |
 | `ALLOW_ALL_USERS` | `false` | Set to `true` for local dev (bypasses auth) |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `http` |
@@ -276,4 +295,6 @@ uv run python scripts/import_history.py  # import Picnic delivery history
 uv run alembic upgrade head           # apply all pending migrations
 uv run alembic revision --autogenerate -m "msg"  # generate migration from model diff
 uv run alembic downgrade -1           # roll back one migration
+uv run python scripts/chat_model.py list          # per-chat models
+uv run python scripts/chat_model.py set <chat_id> <model>
 ```

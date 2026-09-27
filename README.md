@@ -31,7 +31,7 @@ A family meal planner and grocery assistant Telegram bot powered by Claude AI. I
 | OS | Ubuntu 22.04 LTS or Debian 12 recommended |
 | A Picnic account | Registered in NL, DE, or BE |
 | A Telegram account | To create the bot and to use it |
-| An Anthropic API key | From [console.anthropic.com](https://console.anthropic.com) |
+| An OpenRouter API key | From [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys), with credits loaded. All LLM requests go through OpenRouter, so any model it lists can be used |
 | SSH access to the VPS | With a non-root user that has `sudo` privileges |
 
 ---
@@ -146,8 +146,12 @@ PICNIC_COUNTRY_CODE=NL          # NL, DE, or BE
 # Telegram bot token (from BotFather)
 TELEGRAM_BOT_TOKEN=123456:ABC-...
 
-# Anthropic Claude API key
-ANTHROPIC_API_KEY=sk-ant-...
+# OpenRouter API key — every LLM request goes through OpenRouter
+OPENROUTER_API_KEY=sk-or-v1-...
+
+# Default model for all chats (any id from https://openrouter.ai/models).
+# Individual chats can be switched with scripts/chat_model.py.
+LLM_MODEL=anthropic/claude-sonnet-4.6
 
 # Comma-separated Telegram user IDs allowed to use the bot
 # Find your ID via @userinfobot — leave empty to block everyone
@@ -382,7 +386,8 @@ docker system df -v | grep picnic-data
 - Common causes:
   - Missing or misspelled environment variable in `.env`
   - Wrong Picnic credentials (`PICNIC_USERNAME` / `PICNIC_PASSWORD`)
-  - Invalid `ANTHROPIC_API_KEY`
+  - Invalid `OPENROUTER_API_KEY`, or an OpenRouter account without credits
+  - An `LLM_MODEL` that is not a valid OpenRouter model id
 
 ### Cannot pull the Docker image
 
