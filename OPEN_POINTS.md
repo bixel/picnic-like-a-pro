@@ -31,11 +31,11 @@ migration. Porting means reworking how the 15 tools are registered and how
 ### 1.2 Bound the tool-use loop — S, cost/availability
 `bot.py` runs `while True` with no iteration cap and no request timeout. The
 whole message list is re-sent each round, so cost grows quadratically, and a
-model stuck in a search→refine loop burns Anthropic credits and Picnic quota
+model stuck in a search→refine loop burns OpenRouter credits and Picnic quota
 until the process is killed. Since turns are now archived, one runaway turn
 can also write megabytes.
 **Fix:** `for _ in range(MAX_TOOL_ROUNDS)` (~10) plus `timeout=` on
-`messages.create`. Decide what to tell the user when the cap is hit.
+`chat.completions.create` (in `llm.create_message`). Decide what to tell the user when the cap is hit.
 
 ### 1.3 Let a de-authorized user erase their own data — S, privacy
 `cmd_forget` / `cmd_privacy` check `_is_allowed` before deleting. Removing
@@ -72,7 +72,7 @@ and the generic "Sorry, something went wrong" gives no hint that `/forget` is
 the cure. Content is always written with `json.dumps`, so reaching this needs
 corruption or manual editing, not user input.
 **Fix:** drop the whole `turn_id` on a parse failure (the column is right
-there). Optionally catch `anthropic.BadRequestError` in `_chat`, invalidate the
+there). Optionally catch `openai.BadRequestError` in `_chat`, invalidate the
 cache, retry once from empty, and log loudly — that turns *any* future
 sequence bug into one bad turn instead of a permanent outage.
 
@@ -130,7 +130,7 @@ pulls each first message's entire `content` before truncating in Python.
 | 4.4 | `bot.py` calls `history._persistence_enabled_globally()` — private across a module boundary. Expose `history.persistence_status()` | XS |
 | 4.5 | `role` is an unconstrained `String`; `CHECK (role IN ('user','assistant'))` catches corruption at write time | XS |
 | 4.6 | Migration `0002` drops indexes before the table; `DROP TABLE` already removes them | XS |
-| 4.7 | The model is hardcoded to `claude-sonnet-4-6` in `bot.py`. Make it an env var, and consider a newer Sonnet | XS |
+| 4.7 | ~~The model is hardcoded in `bot.py`~~ — done: `LLM_MODEL` default plus a per-chat `chat_settings.model` (via OpenRouter) | — |
 | 4.8 | Container runs as root; the DB is `root:root 0644` in the volume. Add a non-root `USER` and `read_only: true` *(relayed from review; not independently verified)* | S |
 
 ---

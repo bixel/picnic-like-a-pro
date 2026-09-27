@@ -607,6 +607,7 @@ async def get_chat_settings(session: AsyncSession, chat_id: int) -> dict | None:
     return {
         "chat_id": row.chat_id,
         "persist_history": row.persist_history,
+        "model": row.model,
         "updated_at": row.updated_at,
     }
 
@@ -623,3 +624,34 @@ async def set_chat_persist_history(
         )
     )
     await session.execute(stmt)
+
+
+async def set_chat_model(
+    session: AsyncSession, chat_id: int, model: str | None
+) -> None:
+    """Pin *model* for a chat; ``None`` reverts it to the deployment default.
+
+    Only ``model`` is written on conflict, so the persistence opt-out is never
+    touched; a newly created row gets persist_history's server default.
+    """
+    stmt = (
+        sqlite_insert(ChatSettings)
+        .values(chat_id=chat_id, model=model, updated_at=_now())
+        .on_conflict_do_update(
+            index_elements=["chat_id"],
+            set_=dict(model=model, updated_at=_now()),
+        )
+    )
+    await session.execute(stmt)
+
+
+async def list_chat_models(session: AsyncSession) -> list[dict]:
+    """Every known chat with its pinned model (``None`` = deployment default).
+
+    A chat is "known" if it has a settings row or any stored message, so chats
+    that never touched a setting still show up.
+    """
+    ids = set(await session.scalars(select(ChatSettings.chat_id)))
+    ids |= set(await session.scalars(select(ConversationMessage.chat_id).distinct()))
+    pinned = dict((await session.execute(select(ChatSettings.chat_id, ChatSettings.model))).all())
+    return [{"chat_id": cid, "model": pinned.get(cid)} for cid in sorted(ids)]
