@@ -191,3 +191,19 @@ class TestPackageExports:
             session.add(Product(id="p_via_engine", name="Via engine"))
             await session.commit()
             assert await session.get(Product, "p_via_engine") is not None
+
+
+class TestMissingColumns:
+    async def test_none_on_a_current_schema(self, db_path):
+        assert await engine_mod.missing_columns() == []
+
+    async def test_reports_a_column_create_all_could_not_add(self, db_path):
+        """The upgrade-without-migrating case: table exists, column does not."""
+        async with engine_mod.get_engine().begin() as conn:
+            await conn.exec_driver_sql("ALTER TABLE chat_settings DROP COLUMN model")
+        assert await engine_mod.missing_columns() == ["chat_settings.model"]
+
+    async def test_missing_tables_are_not_reported(self, db_path):
+        async with engine_mod.get_engine().begin() as conn:
+            await conn.exec_driver_sql("DROP TABLE chat_settings")
+        assert await engine_mod.missing_columns() == []

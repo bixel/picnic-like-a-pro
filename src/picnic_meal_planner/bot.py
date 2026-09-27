@@ -1,7 +1,10 @@
 """Telegram bot entry point.
 
-Each family member has their own per-chat conversation history with Claude,
-persisted across restarts. All MCP tools are available in every conversation.
+Each family member has their own per-chat conversation history, persisted
+across restarts. All MCP tools are available in every conversation.
+
+Model requests go through OpenRouter (``llm.py``), and each chat can run on its
+own model — see ``llm.get_chat_model``.
 
 History policy — truncation, serialization, storage, opt-out — lives in
 ``history.py``; this module only reads a context and commits a completed turn.
@@ -13,7 +16,6 @@ import asyncio
 import logging
 import os
 
-import anthropic
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -28,8 +30,8 @@ from telegram.ext import (
 load_dotenv()
 
 # Imported after load_dotenv(): both modules read configuration at import time.
-from . import history  # noqa: E402
-from .db.engine import init_db  # noqa: E402
+from . import history, llm  # noqa: E402
+from .db.engine import init_db, missing_columns  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,17 +55,7 @@ The Picnic account is shared across all family members. Be conversational and he
 When suggesting items to add to the cart, always confirm with the user before adding them.
 """
 
-_anthropic_client: anthropic.AsyncAnthropic | None = None
 _mcp_tools: list[dict] | None = None
-
-
-def _get_anthropic_client() -> anthropic.AsyncAnthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.AsyncAnthropic(
-            api_key=os.environ["ANTHROPIC_API_KEY"]
-        )
-    return _anthropic_client
 
 
 def _allowed_user_ids() -> set[int]:
@@ -79,7 +71,7 @@ def _is_allowed(user_id: int) -> bool:
 
 
 async def _get_mcp_tools() -> list[dict]:
-    """Return the list of MCP tool schemas for the Anthropic API."""
+    """Return the MCP tool schemas (Anthropic shape; llm.py translates them)."""
     global _mcp_tools
     if _mcp_tools is not None:
         return _mcp_tools
@@ -94,16 +86,16 @@ async def _call_mcp_tool(name: str, input_data: dict):
     return await call_tool(name, input_data)
 
 
-async def _run_claude(chat_id: int, user_text: str) -> str:
-    """Send a message to Claude, handle tool use, and return the final reply."""
-    client = _get_anthropic_client()
+async def _run_llm(chat_id: int, user_text: str) -> str:
+    """Send a message to the chat's model, handle tool use, return the reply."""
     tools = await _get_mcp_tools()
+    # Resolved once per turn, so a model switch never lands mid-tool-loop.
+    model = await llm.get_chat_model(chat_id)
 
     # Work on a copy; only commit to canonical history on success, so a failed
-    # API call leaves no half-written turn behind. (Two consecutive "user"
-    # messages are not themselves an error — the API merges same-role messages.
-    # The shapes that actually 400 are a non-user first message, an orphaned
-    # tool_result, and a dangling tool_use; see the guards before commit_turn.)
+    # API call leaves no half-written turn behind. The shapes that 400 are a
+    # non-user first message, an orphaned tool_result, and a dangling tool_use;
+    # see the guards before commit_turn.)
     #
     # Trim BEFORE appending the new turn, and only at a safe boundary: trimming
     # afterwards could slice away the message the user just sent, and a blind
@@ -115,9 +107,10 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
     messages.append({"role": "user", "content": user_text})
 
     while True:
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
+        # llm.create_message speaks the same Anthropic-shaped blocks that
+        # history stores, translating to and from OpenRouter internally.
+        response = await llm.create_message(
+            model=model,
             system=SYSTEM_PROMPT,
             tools=tools or [],
             messages=messages,
@@ -127,14 +120,13 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
         assistant_text = ""
         tool_uses = []
         for block in response.content:
-            if block.type == "text":
-                assistant_text += block.text
-            elif block.type == "tool_use":
+            if block["type"] == "text":
+                assistant_text += block["text"]
+            elif block["type"] == "tool_use":
                 tool_uses.append(block)
 
-        # Append the assistant message to the conversation. Normalizing the SDK
-        # blocks to plain dicts here keeps one representation for both the next
-        # request and the stored row.
+        # Append the assistant message to the conversation, in the one
+        # representation used for both the next request and the stored row.
         normalized = history.normalize_content(response.content)
         messages.append({"role": "assistant", "content": normalized})
 
@@ -142,11 +134,11 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
             # Execute all requested tool calls
             tool_results = []
             for tu in tool_uses:
-                result = await _call_mcp_tool(tu.name, tu.input)
+                result = await _call_mcp_tool(tu["name"], tu["input"])
                 tool_results.append(
                     {
                         "type": "tool_result",
-                        "tool_use_id": tu.id,
+                        "tool_use_id": tu["id"],
                         "content": str(result),
                     }
                 )
@@ -207,7 +199,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history — recent order summary\n"
         "/cart — current Picnic cart\n"
         "/forget — delete our stored conversation\n"
-        "/privacy — control whether our conversation is saved\n\n"
+        "/privacy — control whether our conversation is saved\n"
+        "/model — show which AI model this chat uses\n\n"
         "Or just chat with me naturally!"
     )
 
@@ -315,6 +308,22 @@ async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/model`` shows the model this chat runs on.
+
+    Read-only for now. Switching is a backend operation
+    (``scripts/chat_model.py``) until users are given a picker; when they are,
+    it should call ``llm.set_chat_model``, which already enforces
+    ``LLM_ALLOWED_MODELS``.
+    """
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+    model = await llm.get_chat_model(update.effective_chat.id)
+    suffix = "" if model != llm.DEFAULT_MODEL else " (the default)"
+    await update.message.reply_text(f"This chat uses {model}{suffix}.")
+
+
 async def _chat(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -331,9 +340,9 @@ async def _chat(
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        reply = await _run_claude(chat_id, message_text)
+        reply = await _run_llm(chat_id, message_text)
     except Exception:  # noqa: BLE001
-        logger.exception("Error running Claude for chat %d", chat_id)
+        logger.exception("Error running the LLM for chat %d", chat_id)
         reply = "Sorry, something went wrong. Please try again."
 
     # Telegram messages have a 4096 character limit
@@ -364,6 +373,17 @@ async def _post_init(app: Application) -> None:
         if history._persistence_enabled_globally()
         else "off (PERSIST_CONVERSATIONS)",
     )
+    logger.info("Default LLM model (via OpenRouter): %s", llm.DEFAULT_MODEL)
+    # init_db() cannot add columns to existing tables. Without this, a skipped
+    # migration surfaces only as history quietly not being saved (the settings
+    # read fails, and persistence fails closed).
+    missing = await missing_columns()
+    if missing:
+        logger.error(
+            "Database schema is behind the code (missing %s). Run "
+            "`alembic upgrade head` — see MIGRATION_OPENROUTER.md.",
+            ", ".join(missing),
+        )
 
 
 def main() -> None:
@@ -383,6 +403,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cart", cmd_cart))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _chat))
 
     logger.info("Starting bot with long polling...")

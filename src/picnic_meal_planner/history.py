@@ -6,10 +6,10 @@ what it is handed. Nothing here imports ``bot``.
 
 Three responsibilities:
 
-1. **Serialization** — the Anthropic SDK returns pydantic content blocks, which
-   are not JSON-serializable. :func:`normalize_content` converts them to plain
-   dicts once, at append time, so the same representation serves both the API
-   and the database.
+1. **Serialization** — history is kept as Anthropic-shaped content blocks
+   (``llm.py`` translates them to and from OpenRouter's wire format).
+   :func:`normalize_content` guarantees plain JSON-serializable dicts at append
+   time, so the same representation serves both the API and the database.
 2. **Safe truncation** — only the most recent window is sent to the API, but the
    cut must land on a real turn boundary. See :func:`trim_history`.
 3. **Persistence policy** — lazy per-chat loading, a write-through cache, and

@@ -213,3 +213,51 @@ class TestMigratedSchemaIsUsable:
         # DB_PATH still points at migrated_db via the fixture's monkeypatch.
         overdue = asyncio.run(_exercise())
         assert {"p_milk_whole", "p_bread_whole"} <= {r["product_id"] for r in overdue}
+
+
+# ---------------------------------------------------------------------------
+# 0003: per-chat model on an existing, populated database
+# ---------------------------------------------------------------------------
+
+class TestChatModelMigration:
+    def _rows(self, db_file: Path):
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            with engine.connect() as conn:
+                return [dict(r._mapping) for r in conn.exec_driver_sql(
+                    "SELECT * FROM chat_settings ORDER BY chat_id"
+                )]
+        finally:
+            engine.dispose()
+
+    def _seed_at_0002(self, tmp_path, monkeypatch) -> Path:
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0002")
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "INSERT INTO chat_settings (chat_id, persist_history, updated_at) "
+                    "VALUES (7, 0, '2026-01-01T00:00:00')"
+                )
+        finally:
+            engine.dispose()
+        return db_file
+
+    def test_upgrade_keeps_existing_settings_and_defaults_model_to_null(
+        self, tmp_path, monkeypatch
+    ):
+        db_file = self._seed_at_0002(tmp_path, monkeypatch)
+        command.upgrade(_alembic_config(), "head")
+        [row] = self._rows(db_file)
+        assert row["persist_history"] == 0
+        assert row["model"] is None
+
+    def test_downgrade_drops_only_the_model_column(self, tmp_path, monkeypatch):
+        db_file = self._seed_at_0002(tmp_path, monkeypatch)
+        command.upgrade(_alembic_config(), "head")
+        command.downgrade(_alembic_config(), "0002")
+        [row] = self._rows(db_file)
+        assert "model" not in row
+        assert row["persist_history"] == 0
