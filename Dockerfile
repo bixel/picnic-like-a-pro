@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: resolve production dependencies
 # ---------------------------------------------------------------------------
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 # --frozen with no fallback: a missing or stale lock must fail the build rather
@@ -15,7 +15,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # yielding the production runtime stage below, so this stage stays in front.
 #   docker build --target test -t picnic-test .
 # ---------------------------------------------------------------------------
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS test
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS test
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --group dev --no-install-project
@@ -37,7 +37,7 @@ CMD ["pytest", "--cov=picnic_meal_planner", "--cov-report=term-missing", "--cov-
 # ---------------------------------------------------------------------------
 # Stage 3: production runtime (default build target — must remain last)
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim-bookworm AS runtime
+FROM python:3.13-slim-bookworm AS runtime
 WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY --from=builder /app/.venv /app/.venv
