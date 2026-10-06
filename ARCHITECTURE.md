@@ -83,7 +83,7 @@ the `MCP_TRANSPORT` env var (`stdio` / `sse` / `http`). Default is `stdio`.
 ```
 picnic-like-a-pro/
 ├── pyproject.toml              # uv project + deps + pytest/coverage config
-├── .python-version             # Python 3.11
+├── .python-version             # Python 3.13
 ├── .env.example                # Production env vars template
 ├── .env.mock.example           # Mock environment template
 ├── .env.test                   # Test environment (no secrets, committed)
@@ -415,7 +415,7 @@ IMPORT_DELAY_SECONDS=2        # pause between batches to avoid rate limits (defa
 [project]
 name = "picnic-meal-planner"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "python-picnic-api2>=1.3",
     "mcp[cli]>=1.9",
@@ -528,12 +528,12 @@ VPS
 Multi-stage build using the official `uv` Docker image for fast, reproducible installs.
 
 ```dockerfile
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY --from=builder /app/.venv /app/.venv

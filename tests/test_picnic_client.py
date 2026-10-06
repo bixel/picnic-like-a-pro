@@ -212,3 +212,80 @@ class TestClientSelection:
 
         picnic._get_client()
         assert constructed["country_code"] == "NL"
+
+
+class TestRealLibraryModels:
+    """python-picnic-api2 2.x returns pydantic models; the wrapper must hand
+    callers plain dicts, exactly as 1.x did."""
+
+    @pytest.fixture
+    def real(self, monkeypatch):
+        class Fake:
+            pass
+
+        fake = Fake()
+        monkeypatch.setattr(picnic, "_client", fake)
+        return fake
+
+    def test_plain_prefers_verbatim_raw_payload(self):
+        from python_picnic_api2 import Cart
+
+        payload = {"id": "c1", "items": [], "total_count": 0, "unknown_key": 1}
+        assert picnic._plain(Cart.from_api(payload)) is payload
+
+    def test_plain_falls_back_to_model_dump(self):
+        from python_picnic_api2 import Cart
+
+        assert picnic._plain(Cart(id="c1"))["id"] == "c1"
+
+    def test_plain_passes_dicts_through(self):
+        assert picnic._plain([{"a": 1}]) == [{"a": 1}]
+
+    async def test_search_result_model_is_normalised(self, real):
+        from python_picnic_api2 import SearchResult, SearchResultItem
+
+        real.search = lambda q: SearchResult(items=[
+            SearchResultItem(id="s1", name="Milk", display_price=119, unit_quantity="1 l"),
+            SearchResultItem(id="s2", name="Butter"),
+        ])
+        results = await picnic.search_products("milk", limit=5)
+        assert [r["id"] for r in results] == ["s1", "s2"]
+        assert results[0]["unit_price"] == 119
+        assert results[0]["unit_quantity"] == "1 l"
+        assert results[1]["unit_price"] is None
+
+    async def test_cart_models_become_dicts(self, real):
+        from python_picnic_api2 import Cart
+
+        payload = {"id": "c1", "items": [{"id": "line1"}]}
+        removed = []
+        real.get_cart = lambda: Cart.from_api(payload)
+        real.add_product = lambda pid, count=1: Cart.from_api(payload)
+        real.remove_product = lambda pid: removed.append(pid) or Cart.from_api(payload)
+
+        assert await picnic.get_cart() == payload
+        assert await picnic.add_to_cart("p1") == payload
+        assert await picnic.remove_from_cart("p1") == payload
+        assert await picnic.clear_cart() == {"status": "cart cleared"}
+        assert removed == ["p1", "line1"]
+
+    async def test_delivery_models_become_dicts(self, real):
+        from python_picnic_api2 import Delivery, DeliverySlots, DeliverySummary
+
+        slots = {"delivery_slots": [{"slot_id": "s1"}]}
+        summary = {"delivery_id": "d1", "status": "COMPLETED"}
+        detail = {"delivery_id": "d1", "orders": [{"items": []}]}
+        real.get_delivery_slots = lambda: DeliverySlots.from_api(slots)
+        real.get_deliveries = lambda: [DeliverySummary.from_api(summary)]
+        real.get_delivery = lambda did: Delivery.from_api(detail)
+
+        assert await picnic.get_delivery_slots() == [{"slot_id": "s1"}]
+        assert await picnic.get_deliveries() == [summary]
+        assert await picnic.get_delivery("d1") == detail
+
+    async def test_removed_categories_endpoint_returns_empty(self, real):
+        def gone():
+            raise NotImplementedError("removed by picnic")
+
+        real.get_categories = gone
+        assert await picnic.get_categories() == []
