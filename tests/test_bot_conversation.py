@@ -11,22 +11,44 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from picnic_meal_planner import bot
+from picnic_meal_planner import bot, history
 
 
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
 
-class _TextBlock:
+class _Block:
+    """Base for the fake SDK content blocks.
+
+    The real Anthropic SDK returns pydantic v2 models, and history.py
+    serialises them with ``model_dump(mode="json", exclude_none=True)``. These
+    fakes implement that method so the tests exercise the same code path a real
+    response would; a fake without it would silently skip the serialisation
+    logic entirely.
+    """
+
+    _fields: tuple[str, ...] = ()
+
+    def model_dump(self, mode=None, exclude_none=False) -> dict:
+        data = {"type": self.type, **{f: getattr(self, f) for f in self._fields}}
+        if exclude_none:
+            data = {k: v for k, v in data.items() if v is not None}
+        return data
+
+
+class _TextBlock(_Block):
     type = "text"
+    _fields = ("text", "citations")
 
     def __init__(self, text: str) -> None:
         self.text = text
+        self.citations = None      # nullable on real TextBlocks
 
 
-class _ToolUseBlock:
+class _ToolUseBlock(_Block):
     type = "tool_use"
+    _fields = ("id", "name", "input")
 
     def __init__(self, name: str, input_data: dict, id: str = "tu_1") -> None:
         self.name = name
@@ -71,9 +93,14 @@ def fake_claude(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_histories():
-    bot._histories.clear()
+    """Reset history.py's in-process caches between tests.
+
+    The database itself is already isolated per test by the autouse
+    ``isolated_db`` fixture in conftest.py.
+    """
+    history._reset_caches()
     yield
-    bot._histories.clear()
+    history._reset_caches()
 
 
 def _make_update(text: str = "hello", user_id: int = 1, chat_id: int = 100):
@@ -108,17 +135,29 @@ class TestRunClaude:
         fake_claude([_Response([])])
         assert await bot._run_claude(1, "hi") == "(no reply)"
 
-    async def test_history_is_persisted_after_success(self, fake_claude):
+    async def test_history_is_persisted_after_success(self, fake_claude, db_path):
         fake_claude([_Response([_TextBlock("ok")])])
         await bot._run_claude(42, "remember this")
-        assert len(bot._histories[42]) == 2
-        assert bot._histories[42][0] == {"role": "user", "content": "remember this"}
+        context = await history.get_context(42)
+        assert len(context) == 2
+        assert context[0] == {"role": "user", "content": "remember this"}
 
-    async def test_history_accumulates_across_turns(self, fake_claude):
+    async def test_history_accumulates_across_turns(self, fake_claude, db_path):
         fake_claude([_Response([_TextBlock("a")]), _Response([_TextBlock("b")])])
         await bot._run_claude(7, "first")
         await bot._run_claude(7, "second")
-        assert len(bot._histories[7]) == 4
+        assert len(await history.get_context(7)) == 4
+
+    async def test_history_survives_a_restart(self, fake_claude, db_path):
+        """The point of persisting it: context outlives the process."""
+        fake_claude([_Response([_TextBlock("ok")])])
+        await bot._run_claude(42, "remember this")
+
+        history._reset_caches()  # simulate a restart
+
+        context = await history.get_context(42)
+        assert len(context) == 2
+        assert context[0] == {"role": "user", "content": "remember this"}
 
     async def test_prior_history_is_sent_to_claude(self, fake_claude):
         client = fake_claude([_Response([_TextBlock("a")]), _Response([_TextBlock("b")])])
@@ -135,22 +174,28 @@ class TestRunClaude:
         monkeypatch.setattr(client.messages, "create", boom)
         with pytest.raises(RuntimeError):
             await bot._run_claude(9, "hello")
-        assert bot._histories[9] == []
+        assert await history.get_context(9) == []
 
-    async def test_history_is_trimmed_to_max_turns(self, fake_claude, monkeypatch):
-        monkeypatch.setattr(bot, "MAX_HISTORY_TURNS", 2)
+    async def test_history_is_trimmed_to_max_turns(
+        self, fake_claude, monkeypatch, db_path
+    ):
+        monkeypatch.setattr(history, "MAX_HISTORY_MESSAGES", 4)
         client = fake_claude([_Response([_TextBlock("ok")])])
-        bot._histories[5] = [{"role": "user", "content": f"m{i}"} for i in range(10)]
+        history._contexts[5] = [
+            {"role": "user", "content": f"m{i}"} for i in range(10)
+        ]
+        history._loaded_chats.add(5)
         await bot._run_claude(5, "newest")
         assert len(client.calls[0]["messages"]) <= 4
 
-    async def test_conversations_are_isolated_per_chat(self, fake_claude):
+    async def test_conversations_are_isolated_per_chat(self, fake_claude, db_path):
         fake_claude([_Response([_TextBlock("a")]), _Response([_TextBlock("b")])])
         await bot._run_claude(1, "chat one")
         await bot._run_claude(2, "chat two")
-        assert bot._histories[1][0]["content"] == "chat one"
-        assert bot._histories[2][0]["content"] == "chat two"
-        assert len(bot._histories[2]) == 2
+        one, two = await history.get_context(1), await history.get_context(2)
+        assert one[0]["content"] == "chat one"
+        assert two[0]["content"] == "chat two"
+        assert len(two) == 2
 
     async def test_system_prompt_is_sent(self, fake_claude):
         client = fake_claude([_Response([_TextBlock("ok")])])
@@ -206,6 +251,62 @@ class TestRunClaudeToolUse:
             _Response([_TextBlock("recovered")]),
         ])
         assert await bot._run_claude(1, "go") == "recovered"
+
+
+class TestRunClaudeUnfinishedTurns:
+    """Regression (C3): a turn that ends mid-tool_use must never be archived.
+
+    When generation is cut off inside a tool_use block, stop_reason is
+    "max_tokens" rather than "tool_use", so the tool-execution branch is
+    skipped. Persisting that message leaves a tool_use with no tool_result,
+    which the Messages API rejects — and nothing can repair it afterwards,
+    because trimming only fixes the head and commit_turn only runs on success.
+    The chat would 400 forever.
+    """
+
+    async def test_truncated_tool_use_is_not_persisted(self, fake_claude, db_path):
+        fake_claude([_Response(
+            [_TextBlock("let me look"), _ToolUseBlock("get_cart", {})],
+            stop_reason="max_tokens",
+        )])
+        await bot._run_claude(100, "what's in the cart?")
+
+        history._reset_caches()
+        assert await history.get_context(100) == []
+        assert await history.list_turns(100) == []
+
+    async def test_truncated_tool_use_tells_the_user(self, fake_claude, db_path):
+        fake_claude([_Response(
+            [_ToolUseBlock("get_cart", {})], stop_reason="max_tokens",
+        )])
+        reply = await bot._run_claude(100, "hi")
+        assert "ran out of room" in reply.lower()
+
+    async def test_chat_still_works_after_a_truncated_turn(
+        self, fake_claude, db_path
+    ):
+        """The proof that the poisoning is gone: the next turn succeeds."""
+        client = fake_claude([
+            _Response([_ToolUseBlock("get_cart", {})], stop_reason="max_tokens"),
+            _Response([_TextBlock("all good")]),
+        ])
+        await bot._run_claude(100, "first")
+        assert await bot._run_claude(100, "second") == "all good"
+
+        # The retry must not carry the abandoned tool_use forward.
+        sent = client.calls[1]["messages"]
+        assert not any(
+            isinstance(m["content"], list)
+            and any(b.get("type") == "tool_use" for b in m["content"])
+            for m in sent
+        )
+        assert len(await history.list_turns(100)) == 1   # only the good turn
+
+    async def test_empty_response_is_not_persisted(self, fake_claude, db_path):
+        fake_claude([_Response([])])
+        assert await bot._run_claude(100, "hi") == "(no reply)"
+        history._reset_caches()
+        assert await history.get_context(100) == []
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +409,121 @@ class TestCommandHandlers:
         assert "not authorised" in update.message.reply_text.await_args[0][0]
 
 
+class TestForgetCommand:
+    async def test_deletes_stored_history(self, fake_claude, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        fake_claude([_Response([_TextBlock("ok")])])
+        await bot._run_claude(100, "remember this")
+
+        update = _make_update()
+        await bot.cmd_forget(update, _make_context())
+
+        assert await history.get_context(100) == []
+        assert "deleted 2" in update.message.reply_text.await_args[0][0]
+
+    async def test_reports_when_nothing_was_stored(self, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        update = _make_update()
+        await bot.cmd_forget(update, _make_context())
+        assert "nothing stored" in update.message.reply_text.await_args[0][0].lower()
+
+    async def test_rejects_unauthorised(self, monkeypatch, db_path):
+        monkeypatch.delenv("ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "999")
+        update = _make_update(user_id=1)
+        await bot.cmd_forget(update, _make_context())
+        assert "not authorised" in update.message.reply_text.await_args[0][0]
+
+    async def test_reports_failure_rather_than_claiming_success(
+        self, monkeypatch, db_path
+    ):
+        """clear_history propagates by design, so the handler must catch it."""
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+
+        async def boom(chat_id):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(history, "clear_history", boom)
+        update = _make_update()
+        await bot.cmd_forget(update, _make_context())
+
+        reply = update.message.reply_text.await_args[0][0].lower()
+        assert "couldn't clear" in reply
+        assert "forgotten" not in reply
+
+
+class TestPrivacyCommand:
+    def _ctx(self, *args):
+        context = _make_context()
+        context.args = list(args)
+        return context
+
+    async def test_reports_status_by_default(self, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        update = _make_update()
+        await bot.cmd_privacy(update, self._ctx())
+        assert "ON" in update.message.reply_text.await_args[0][0]
+
+    async def test_unrecognised_argument_falls_back_to_status(
+        self, monkeypatch, db_path
+    ):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        update = _make_update()
+        await bot.cmd_privacy(update, self._ctx("maybe"))
+        assert "currently" in update.message.reply_text.await_args[0][0]
+
+    async def test_off_disables_and_deletes(self, fake_claude, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        fake_claude([_Response([_TextBlock("ok")])])
+        await bot._run_claude(100, "secret")
+
+        update = _make_update()
+        await bot.cmd_privacy(update, self._ctx("off"))
+
+        assert not await history.is_persistence_enabled(100)
+        assert await history.list_turns(100) == []
+        assert "deleted" in update.message.reply_text.await_args[0][0].lower()
+
+    async def test_off_keeps_the_live_conversation(
+        self, fake_claude, monkeypatch, db_path
+    ):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        fake_claude([_Response([_TextBlock("ok")])])
+        await bot._run_claude(100, "secret")
+        await bot.cmd_privacy(_make_update(), self._ctx("off"))
+        assert len(await history.get_context(100)) == 2
+
+    async def test_on_is_case_insensitive(self, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        await bot.cmd_privacy(_make_update(), self._ctx("off"))
+        await bot.cmd_privacy(_make_update(), self._ctx("ON"))
+        assert await history.is_persistence_enabled(100)
+
+    async def test_rejects_unauthorised(self, monkeypatch, db_path):
+        monkeypatch.delenv("ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "999")
+        update = _make_update(user_id=1)
+        await bot.cmd_privacy(update, self._ctx("off"))
+        assert "not authorised" in update.message.reply_text.await_args[0][0]
+        assert await history.is_persistence_enabled(100)
+
+    async def test_reports_failure_rather_than_claiming_success(
+        self, monkeypatch, db_path
+    ):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+
+        async def boom(chat_id, enabled):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(history, "set_persistence", boom)
+        update = _make_update()
+        await bot.cmd_privacy(update, self._ctx("off"))
+
+        reply = update.message.reply_text.await_args[0][0].lower()
+        assert "couldn't change" in reply
+        assert "has been deleted" not in reply
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -324,7 +540,7 @@ class TestMain:
 
         bot.main()
 
-        assert app.add_handler.call_count == 7   # 6 commands + 1 message handler
+        assert app.add_handler.call_count == 9   # 8 commands + 1 message handler
         app.run_polling.assert_called_once()
         # The DB must be initialised on startup, before any update is handled.
         builder.post_init.assert_called_once_with(bot._post_init)

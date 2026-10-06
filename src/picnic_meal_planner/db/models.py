@@ -8,7 +8,7 @@ Python.
 
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -71,3 +71,50 @@ class ImportCheckpoint(Base):
     imported_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime
     total_imported: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     finished: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0 or 1
+
+
+class ConversationMessage(Base):
+    """One message in a chat's conversation with Claude.
+
+    Messages are grouped into *turns*: a turn is everything produced by a
+    single exchange, which for a tool-using turn is several messages
+    (user -> assistant/tool_use -> user/tool_result -> assistant/text).
+
+    A turn is the unit of deletion. Removing an individual message would leave
+    a ``tool_result`` with no matching ``tool_use``, which the Anthropic API
+    rejects with a 400; removing whole turns always leaves a valid sequence.
+
+    There is deliberately no FK to anything — ``chat_id`` is a Telegram id,
+    external to this database.
+    """
+
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    turn_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False)  # 'user' | 'assistant'
+    # JSON-encoded: either a bare string, or a list of content-block dicts.
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime
+
+    __table_args__ = (
+        # Sequential read of a chat's history (insertion order == conversation order).
+        Index("idx_conversation_messages_chat", "chat_id", "id"),
+        # "Delete everything from day X" and other time-range lookups.
+        Index("idx_conversation_messages_time", "chat_id", "created_at"),
+    )
+
+
+class ChatSettings(Base):
+    """Per-chat preferences. Currently just the history-persistence opt-out."""
+
+    __tablename__ = "chat_settings"
+
+    chat_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 0 = this chat opted out of having its conversation stored. server_default
+    # keeps metadata.create_all() and the Alembic migration in exact agreement.
+    persist_history: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime

@@ -1,7 +1,10 @@
 """Telegram bot entry point.
 
-Each family member has their own per-chat conversation history with Claude.
-All MCP tools are available in every conversation.
+Each family member has their own per-chat conversation history with Claude,
+persisted across restarts. All MCP tools are available in every conversation.
+
+History policy — truncation, serialization, storage, opt-out — lives in
+``history.py``; this module only reads a context and commits a completed turn.
 """
 
 from __future__ import annotations
@@ -9,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections import defaultdict
 
 import anthropic
 from dotenv import load_dotenv
@@ -25,6 +27,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+# Imported after load_dotenv(): both modules read configuration at import time.
+from . import history  # noqa: E402
 from .db.engine import init_db  # noqa: E402
 
 logging.basicConfig(
@@ -48,11 +52,6 @@ You have access to tools that let you:
 The Picnic account is shared across all family members. Be conversational and helpful.
 When suggesting items to add to the cart, always confirm with the user before adding them.
 """
-
-MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "20"))
-
-# Per-chat conversation history: chat_id → list of messages
-_histories: dict[int, list[dict]] = defaultdict(list)
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
 _mcp_tools: list[dict] | None = None
@@ -100,13 +99,20 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
     client = _get_anthropic_client()
     tools = await _get_mcp_tools()
 
-    # Work on a copy; only commit to canonical history on success so that a
-    # failed API call never leaves two consecutive "user" turns in the history.
-    messages = list(_histories[chat_id])
+    # Work on a copy; only commit to canonical history on success, so a failed
+    # API call leaves no half-written turn behind. (Two consecutive "user"
+    # messages are not themselves an error — the API merges same-role messages.
+    # The shapes that actually 400 are a non-user first message, an orphaned
+    # tool_result, and a dangling tool_use; see the guards before commit_turn.)
+    #
+    # Trim BEFORE appending the new turn, and only at a safe boundary: trimming
+    # afterwards could slice away the message the user just sent, and a blind
+    # slice can leave an orphaned tool_result at the front, which the API
+    # rejects. Everything from new_from onwards is what this turn produced.
+    base = await history.get_context(chat_id)
+    messages = history.trim_history(base, history.MAX_HISTORY_MESSAGES - 1)
+    new_from = len(messages)
     messages.append({"role": "user", "content": user_text})
-
-    if len(messages) > MAX_HISTORY_TURNS * 2:
-        messages = messages[-(MAX_HISTORY_TURNS * 2):]
 
     while True:
         response = await client.messages.create(
@@ -126,8 +132,11 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
             elif block.type == "tool_use":
                 tool_uses.append(block)
 
-        # Append the assistant message to the conversation
-        messages.append({"role": "assistant", "content": response.content})
+        # Append the assistant message to the conversation. Normalizing the SDK
+        # blocks to plain dicts here keeps one representation for both the next
+        # request and the stored row.
+        normalized = history.normalize_content(response.content)
+        messages.append({"role": "assistant", "content": normalized})
 
         if response.stop_reason == "tool_use" and tool_uses:
             # Execute all requested tool calls
@@ -144,8 +153,36 @@ async def _run_claude(chat_id: int, user_text: str) -> str:
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Final response — update canonical history and return text
-        _histories[chat_id] = messages
+        # The turn ended without the tool_use branch running. Two shapes are
+        # unsafe to archive, and both permanently break the chat if stored:
+        #
+        #  - a tool_use that will never be answered. Generation cut off mid
+        #    block (stop_reason "max_tokens") leaves tool_uses set while
+        #    stop_reason is not "tool_use", so control lands here.
+        #  - empty content, which the API rejects on the next request.
+        #
+        # Neither is repairable later: trim_history only fixes the head, and
+        # commit_turn runs only on success, so no subsequent turn can advance
+        # past a poisoned one. Discard rather than persist.
+        if tool_uses:
+            logger.warning(
+                "Discarding turn for chat %d: stop_reason=%r left a tool_use "
+                "unanswered", chat_id, response.stop_reason,
+            )
+            return (
+                "Sorry, I ran out of room mid-thought and didn't finish that. "
+                "Could you ask again, ideally a bit more specifically?"
+            )
+
+        if not normalized:
+            logger.warning(
+                "Discarding empty response for chat %d (stop_reason=%r)",
+                chat_id, response.stop_reason,
+            )
+            return "(no reply)"
+
+        # Final response — commit the turn (memory + archive) and return text
+        await history.commit_turn(chat_id, messages, new_from)
         return assistant_text or "(no reply)"
 
 
@@ -168,7 +205,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/order — open a shopping session\n"
         "/forecast — see what you might be running low on\n"
         "/history — recent order summary\n"
-        "/cart — current Picnic cart\n\n"
+        "/cart — current Picnic cart\n"
+        "/forget — delete our stored conversation\n"
+        "/privacy — control whether our conversation is saved\n\n"
         "Or just chat with me naturally!"
     )
 
@@ -206,6 +245,74 @@ async def cmd_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reject_unauthorized(update)
         return
     await _chat(update, context, "Show me what's currently in the Picnic cart.")
+
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete this chat's stored conversation and start fresh."""
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+
+    chat_id = update.effective_chat.id
+    # history.clear_history deliberately propagates DB failures rather than
+    # failing silently, so never report success without catching them first.
+    try:
+        removed = await history.clear_history(chat_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not clear history for chat %d", chat_id)
+        await update.message.reply_text(
+            "Sorry, I couldn't clear the history just now. Please try again."
+        )
+        return
+
+    if removed:
+        await update.message.reply_text(
+            f"Forgotten — deleted {removed} stored message(s). We're starting fresh."
+        )
+    else:
+        await update.message.reply_text(
+            "There was nothing stored. We're starting fresh."
+        )
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/privacy`` shows the current setting; ``/privacy on|off`` changes it."""
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+
+    chat_id = update.effective_chat.id
+    arg = context.args[0].lower() if context.args else ""
+
+    if arg not in ("on", "off"):
+        enabled = await history.is_persistence_enabled(chat_id)
+        await update.message.reply_text(
+            f"Saving our conversation is currently {'ON' if enabled else 'OFF'}.\n\n"
+            "/privacy off — stop saving, and delete what's already stored\n"
+            "/privacy on — start saving again\n"
+            "/forget — clear the history either way"
+        )
+        return
+
+    enable = arg == "on"
+    try:
+        await history.set_persistence(chat_id, enable)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not change persistence for chat %d", chat_id)
+        await update.message.reply_text(
+            "Sorry, I couldn't change that setting just now. Please try again."
+        )
+        return
+
+    if enable:
+        await update.message.reply_text(
+            "Saving is ON. I'll remember our conversations between restarts."
+        )
+    else:
+        await update.message.reply_text(
+            "Saving is OFF, and anything already stored has been deleted. "
+            "I'll still remember this conversation until the bot restarts."
+        )
 
 
 async def _chat(
@@ -251,7 +358,12 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 async def _post_init(app: Application) -> None:
     """Ensure database tables exist before the bot starts handling messages."""
     await init_db()
-    logger.info("Database initialised.")
+    logger.info(
+        "Database initialised. Conversation persistence: %s",
+        "on"
+        if history._persistence_enabled_globally()
+        else "off (PERSIST_CONVERSATIONS)",
+    )
 
 
 def main() -> None:
@@ -269,6 +381,8 @@ def main() -> None:
     app.add_handler(CommandHandler("forecast", cmd_forecast))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("cart", cmd_cart))
+    app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _chat))
 
     logger.info("Starting bot with long polling...")

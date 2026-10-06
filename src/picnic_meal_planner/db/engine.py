@@ -12,6 +12,7 @@ starting the application instead.
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -36,10 +37,30 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _mute_driver_statement_logging() -> None:
+    """Stop aiosqlite from logging every statement with its bound parameters.
+
+    aiosqlite logs each operation at DEBUG including the parameter tuple, which
+    for conversation_messages is the message content in plaintext. The app runs
+    at INFO so this is normally invisible, but an operator enabling DEBUG to
+    chase an unrelated bug should not silently start writing family
+    conversations to stdout. Raise it back explicitly if you need driver-level
+    tracing and understand what it emits.
+    """
+    logging.getLogger("aiosqlite").setLevel(logging.INFO)
+
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _engine = create_async_engine(_db_url(), echo=False)
+        _mute_driver_statement_logging()
+        # hide_parameters keeps bound values out of exception text. Without it,
+        # SQLAlchemy appends "[parameters: ...]" to DBAPIError, so any logged
+        # write failure would spill the row being written — for
+        # conversation_messages that is the message content itself.
+        _engine = create_async_engine(
+            _db_url(), echo=False, hide_parameters=True
+        )
 
         # SQLite requires an explicit PRAGMA to honour FK constraints.
         @event.listens_for(_engine.sync_engine, "connect")

@@ -3,6 +3,10 @@
 The underlying library is synchronous, so every call is run in a thread pool
 executor to avoid blocking the event loop.
 
+Since python-picnic-api2 2.0 the library returns pydantic models.  Everything
+here converts them back to plain dicts via ``_plain()`` so callers (MCP tools,
+the import script) keep working on JSON-serialisable data.
+
 Set PICNIC_MOCK=true to swap the real Picnic API for the in-process mock
 (useful for demos, automated tests, and local development without credentials).
 """
@@ -46,6 +50,21 @@ async def _run(func, *args, **kwargs) -> Any:
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 
+def _plain(value: Any) -> Any:
+    """Turn a python-picnic-api2 model (or a list of them) into a plain dict.
+
+    Models keep the verbatim API payload on ``.raw``, which is exactly what
+    1.x returned, so that is preferred over ``model_dump()``.  Plain values
+    (as returned by the mock client) pass through unchanged.
+    """
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    if hasattr(value, "model_dump"):
+        raw = getattr(value, "raw", None)
+        return raw if isinstance(raw, dict) else value.model_dump(mode="json")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Product search & catalog
 # ---------------------------------------------------------------------------
@@ -53,6 +72,10 @@ async def _run(func, *args, **kwargs) -> Any:
 async def search_products(query: str, limit: int = 10) -> list[dict]:
     client = _get_client()
     raw = await _run(client.search, query)
+    if hasattr(raw, "items") and not isinstance(raw, (dict, list)):
+        # 2.x SearchResult: a flat list of tiles.  Its ``.raw`` is the whole
+        # page tree, so dump the parsed tiles instead.
+        raw = [{"items": [i.model_dump(mode="json") for i in raw.items]}]
     items: list[dict] = []
     for category in raw:
         for item in category.get("items", []):
@@ -64,7 +87,11 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
 
 async def get_categories() -> list[dict]:
     client = _get_client()
-    raw = await _run(client.get_categories)
+    try:
+        raw = await _run(client.get_categories)
+    except NotImplementedError:
+        # Picnic removed this endpoint; python-picnic-api2 2.x raises.
+        return []
     return raw if isinstance(raw, list) else []
 
 
@@ -74,22 +101,22 @@ async def get_categories() -> list[dict]:
 
 async def get_cart() -> dict:
     client = _get_client()
-    return await _run(client.get_cart)
+    return _plain(await _run(client.get_cart))
 
 
 async def add_to_cart(product_id: str, quantity: int = 1) -> dict:
     client = _get_client()
-    return await _run(client.add_product, product_id, count=quantity)
+    return _plain(await _run(client.add_product, product_id, count=quantity))
 
 
 async def remove_from_cart(product_id: str) -> dict:
     client = _get_client()
-    return await _run(client.remove_product, product_id)
+    return _plain(await _run(client.remove_product, product_id))
 
 
 async def clear_cart() -> dict:
     client = _get_client()
-    cart = await _run(client.get_cart)
+    cart = _plain(await _run(client.get_cart))
     for item in cart.get("items", []):
         pid = item.get("id") or item.get("article_id")
         if pid:
@@ -103,7 +130,7 @@ async def clear_cart() -> dict:
 
 async def get_delivery_slots() -> list[dict]:
     client = _get_client()
-    raw = await _run(client.get_delivery_slots)
+    raw = _plain(await _run(client.get_delivery_slots))
     if isinstance(raw, dict):
         return raw.get("delivery_slots", [])
     return raw if isinstance(raw, list) else []
@@ -116,13 +143,13 @@ async def get_delivery_slots() -> list[dict]:
 async def get_deliveries() -> list[dict]:
     """Return full list of past deliveries (summary only)."""
     client = _get_client()
-    return await _run(client.get_deliveries)
+    return _plain(await _run(client.get_deliveries))
 
 
 async def get_delivery(delivery_id: str) -> dict:
     """Return detailed delivery data including line items."""
     client = _get_client()
-    return await _run(client.get_delivery, delivery_id)
+    return _plain(await _run(client.get_delivery, delivery_id))
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +157,12 @@ async def get_delivery(delivery_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _normalise_product(raw: dict) -> dict:
-    """Map a raw Picnic API product dict to our internal schema."""
-    price = raw.get("price", 0) or 0
+    """Map a raw Picnic API product dict to our internal schema.
+
+    Real search tiles carry only ``display_price`` (cents); ``price`` is what
+    the mock catalogue uses.
+    """
+    price = raw.get("display_price") or raw.get("price") or 0
     return {
         "id": raw.get("id", ""),
         "name": raw.get("name", ""),
