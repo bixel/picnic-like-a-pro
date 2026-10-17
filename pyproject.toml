@@ -14,6 +14,7 @@ dependencies = [
     "alembic>=1.13",
     "python-dotenv>=1.0",
     "openai>=1.40",
+    "httpx>=0.27",                # used directly by scripts/preflight.py
 ]
 
 [project.scripts]

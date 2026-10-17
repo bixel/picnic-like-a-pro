@@ -34,7 +34,9 @@ from picnic_meal_planner.db.models import Base  # noqa: E402
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Keep loggers that already exist: the default would silently disable every
+    # app logger when migrations run in-process (e.g. from the test suite).
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

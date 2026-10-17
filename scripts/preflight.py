@@ -195,10 +195,38 @@ async def check_database() -> None:
         )
 
 
-async def check_openrouter() -> None:
-    """Key validity via /key, then that the default model id exists.
+def load_llm_config():
+    """Import ``llm`` for its parsed settings, or record why that fails.
 
-    Neither call generates tokens, so the check costs nothing.
+    Imported lazily, after ``load_dotenv()``, so preflight reads the same
+    defaults the bot does instead of keeping its own copies. ``llm`` parses its
+    settings at import, so a bad value here is a bot that crashes on start.
+    """
+    try:
+        from picnic_meal_planner import llm
+    except ValueError as exc:
+        record(
+            FAIL,
+            "LLM_MAX_TOKENS",
+            f"not an integer: {os.getenv('LLM_MAX_TOKENS')!r} (bot will crash at import: {exc})",
+        )
+        return None
+    if llm.MAX_TOKENS <= 0:
+        record(FAIL, "LLM_MAX_TOKENS", f"{llm.MAX_TOKENS} — every request would be rejected")
+    else:
+        record(OK, "LLM_MAX_TOKENS", str(llm.MAX_TOKENS))
+    allowed = llm.allowed_models()
+    record(OK, "LLM_MODEL", f"{llm.DEFAULT_MODEL} (default for chats without their own)")
+    if allowed:
+        record(OK, "LLM_ALLOWED_MODELS", ", ".join(sorted(allowed)))
+    return llm
+
+
+async def check_openrouter(llm) -> None:
+    """Key validity via /key, then — independently — that the model id exists.
+
+    Neither call generates tokens, so the check costs nothing. Any failure is
+    a FAIL: if preflight cannot get an answer, neither can the bot.
     """
     import httpx
 
@@ -213,38 +241,59 @@ async def check_openrouter() -> None:
             )
         else:
             record(FAIL, "openrouter api", "no key to test")
+    if llm is None:
+        record(FAIL, "openrouter api", "skipped — fix the LLM settings above first")
         return
 
-    base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-    model = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4.6")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(f"{base}/key", headers={"Authorization": f"Bearer {key}"})
-            if r.status_code == 401:
-                record(
-                    FAIL,
-                    "openrouter api",
-                    "401 invalid key — this is what makes /plan fail. Mint a new one at "
-                    "openrouter.ai/settings/keys and export OPENROUTER_API_KEY",
-                )
-                return
-            r.raise_for_status()
-            data = r.json().get("data", {})
-            remaining = data.get("limit_remaining")
-            detail = "key accepted"
-            if remaining is not None:
-                detail += f", {remaining} credits left on this key"
-            record(OK, "openrouter api", detail)
+    base = llm.OPENROUTER_BASE_URL.rstrip("/")
+    async with httpx.AsyncClient(timeout=15) as client:
+        if key:
+            await _check_key(client, base, key)
+        await _check_model(client, base, llm.DEFAULT_MODEL)
 
-            r = await client.get(f"{base}/models")
-            r.raise_for_status()
-            ids = {m.get("id") for m in r.json().get("data", [])}
-        if model in ids:
-            record(OK, "llm model", f"{model} is available")
-        else:
-            record(FAIL, "llm model", f"LLM_MODEL={model!r} is not an OpenRouter model id")
-    except Exception as exc:  # noqa: BLE001
-        record(WARN, "openrouter api", f"could not verify: {type(exc).__name__}")
+
+async def _check_key(client, base: str, key: str) -> None:
+    import httpx
+
+    try:
+        r = await client.get(f"{base}/key", headers={"Authorization": f"Bearer {key}"})
+    except httpx.RequestError as exc:
+        record(FAIL, "openrouter api", f"cannot reach {base}: {type(exc).__name__}")
+        return
+    if r.status_code == 401:
+        record(
+            FAIL,
+            "openrouter api",
+            "401 invalid key — this is what makes /plan fail. Mint a new one at "
+            "openrouter.ai/settings/keys and export OPENROUTER_API_KEY",
+        )
+    elif r.status_code == 402:
+        record(FAIL, "openrouter api", "402 — key is valid but the account has no credits")
+    elif r.is_error:
+        record(FAIL, "openrouter api", f"HTTP {r.status_code} from {base}/key")
+    else:
+        data = r.json().get("data", {})
+        remaining = data.get("limit_remaining")
+        detail = "key accepted"
+        if remaining is not None:
+            detail += f", {remaining} credits left on this key"
+        record(OK, "openrouter api", detail)
+
+
+async def _check_model(client, base: str, model: str) -> None:
+    import httpx
+
+    try:
+        r = await client.get(f"{base}/models")
+        r.raise_for_status()
+        ids = {m.get("id") for m in r.json().get("data", [])}
+    except httpx.HTTPError as exc:
+        record(FAIL, "llm model", f"cannot list models at {base}: {type(exc).__name__}")
+        return
+    if model in ids:
+        record(OK, "llm model", f"{model} is available")
+    else:
+        record(FAIL, "llm model", f"LLM_MODEL={model!r} is not an OpenRouter model id")
 
 
 async def check_telegram() -> None:
@@ -280,11 +329,12 @@ async def main() -> int:
     check_auth_config()
     check_picnic_mode()
     check_history_config()
+    llm = load_llm_config()
     await check_database()
     if offline:
         record(WARN, "live api checks", "skipped (--offline)")
     else:
-        await check_openrouter()
+        await check_openrouter(llm)
         await check_telegram()
 
     fails = [r for r in _results if r[0] == FAIL]

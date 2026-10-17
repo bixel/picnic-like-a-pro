@@ -36,6 +36,10 @@ until the process is killed. Since turns are now archived, one runaway turn
 can also write megabytes.
 **Fix:** `for _ in range(MAX_TOOL_ROUNDS)` (~10) plus `timeout=` on
 `chat.completions.create` (in `llm.create_message`). Decide what to tell the user when the cap is hit.
+**More pressing since OpenRouter:** any model can now be configured, and
+tool-use discipline varies a lot between models, so a runaway loop is more
+likely than with one known model. A stuck request also blocks every other chat,
+since python-telegram-bot handles updates serially.
 
 ### 1.3 Let a de-authorized user erase their own data — S, privacy
 `cmd_forget` / `cmd_privacy` check `_is_allowed` before deleting. Removing
@@ -88,7 +92,7 @@ the kill-switch kept working. A typo raises a bare `ValueError` at import;
 
 ## 3. Performance
 
-### 3.1 Swap the index (review ref: m1) — S, needs migration `0003`
+### 3.1 Swap the index (review ref: m1) — S, needs migration `0004`
 `EXPLAIN QUERY PLAN` on all five conversation queries: **none** use
 `idx_conversation_messages_time`. `delete_turns_in_range` filters on
 `HAVING MIN(created_at)` after grouping, which that index cannot serve, so it

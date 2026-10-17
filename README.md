@@ -1,6 +1,6 @@
 # Picnic Like a Pro
 
-A family meal planner and grocery assistant Telegram bot powered by Claude AI. It connects to your shared [Picnic](https://picnic.app) grocery account and helps you plan meals, manage your cart, track order history, and forecast what you'll need to reorder.
+A family meal planner and grocery assistant Telegram bot powered by an LLM of your choice via OpenRouter (Claude Sonnet by default). It connects to your shared [Picnic](https://picnic.app) grocery account and helps you plan meals, manage your cart, track order history, and forecast what you'll need to reorder.
 
 ---
 

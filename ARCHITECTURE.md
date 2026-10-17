@@ -97,7 +97,8 @@ picnic-like-a-pro/
 ├── alembic.ini                 # Alembic config (DB URL from DB_PATH at runtime)
 ├── alembic/
 │   ├── env.py                  # Async migration env
-│   └── versions/               # 0001 initial schema, 0002 conversation history
+│   └── versions/               # 0001 initial schema, 0002 conversation history,
+│                               # 0003 per-chat LLM model
 │
 ├── src/
 │   └── picnic_meal_planner/
@@ -105,6 +106,7 @@ picnic-like-a-pro/
 │       │
 │       ├── bot.py              # Telegram bot entry point
 │       ├── history.py          # Conversation history policy & persistence
+│       ├── llm.py              # OpenRouter client, message translation, per-chat model
 │       ├── mcp_server.py       # FastMCP server (all tools)
 │       │
 │       ├── db/
@@ -123,8 +125,10 @@ picnic-like-a-pro/
 │           └── engine.py       # Order frequency analysis + forecasting
 │
 ├── scripts/
-│   └── import_history.py       # Optional stepwise import of Picnic delivery
-│                               # history (resumable, rate-limit safe)
+│   ├── import_history.py       # Optional stepwise import of Picnic delivery
+│   │                           # history (resumable, rate-limit safe)
+│   ├── chat_model.py           # List / set / reset each chat's LLM model
+│   └── preflight.py            # Config + live API checks before `uv run bot`
 │
 ├── tests/
 │   ├── conftest.py             # Shared fixtures (mock client, isolated DBs)
@@ -261,12 +265,13 @@ Indexed on `(chat_id, id)` for sequential reads and `(chat_id, created_at)` for
 day-range deletion.
 
 ### `chat_settings`
-Per-chat preferences; currently just the storage opt-out.
+Per-chat preferences: the storage opt-out and the LLM model.
 
 | Column          | Type    | Notes                              |
 |-----------------|---------|------------------------------------|
 | chat_id         | INTEGER PK | Telegram chat id                |
 | persist_history | INTEGER | 0 = chat opted out of storage      |
+| model           | TEXT NULL | OpenRouter model id; NULL = `LLM_MODEL` (migration 0003) |
 | updated_at      | TEXT    | ISO datetime                       |
 
 ### `meal_plans`

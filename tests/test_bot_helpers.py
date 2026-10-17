@@ -7,7 +7,7 @@ import string
 
 import pytest
 
-from picnic_meal_planner import bot, llm
+from picnic_meal_planner import bot
 
 
 class TestSplitMessage:
@@ -95,25 +95,6 @@ class TestAccessControl:
     def test_trailing_comma_tolerated(self, monkeypatch):
         monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123,456,")
         assert bot._allowed_user_ids() == {123, 456}
-
-
-class TestLlmClient:
-    def test_client_is_built_from_env_key(self, monkeypatch):
-        monkeypatch.setattr(llm, "_client", None)
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        client = llm.get_client()
-        assert str(client.base_url).startswith("https://openrouter.ai/api/v1")
-
-    def test_client_is_cached(self, monkeypatch):
-        monkeypatch.setattr(llm, "_client", None)
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        assert llm.get_client() is llm.get_client()
-
-    def test_missing_api_key_raises(self, monkeypatch):
-        monkeypatch.setattr(llm, "_client", None)
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        with pytest.raises(KeyError):
-            llm.get_client()
 
 
 class TestMcpToolWiring:

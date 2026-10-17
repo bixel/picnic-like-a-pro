@@ -11,7 +11,7 @@ format, and it is translated for whichever model a chat uses.
 **TL;DR**
 
 1. Create an OpenRouter key and load credits.
-2. In the VPS `.env`, replace `ANTHROPIC_API_KEY` with `OPENROUTER_API_KEY` and add `LLM_MODEL`.
+2. In the VPS `.env`, replace `ANTHROPIC_API_KEY` with `OPENROUTER_API_KEY` (setting `LLM_MODEL` is optional).
 3. Back up the DB, then run the migration **before** starting the new image. It adds `chat_settings.model`.
 4. Check it with `/model` and a normal chat message.
 
@@ -43,7 +43,7 @@ On the VPS, edit `~/picnic-bot/.env`:
 ```diff
 -ANTHROPIC_API_KEY=sk-ant-...
 +OPENROUTER_API_KEY=sk-or-v1-...
-+LLM_MODEL=anthropic/claude-sonnet-4.6
++LLM_MODEL=anthropic/claude-sonnet-4.6   # optional, see below
 ```
 
 `LLM_MODEL` is optional. `anthropic/claude-sonnet-4.6` is already the default
@@ -80,9 +80,11 @@ additive. Existing rows get `NULL`, which means "use `LLM_MODEL`".
 > **Do not skip this.** `init_db()` at startup creates missing *tables* but
 > cannot add a column to an existing one. Without the migration, reading chat
 > settings fails. Persistence then fails closed, so **conversations silently
-> stop being saved**, and every chat falls back to the default model. The bot
-> logs `Database schema is behind the code (missing chat_settings.model)` at
-> startup if this happens.
+> stop being saved**, and every chat falls back to the default model. To make
+> that impossible to miss, the bot **refuses to start** on such a schema
+> (`SchemaOutOfDateError: Database schema is behind the code (missing
+> chat_settings.model)`). With `restart: unless-stopped` that shows up as a
+> restart loop in `docker compose ps`. `scripts/chat_model.py` refuses too.
 
 The deploy workflow only runs `docker compose pull && up -d`. It does **not**
 migrate, so do this by hand once, on the VPS, in this order:
@@ -96,7 +98,7 @@ docker compose stop picnic-bot           # no writes during the migration
 docker compose run --rm picnic-bot python -c "import sqlite3; sqlite3.connect('data/picnic.db').backup(sqlite3.connect('data/picnic.pre-openrouter.db'))"
 
 # 3b. Find out which state the DB is in
-docker compose run --rm picnic-bot python -c "import sqlite3; c=sqlite3.connect('data/picnic.db'); t={r[0] for r in c.execute(\"select name from sqlite_master where type='table'\")}; print('alembic_version:', c.execute('select version_num from alembic_version').fetchall() if 'alembic_version' in t else 'NONE'); print('has conversation tables:', {'conversation_messages','chat_settings'} <= t)"
+docker compose run --rm picnic-bot python -c "import sqlite3; c=sqlite3.connect('data/picnic.db'); t={r[0] for r in c.execute(\"select name from sqlite_master where type='table'\")}; print('alembic_version:', c.execute('select version_num from alembic_version').fetchall() if 'alembic_version' in t else 'NONE'); print('has conversation tables:', {'conversation_messages','chat_settings'} <= t); print('has model column:', 'chat_settings' in t and 'model' in {r[1] for r in c.execute('pragma table_info(chat_settings)')})"
 ```
 
 Then apply the matching case:
@@ -104,13 +106,16 @@ Then apply the matching case:
 | `3b` printed | Meaning | Run |
 |---|---|---|
 | `alembic_version: [('0002',)]` (or `0001`) | Already under Alembic | `docker compose run --rm picnic-bot alembic upgrade head` |
-| `alembic_version: NONE`, conversation tables **True** | Created by `init_db()` with the conversation-history code | `docker compose run --rm picnic-bot alembic stamp 0002` then `... alembic upgrade head` |
-| `alembic_version: NONE`, conversation tables **False** | Created by `init_db()` before conversation history | `docker compose run --rm picnic-bot alembic stamp 0001` then `... alembic upgrade head` |
+| `alembic_version: [('0003',)]` | Already migrated | nothing |
+| `NONE`, conversation tables **False** | Created by `init_db()` before conversation history | `docker compose run --rm picnic-bot alembic stamp 0001` then `... alembic upgrade head` |
+| `NONE`, conversation tables **True**, model column **False** | Created by `init_db()` with the conversation-history code | `docker compose run --rm picnic-bot alembic stamp 0002` then `... alembic upgrade head` |
+| `NONE`, conversation tables **True**, model column **True** | Created by `init_db()` from *this* image (e.g. it already started once) | `docker compose run --rm picnic-bot alembic stamp 0003` — nothing to upgrade |
 
-> **Don't `alembic stamp head`** on an unmanaged DB this time. `stamp head`
-> would record `0003` as applied without adding the column. The older advice in
-> CLAUDE.md applies only when the code and the DB were created at the same
-> revision.
+> **Stamp the revision the DB actually matches — never `stamp head` blindly.**
+> Stamping records migrations as applied without running them: stamping a
+> 0002-shaped DB at `0003` leaves the column missing, and stamping a DB that
+> already has the column at `0002` makes `upgrade head` fail with "duplicate
+> column".
 
 Then start the bot:
 
@@ -119,7 +124,7 @@ docker compose up -d
 docker compose logs --tail=30 picnic-bot
 ```
 
-You should see this line, and **no** `schema is behind` error:
+The container should stay `Up` (not restarting), and the log should contain:
 
 ```
 Default LLM model (via OpenRouter): anthropic/claude-sonnet-4.6
@@ -201,8 +206,8 @@ the volume.
 - The `anthropic` dependency was removed and `openai` added.
 - `chat_settings.model` is a new column (migration `0003`).
 - `/model` shows the chat's model. `scripts/chat_model.py` switches it.
-- `preflight.py` now checks the OpenRouter key, the model id and schema drift.
-  The bot logs schema drift at startup.
+- `preflight.py` now checks the OpenRouter key, the model id, `LLM_MAX_TOKENS`
+  and schema drift. The bot refuses to start on schema drift.
 - Behaviour notes: failures now surface as `openai.*Error`, not
   `anthropic.*Error`. The user still sees the same friendly message. No
   prompt caching was used before, and none is used now.

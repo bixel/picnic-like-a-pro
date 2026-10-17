@@ -125,10 +125,9 @@ async def _run_llm(chat_id: int, user_text: str) -> str:
             elif block["type"] == "tool_use":
                 tool_uses.append(block)
 
-        # Append the assistant message to the conversation, in the one
-        # representation used for both the next request and the stored row.
-        normalized = history.normalize_content(response.content)
-        messages.append({"role": "assistant", "content": normalized})
+        # llm returns plain, JSON-safe dicts: the one representation used for
+        # both the next request and the stored row.
+        messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "tool_use" and tool_uses:
             # Execute all requested tool calls
@@ -166,7 +165,7 @@ async def _run_llm(chat_id: int, user_text: str) -> str:
                 "Could you ask again, ideally a bit more specifically?"
             )
 
-        if not normalized:
+        if not response.content:
             logger.warning(
                 "Discarding empty response for chat %d (stop_reason=%r)",
                 chat_id, response.stop_reason,
@@ -364,9 +363,27 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+class SchemaOutOfDateError(RuntimeError):
+    """The database lacks columns the code needs; a migration was skipped."""
+
+
 async def _post_init(app: Application) -> None:
-    """Ensure database tables exist before the bot starts handling messages."""
+    """Ensure the database is usable before the bot starts handling messages.
+
+    Raises :class:`SchemaOutOfDateError` — stopping the bot — when a migration
+    was skipped. ``init_db()`` creates missing tables but cannot add columns to
+    existing ones, and running on such a schema is worse than not running:
+    every ``chat_settings`` read fails, persistence fails closed, and history
+    silently stops being saved while the bot looks healthy.
+    """
     await init_db()
+    missing = await missing_columns()
+    if missing:
+        raise SchemaOutOfDateError(
+            f"Database schema is behind the code (missing {', '.join(missing)}). "
+            "Run `alembic upgrade head` before starting the bot — see "
+            "MIGRATION_OPENROUTER.md."
+        )
     logger.info(
         "Database initialised. Conversation persistence: %s",
         "on"
@@ -374,16 +391,6 @@ async def _post_init(app: Application) -> None:
         else "off (PERSIST_CONVERSATIONS)",
     )
     logger.info("Default LLM model (via OpenRouter): %s", llm.DEFAULT_MODEL)
-    # init_db() cannot add columns to existing tables. Without this, a skipped
-    # migration surfaces only as history quietly not being saved (the settings
-    # read fails, and persistence fails closed).
-    missing = await missing_columns()
-    if missing:
-        logger.error(
-            "Database schema is behind the code (missing %s). Run "
-            "`alembic upgrade head` — see MIGRATION_OPENROUTER.md.",
-            ", ".join(missing),
-        )
 
 
 def main() -> None:

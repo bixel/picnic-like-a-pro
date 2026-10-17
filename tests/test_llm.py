@@ -195,6 +195,28 @@ class TestFromOpenAICompletion:
         ))
         assert r.content[0]["id"].startswith("call_")
 
+    def test_text_and_tool_call_in_one_message(self):
+        r = llm.from_openai_completion(_completion(
+            "Let me check.",
+            tool_calls=[{"id": "c1", "name": "get_cart"}],
+            finish_reason="tool_calls",
+        ))
+        assert [b["type"] for b in r.content] == ["text", "tool_use"]
+        assert r.stop_reason == "tool_use"
+
+    def test_missing_arguments_mean_no_input(self):
+        completion = _completion(tool_calls=[{"name": "get_cart"}], finish_reason="tool_calls")
+        completion.choices[0].message.tool_calls[0].function.arguments = None
+        assert llm.from_openai_completion(completion).content[0]["input"] == {}
+
+    def test_output_is_json_safe(self):
+        """History stores this verbatim; nothing downstream converts it."""
+        r = llm.from_openai_completion(_completion(
+            "hi", tool_calls=[{"name": "x", "arguments": '{"a": [1, {"b": null}]}'}],
+            finish_reason="tool_calls",
+        ))
+        assert json.loads(json.dumps(r.content)) == r.content
+
     def test_empty_content_yields_no_blocks(self):
         assert llm.from_openai_completion(_completion(None)).content == []
 
@@ -263,6 +285,25 @@ class TestCreateMessage:
         assert "tools" not in client.chat.completions.kwargs
 
 
+class TestLlmClient:
+    def test_client_is_built_from_env_key(self, monkeypatch):
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        client = llm.get_client()
+        assert str(client.base_url).startswith("https://openrouter.ai/api/v1")
+
+    def test_client_is_cached(self, monkeypatch):
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        assert llm.get_client() is llm.get_client()
+
+    def test_missing_api_key_raises(self, monkeypatch):
+        monkeypatch.setattr(llm, "_client", None)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with pytest.raises(KeyError):
+            llm.get_client()
+
+
 class TestClientHeaders:
     def test_referer_header_is_optional(self, monkeypatch):
         monkeypatch.setattr(llm, "_client", None)
@@ -286,6 +327,13 @@ class TestChatModel:
         assert await llm.get_chat_model(1) == "openai/gpt-5"
         await llm.set_chat_model(1, None)
         assert await llm.get_chat_model(1) == llm.DEFAULT_MODEL
+
+    async def test_empty_model_means_default(self, db_path):
+        await llm.set_chat_model(1, "openai/gpt-5")
+        await llm.set_chat_model(1, "   ")
+        assert await llm.get_chat_model(1) == llm.DEFAULT_MODEL
+        async with get_db() as session:
+            assert (await get_chat_settings(session, 1))["model"] is None
 
     async def test_whitespace_is_stripped(self, db_path):
         await llm.set_chat_model(1, "  openai/gpt-5 ")

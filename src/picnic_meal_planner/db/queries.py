@@ -626,7 +626,7 @@ async def set_chat_persist_history(
     await session.execute(stmt)
 
 
-async def set_chat_model(
+async def upsert_chat_model(
     session: AsyncSession, chat_id: int, model: str | None
 ) -> None:
     """Pin *model* for a chat; ``None`` reverts it to the deployment default.

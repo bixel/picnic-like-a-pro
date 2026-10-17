@@ -36,8 +36,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from .db.queries import get_chat_settings, get_db
-from .db.queries import set_chat_model as _set_chat_model_row
+from .db.queries import get_chat_settings, get_db, upsert_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +55,21 @@ _STOP_REASONS = {
 
 
 class LLMError(RuntimeError):
-    """The provider answered, but not with anything usable."""
+    """A 200 response that carries no completion.
+
+    Only that case. Transport and API failures propagate as the ``openai``
+    SDK's own exceptions (``BadRequestError``, ``AuthenticationError``, ...),
+    deliberately unwrapped so a caller can react to a specific one.
+    """
 
 
 @dataclass
 class LLMResponse:
-    """A completion translated back into Anthropic-shaped content blocks."""
+    """A completion translated back into Anthropic-shaped content blocks.
+
+    ``content`` is plain, JSON-safe dicts — the exact form history stores and
+    sends back on the next request, so callers need not convert it.
+    """
 
     content: list[dict]
     stop_reason: str | None
@@ -126,14 +134,14 @@ async def set_chat_model(chat_id: int, model: str | None) -> None:
     Raises ``ValueError`` when ``LLM_ALLOWED_MODELS`` is set and *model* is not
     in it, so user-facing callers can reuse the same guard.
     """
-    model = model.strip() if model else None
+    model = (model or "").strip() or None
     allowed = allowed_models()
     if model and allowed and model not in allowed:
         raise ValueError(
             f"Model {model!r} is not allowed. Choose one of: {', '.join(sorted(allowed))}"
         )
     async with get_db() as session:
-        await _set_chat_model_row(session, chat_id, model)
+        await upsert_chat_model(session, chat_id, model)
         await session.commit()
 
 
@@ -299,7 +307,11 @@ async def create_message(
     tools: list[dict] | None = None,
     max_tokens: int = MAX_TOKENS,
 ) -> LLMResponse:
-    """Send Anthropic-shaped *messages* to *model* via OpenRouter."""
+    """Send Anthropic-shaped *messages* to *model* via OpenRouter.
+
+    Raises the ``openai`` SDK's exceptions for transport/API failures and
+    :class:`LLMError` for a response with no completion in it.
+    """
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,

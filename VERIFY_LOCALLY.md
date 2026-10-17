@@ -12,7 +12,7 @@ outbound Telegram/OpenRouter access or a Docker daemon — neither was available
 where this was written, and those are called out where they appear.
 
 ```bash
-git checkout claude/persist-conversation-history-90CmU
+git checkout claude/openrouter-llm-integration-uqletp
 make install          # uv sync --group dev
 ```
 
@@ -27,37 +27,28 @@ dev` will reconcile it.
 ```bash
 make test-fast
 ```
-**Expect:** `438 passed`. If you want coverage instead, `make test`.
+**Expect:** `497 passed`. If you want coverage instead, `make test`.
 
-The 11 tests added by the review-fix commit are the ones that matter most.
-Run them alone to see what they assert:
+The tests that matter most for the history and OpenRouter work. Run them alone
+to see what they assert:
 
 ```bash
 uv run pytest tests/test_history.py -q \
   -k "window or concurrent or leak or head"
-uv run pytest tests/test_bot_conversation.py::TestRunClaudeUnfinishedTurns -v
-```
-
-**Prove they are real regression tests** — they must fail against the code as
-it was before the fixes:
-
-```bash
-git stash -u                       # if you have local edits
-git checkout HEAD~1 -- src/        # old source, new tests
-uv run pytest tests/test_history.py tests/test_bot_conversation.py -q
-#   -> expect 10 failed
-git checkout HEAD -- src/          # put it back
-uv run pytest -q                   # -> 438 passed
+uv run pytest tests/test_bot_conversation.py::TestRunLlmUnfinishedTurns -v
+uv run pytest tests/test_llm.py -q                        # translation both ways
+uv run pytest tests/test_bot_conversation.py -v \
+  -k "ModelSelection or RealAdapter or schema or 0002"    # per-chat model, drift
 ```
 
 Migration round-trip on a scratch DB (never touches `data/picnic.db`):
 
 ```bash
 export DB_PATH=/tmp/verify.db && rm -f $DB_PATH
-uv run alembic upgrade head        # -> runs 0001 then 0002
-uv run alembic downgrade -1        # -> 0002 -> 0001, no error
+uv run alembic upgrade head        # -> runs 0001, 0002, then 0003
+uv run alembic downgrade -1        # -> 0003 -> 0002, no error
 uv run alembic upgrade head
-uv run alembic current             # -> 0002 (head)
+uv run alembic current             # -> 0003 (head)
 uv run alembic revision --autogenerate -m drift
 ```
 **Expect:** the generated file's `upgrade()` body is just `pass` — models and
@@ -254,7 +245,7 @@ export PERSIST_CONVERSATIONS=true
 
 ```bash
 rm -f "$DB_PATH"
-uv run alembic upgrade head     # 0001, then 0002
+uv run alembic upgrade head     # 0001, 0002, then 0003
 uv run python scripts/preflight.py
 ```
 
@@ -401,8 +392,10 @@ make mock-up && make mock-logs
 Here `_post_init`'s `init_db()` does create the tables on a fresh volume. On a
 volume that predates this branch, run
 `docker compose -f docker-compose.mock.yml run --rm picnic-bot-mock alembic
-upgrade head` first — and `alembic stamp head` before that if the DB was
-originally created by `init_db()` rather than Alembic.
+upgrade head` first. If the DB was originally created by `init_db()` rather
+than Alembic, stamp the revision it actually matches before that — see
+`MIGRATION_OPENROUTER.md` step 3. (The bot refuses to start on a stale schema
+and names the missing column.)
 
 **Tear down:** `make mock-down`, or add `-v` to drop the volume.
 
@@ -421,9 +414,11 @@ originally created by `init_db()` rather than Alembic.
 
 ## Before deploying to production
 
-1. `uv run alembic upgrade head` **before** restarting the bot — this branch
-   adds migration `0002`. On a DB originally created by `init_db()`, run
-   `uv run alembic stamp head` first so Alembic doesn't try to recreate tables.
+1. `uv run alembic upgrade head` **before** restarting the bot — the history
+   branch adds migration `0002`, this one `0003`. On a DB originally created by
+   `init_db()`, stamp the revision it actually matches first (never `stamp
+   head`); `MIGRATION_OPENROUTER.md` step 3 has the diagnostic and the full
+   production procedure.
 2. Existing chats start empty; history accrues from the first message after the
    upgrade. Nothing is back-filled.
 3. Conversations are now **stored unencrypted** on the data volume. If that is

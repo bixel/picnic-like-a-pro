@@ -8,7 +8,6 @@ view.
 
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
 
 import pytest
@@ -55,69 +54,6 @@ async def _commit(chat_id: int, turn: list[dict]) -> None:
     new_from = len(messages)
     messages.extend(turn)
     await history.commit_turn(chat_id, messages, new_from)
-
-
-# ---------------------------------------------------------------------------
-# normalize_content
-# ---------------------------------------------------------------------------
-
-class _FakeBlock:
-    """Mimics an Anthropic SDK pydantic content block."""
-
-    def __init__(self, **data):
-        self._data = data
-
-    def model_dump(self, mode=None, exclude_none=False):
-        data = dict(self._data)
-        if exclude_none:
-            data = {k: v for k, v in data.items() if v is not None}
-        return data
-
-
-class _LegacyBlock:
-    def __init__(self, data):
-        self._data = data
-
-    def to_dict(self):
-        return self._data
-
-
-class TestNormalizeContent:
-    def test_passes_strings_through(self):
-        assert history.normalize_content("hello") == "hello"
-
-    def test_maps_none_to_empty_string(self):
-        assert history.normalize_content(None) == ""
-
-    def test_passes_plain_dicts_through(self):
-        blocks = [{"type": "text", "text": "hi"}]
-        assert history.normalize_content(blocks) == blocks
-
-    def test_dumps_sdk_blocks(self):
-        out = history.normalize_content([_FakeBlock(type="text", text="hi")])
-        assert out == [{"type": "text", "text": "hi"}]
-
-    def test_drops_none_fields(self):
-        """Nullable fields the API does not need echoed back are stripped."""
-        out = history.normalize_content(
-            [_FakeBlock(type="text", text="hi", citations=None)]
-        )
-        assert "citations" not in out[0]
-
-    def test_output_is_json_serialisable(self):
-        """The whole point: these values have to survive a round trip to SQLite."""
-        out = history.normalize_content(
-            [_FakeBlock(type="tool_use", id="t", name="n", input={"a": 1})]
-        )
-        assert json.loads(json.dumps(out)) == out
-
-    def test_falls_back_to_to_dict(self):
-        out = history.normalize_content([_LegacyBlock({"type": "text"})])
-        assert out == [{"type": "text"}]
-
-    def test_rejects_unserialisable_blocks(self):
-        with pytest.raises(TypeError):
-            history.normalize_content([object()])
 
 
 # ---------------------------------------------------------------------------

@@ -102,12 +102,20 @@ When starting the app for the first time (bot, mcp-server, or import script),
 `Base.metadata.create_all(checkfirst=True)` — a no-op if tables already
 exist, otherwise it creates them.
 
-> **Note:** `create_all` bypasses Alembic's migration history tracking.
-> If you later run `alembic upgrade head` on a database bootstrapped this way,
-> stamp it first so Alembic doesn't try to re-create tables:
+> **Note:** `create_all` bypasses Alembic's migration history tracking, and
+> it never adds a column to an existing table.  To bring such a database under
+> Alembic, stamp the revision its schema **actually matches**, then upgrade:
 > ```bash
-> uv run alembic stamp head
+> uv run alembic stamp 0002     # or whichever revision the tables match
+> uv run alembic upgrade head
 > ```
+> Never `stamp head` blindly: it records every migration as applied without
+> running any, so a missing column stays missing.  `MIGRATION_OPENROUTER.md`
+> step 3 shows how to tell which revision a database matches.
+>
+> The bot refuses to start (`SchemaOutOfDateError`) when
+> `engine.missing_columns()` reports drift, and `scripts/chat_model.py` refuses
+> to run — a stale schema would otherwise silently disable history storage.
 
 ---
 
@@ -186,14 +194,14 @@ All policy lives in `history.py`.  `bot.py` calls only `get_context()` and
 
 ### A turn is the unit of deletion
 
-One `_run_claude` call can produce several messages:
+One `_run_llm` call can produce several messages:
 
 ```
 user  →  assistant (tool_use)  →  user (tool_result)  →  assistant (text)
 ```
 
 Deleting an arbitrary *message* out of that leaves a `tool_result` with no
-matching `tool_use`, and the Messages API rejects the next request with a 400.
+matching `tool_use`, and the API rejects the next request with a 400.
 So every message carries a `turn_id` and **all deletion operates on whole
 turns**.  Because each turn begins with a plain-text `user` message, removing
 any set of turns leaves a valid alternating sequence.
@@ -222,7 +230,7 @@ could discard the message the user just sent.
 
 ### A turn is only archived if it ended cleanly
 
-`_run_claude` discards, rather than persists, a turn whose final assistant
+`_run_llm` discards, rather than persists, a turn whose final assistant
 message contains an unanswered `tool_use` (generation cut off mid-block, so
 `stop_reason` is `max_tokens` and the tool branch never runs) or whose content
 is empty.  Storing either would poison the chat permanently: the next request
@@ -231,10 +239,11 @@ success.
 
 ### Serialization
 
-`response.content` is a list of pydantic SDK blocks, which are not
-JSON-serialisable.  `normalize_content()` converts them once, at append time,
-via `model_dump(mode="json", exclude_none=True)`, so a single representation
-serves both the next API request and the stored row.
+`llm.create_message()` returns `LLMResponse.content` as plain, JSON-safe
+Anthropic-shaped dicts, built once in `llm.from_openai_completion()`.  That one
+representation is appended to the conversation, sent back on the next request
+and stored as-is — nothing downstream converts it.  Keep it that way: if a
+new provider path ever yields SDK objects, convert them in `llm.py`.
 
 ### Failure behaviour
 
