@@ -16,16 +16,27 @@ always the last write in a batch.
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .engine import get_session_factory
-from .models import ImportCheckpoint, Order, OrderItem, Product
+from .models import (
+    ChatSettings,
+    ConversationMessage,
+    ImportCheckpoint,
+    Order,
+    OrderItem,
+    Product,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +352,274 @@ async def save_checkpoint(
         )
     )
     await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Conversation history
+#
+# Messages are grouped into turns (see ConversationMessage in models.py).
+# Deletion always operates on whole turns: removing a lone message would leave
+# a tool_result with no matching tool_use, which the Anthropic API rejects.
+#
+# Like the rest of this module, these helpers are commit-neutral — the caller
+# owns the transaction.
+# ---------------------------------------------------------------------------
+
+async def load_conversation(
+    session: AsyncSession, chat_id: int, *, limit: int | None = None
+) -> list[dict]:
+    """Return stored messages oldest-first as ``{"role", "content"}`` dicts.
+
+    *limit* keeps the most recent N messages (still returned oldest-first).
+    """
+    stmt = select(ConversationMessage.role, ConversationMessage.content).where(
+        ConversationMessage.chat_id == chat_id
+    )
+    if limit is None:
+        stmt = stmt.order_by(ConversationMessage.id)
+    else:
+        stmt = stmt.order_by(ConversationMessage.id.desc()).limit(limit)
+
+    rows = (await session.execute(stmt)).all()
+    messages = _rows_to_messages(rows, chat_id)
+
+    if limit is not None:
+        messages.reverse()
+    return messages
+
+
+def _rows_to_messages(rows, chat_id: int) -> list[dict]:
+    """Decode ``(role, content)`` rows, skipping any whose JSON will not parse.
+
+    Content is always written with ``json.dumps``, so an unparseable row means
+    corruption or manual editing rather than anything a user can cause.
+
+    Skipping keeps the chat *loadable*, but note it does not guarantee the
+    result is a valid request: dropping a row from the middle of a turn can
+    orphan a ``tool_result``. ``trim_history`` repairs the head only. Fully
+    repairing this means dropping the whole turn — see the C2 note in
+    PLAN_CONVERSATION_HISTORY.md.
+    """
+    messages: list[dict] = []
+    for row in rows:
+        try:
+            content = json.loads(row.content)
+        except (TypeError, ValueError):
+            logger.warning("Skipping unparseable message for chat %d", chat_id)
+            continue
+        messages.append({"role": row.role, "content": content})
+    return messages
+
+
+async def load_recent_turns(
+    session: AsyncSession, chat_id: int, *, max_messages: int
+) -> list[dict]:
+    """Return the most recent *whole* turns that fit within *max_messages*.
+
+    Loading by message count instead would cut mid-turn whenever the boundary
+    fell inside one, handing back a window that opens on an orphaned
+    ``tool_result`` — a 400 from the Messages API. Turn ids exist precisely so
+    the read path does not have to infer boundaries; this uses them.
+
+    A turn larger than *max_messages* on its own is dropped rather than
+    truncated, so the result may be empty.
+    """
+    if max_messages <= 0:
+        return []
+
+    counts = (
+        await session.execute(
+            select(
+                ConversationMessage.turn_id,
+                func.count().label("size"),
+            )
+            .where(ConversationMessage.chat_id == chat_id)
+            .group_by(ConversationMessage.turn_id)
+            .order_by(func.min(ConversationMessage.id).desc())
+        )
+    ).all()
+
+    keep: list[int] = []
+    total = 0
+    for row in counts:                      # newest turn first
+        if total + row.size > max_messages:
+            break                           # stop at the first turn that overflows
+        keep.append(row.turn_id)
+        total += row.size
+
+    if not keep:
+        return []
+
+    rows = (
+        await session.execute(
+            select(ConversationMessage.role, ConversationMessage.content)
+            .where(
+                ConversationMessage.chat_id == chat_id,
+                ConversationMessage.turn_id.in_(keep),
+            )
+            .order_by(ConversationMessage.id)
+        )
+    ).all()
+    return _rows_to_messages(rows, chat_id)
+
+
+async def append_turn(
+    session: AsyncSession, chat_id: int, messages: list[dict]
+) -> int:
+    """Append one turn's messages under a fresh ``turn_id``. Returns the turn_id.
+
+    Turn ids are per-chat and monotonic. They are not reused after a deletion —
+    gaps are expected and harmless.
+    """
+    next_turn = await session.scalar(
+        select(func.coalesce(func.max(ConversationMessage.turn_id), 0) + 1).where(
+            ConversationMessage.chat_id == chat_id
+        )
+    )
+    turn_id = int(next_turn or 1)
+
+    now = _now()
+    session.add_all(
+        [
+            ConversationMessage(
+                chat_id=chat_id,
+                turn_id=turn_id,
+                role=m["role"],
+                content=json.dumps(m["content"]),
+                created_at=now,
+            )
+            for m in messages
+        ]
+    )
+    return turn_id
+
+
+async def list_turns(session: AsyncSession, chat_id: int) -> list[dict]:
+    """Summarise a chat's turns, oldest first.
+
+    Backs a future "what can I delete?" view; the preview is the opening user
+    message of each turn, truncated.
+    """
+    stmt = (
+        select(
+            ConversationMessage.turn_id,
+            func.min(ConversationMessage.created_at).label("started_at"),
+            func.count().label("message_count"),
+            func.min(ConversationMessage.id).label("first_id"),
+        )
+        .where(ConversationMessage.chat_id == chat_id)
+        .group_by(ConversationMessage.turn_id)
+        .order_by(func.min(ConversationMessage.id))
+    )
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return []
+
+    first_ids = [row.first_id for row in rows]
+    previews_by_id = dict(
+        (
+            await session.execute(
+                select(ConversationMessage.id, ConversationMessage.content).where(
+                    ConversationMessage.id.in_(first_ids)
+                )
+            )
+        ).all()
+    )
+
+    turns = []
+    for row in rows:
+        try:
+            content = json.loads(previews_by_id.get(row.first_id, '""'))
+        except (TypeError, ValueError):
+            content = ""
+        # Only a plain-text opening message makes a meaningful preview.
+        preview = content if isinstance(content, str) else ""
+        turns.append(
+            {
+                "turn_id": row.turn_id,
+                "started_at": row.started_at,
+                "message_count": row.message_count,
+                "preview": preview[:120],
+            }
+        )
+    return turns
+
+
+async def delete_conversation(session: AsyncSession, chat_id: int) -> int:
+    """Delete all stored messages for a chat. Returns the number of rows removed."""
+    result = await session.execute(
+        delete(ConversationMessage).where(ConversationMessage.chat_id == chat_id)
+    )
+    return result.rowcount
+
+
+async def delete_turns(
+    session: AsyncSession, chat_id: int, turn_ids: Iterable[int]
+) -> int:
+    """Delete the named turns in full. Returns the number of rows removed."""
+    ids = list(turn_ids)
+    if not ids:
+        return 0
+    result = await session.execute(
+        delete(ConversationMessage).where(
+            ConversationMessage.chat_id == chat_id,
+            ConversationMessage.turn_id.in_(ids),
+        )
+    )
+    return result.rowcount
+
+
+async def delete_turns_in_range(
+    session: AsyncSession,
+    chat_id: int,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+) -> int:
+    """Delete every turn that *started* within ``[since, until)`` (ISO datetimes).
+
+    The range is resolved to a set of whole turns first, rather than deleting
+    rows by timestamp — that is what stops a turn straddling the boundary from
+    being split in half.
+    """
+    stmt = (
+        select(ConversationMessage.turn_id)
+        .where(ConversationMessage.chat_id == chat_id)
+        .group_by(ConversationMessage.turn_id)
+    )
+    if since is not None:
+        stmt = stmt.having(func.min(ConversationMessage.created_at) >= since)
+    if until is not None:
+        stmt = stmt.having(func.min(ConversationMessage.created_at) < until)
+
+    turn_ids = (await session.scalars(stmt)).all()
+    return await delete_turns(session, chat_id, turn_ids)
+
+
+# ---------------------------------------------------------------------------
+# Chat settings
+# ---------------------------------------------------------------------------
+
+async def get_chat_settings(session: AsyncSession, chat_id: int) -> dict | None:
+    row = await session.get(ChatSettings, chat_id)
+    if row is None:
+        return None
+    return {
+        "chat_id": row.chat_id,
+        "persist_history": row.persist_history,
+        "updated_at": row.updated_at,
+    }
+
+
+async def set_chat_persist_history(
+    session: AsyncSession, chat_id: int, enabled: bool
+) -> None:
+    stmt = (
+        sqlite_insert(ChatSettings)
+        .values(chat_id=chat_id, persist_history=int(enabled), updated_at=_now())
+        .on_conflict_do_update(
+            index_elements=["chat_id"],
+            set_=dict(persist_history=int(enabled), updated_at=_now()),
+        )
+    )
+    await session.execute(stmt)

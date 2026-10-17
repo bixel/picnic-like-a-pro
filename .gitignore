@@ -8,7 +8,6 @@ build/
 *.egg
 
 # uv
-uv.lock
 
 # Environment
 # .env.test is committed on purpose: it holds no secrets and CI needs it.
