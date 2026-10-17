@@ -153,6 +153,13 @@ async def insert_order(
     return order.id
 
 
+async def get_order_id(session: AsyncSession, picnic_order_id: str) -> int | None:
+    """Return the local id of the order imported as *picnic_order_id*, if any."""
+    return await session.scalar(
+        select(Order.id).where(Order.picnic_order_id == picnic_order_id)
+    )
+
+
 async def insert_order_item(
     session: AsyncSession,
     *,
