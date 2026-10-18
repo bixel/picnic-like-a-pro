@@ -8,6 +8,10 @@ A delivery that cannot be imported yet (still CURRENT, or its detail could not
 be fetched or was unusable) is deferred: the run does not mark the import
 finished and does not move the checkpoint past it, so the next run picks it up.
 
+Every run then looks up the category of each stored product that has none
+yet (delivery data carries no categories), including runs that find no new
+deliveries.  A product Picnic no longer lists is retried on the next run.
+
 Usage:
     uv run python scripts/import_history.py
 
@@ -49,7 +53,56 @@ async def main() -> None:
             "Run `uv run alembic upgrade head` first."
         )
     await init_db()
+    await import_deliveries()
+    await backfill_categories()
 
+
+async def backfill_categories() -> None:
+    """Fill in the category of every stored product that has none."""
+    batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
+    delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
+
+    async with db.get_db() as conn:
+        product_ids = await db.products_without_category(conn)
+    if not product_ids:
+        return
+    print(f"\nLooking up categories for {len(product_ids)} product(s)...")
+
+    found = 0
+    login_error = None
+    for i in range(0, len(product_ids), batch_size):
+        categories: dict[str, str] = {}
+        for product_id in product_ids[i : i + batch_size]:
+            try:
+                category = await picnic.get_product_category(product_id)
+            except (picnic.PicnicLoginRequired, picnic.PicnicLoginPending) as exc:
+                login_error = exc
+                break
+            except Exception as exc:  # noqa: BLE001 — retried by the next run
+                print(f"  Warning: could not look up category of {product_id}: {exc}")
+                continue
+            if category:
+                categories[product_id] = category
+
+        async with db.get_db() as conn:
+            for product_id, category in categories.items():
+                await db.set_product_category(conn, product_id, category)
+            await conn.commit()
+        found += len(categories)
+        if login_error:
+            print(f"  Stopped: {login_error}", file=sys.stderr)
+            break
+        print(f"  {min(i + batch_size, len(product_ids))}/{len(product_ids)} checked", flush=True)
+
+        if i + batch_size < len(product_ids):
+            await asyncio.sleep(delay_seconds)
+
+    print(f"Categories found for {found} of {len(product_ids)} product(s).")
+    if found < len(product_ids):
+        print("The rest will be retried on the next run.")
+
+
+async def import_deliveries() -> None:
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 

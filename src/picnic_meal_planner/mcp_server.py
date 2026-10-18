@@ -55,9 +55,20 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
-async def get_categories() -> list[dict]:
-    """Browse the top-level Picnic product categories."""
-    return await picnic.get_categories()
+async def get_categories(category: str | None = None) -> list[dict]:
+    """List the categories of products the family has ordered or searched for.
+
+    Picnic no longer offers its own category listing, so this covers only
+    products known locally (order history and earlier searches).
+
+    Args:
+        category: A category name as listed by this tool.  If given, return
+            the products in that category instead of the category list.
+    """
+    async with db.get_db() as conn:
+        if category:
+            return await db.get_products_in_category(conn, category)
+        return await db.get_categories(conn)
 
 
 @mcp.tool()

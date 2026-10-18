@@ -75,9 +75,33 @@ class TestSearchProducts:
         assert await picnic.search_products("xyzzy_none") == []
 
 
-class TestGetCategories:
-    async def test_returns_list(self):
-        assert len(await picnic.get_categories()) >= 5
+class TestGetProductCategory:
+    async def test_mock_product(self):
+        assert await picnic.get_product_category("p_milk_whole") == "Zuivel, Eieren & Boter"
+
+    async def test_unknown_product_is_none(self):
+        assert await picnic.get_product_category("p_nonexistent") is None
+
+    async def test_reads_the_typed_article(self, monkeypatch):
+        from python_picnic_api2.models import Article, Category
+
+        class Api:
+            def get_article(self, article_id, add_category=False):
+                assert add_category
+                return Article(id=article_id, category=Category(l2_id=1, l3_id=2, name="Koffiebonen"))
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_product_category("s1") == "Koffiebonen"
+
+    async def test_page_without_category_is_none(self, monkeypatch):
+        from python_picnic_api2 import PicnicParseError
+
+        class Api:
+            def get_article(self, article_id, add_category=False):
+                raise PicnicParseError("no category button", endpoint="product-details-page-root")
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_product_category("s1") is None
 
 
 class TestGetCart:
@@ -244,13 +268,6 @@ class TestRealLibraryModels:
         assert await picnic.get_delivery_slots() == [{"slot_id": "s1"}]
         assert await picnic.get_deliveries() == [summary]
         assert await picnic.get_delivery("d1") == detail
-
-    async def test_removed_categories_endpoint_returns_empty(self, real):
-        def gone():
-            raise NotImplementedError("removed by picnic")
-
-        real.get_categories = gone
-        assert await picnic.get_categories() == []
 
 
 # Trimmed from python-picnic-api2's tests/fixtures/delivery_de.json: the real

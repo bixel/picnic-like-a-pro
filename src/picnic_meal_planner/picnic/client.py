@@ -217,13 +217,26 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
     return items
 
 
-async def get_categories() -> list[dict]:
+async def get_product_category(product_id: str) -> str | None:
+    """Return the name of a product's (L3) category, or ``None`` if unknown.
+
+    Neither search tiles nor delivery articles carry a category, and the
+    per-article category endpoint is gone, so this loads the product page and
+    then its category page: two requests per product.  ``None`` means Picnic
+    has no page for the product any more, or the page has no category button.
+    Login errors propagate.
+    """
+    from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
+
     try:
-        raw = await _call("get_categories")
-    except NotImplementedError:
-        # Picnic removed this endpoint; python-picnic-api2 2.x raises.
-        return []
-    return raw if isinstance(raw, list) else []
+        article = await _call("get_article", product_id, add_category=True)
+    except PicnicParseError:
+        return None
+    category = getattr(article, "category", None)
+    if isinstance(article, dict):  # the mock client
+        category = article.get("category")
+    name = category.get("name") if isinstance(category, dict) else getattr(category, "name", None)
+    return name or None
 
 
 # ---------------------------------------------------------------------------

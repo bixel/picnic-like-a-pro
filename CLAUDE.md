@@ -131,7 +131,15 @@ SQLite's `INSERT … ON CONFLICT DO UPDATE/NOTHING` dialect is used via
 `sqlalchemy.dialects.sqlite.insert`.  This keeps the insert operations
 idempotent for re-imports.
 
-- `upsert_product`: full upsert (update all mutable columns on conflict).
+- `upsert_product`: full upsert (update all mutable columns on conflict),
+  except that a `None` category keeps the stored one.  Search tiles and
+  delivery articles carry no category, and Picnic removed both category
+  endpoints (`get_categories`, `get_article_category`), so
+  `scripts/import_history.py` fills `products.category` afterwards via
+  `client.get_product_category()` (`get_article(id, add_category=True)`, two
+  requests per product), on every run, for products that still have none.
+  The `get_categories` MCP tool lists these local categories (and, given a
+  name, the products in one); there is no live category listing any more.
 - `insert_order`: conflict-do-nothing on `picnic_order_id`; returns the
   existing row's id when the row already exists.
 

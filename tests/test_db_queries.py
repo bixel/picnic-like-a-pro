@@ -54,6 +54,18 @@ class TestUpsertProduct:
         await db_session.commit()
         assert (await db.get_product(db_session, "p_test_milk"))["unit_price"] is None
 
+    async def test_upsert_without_category_keeps_the_stored_one(self, db_session):
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": None})
+        await db_session.commit()
+        assert (await db.get_product(db_session, "p_test_milk"))["category"] == "Dairy"
+
+    async def test_upsert_with_category_replaces_it(self, db_session):
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": "Milk"})
+        await db_session.commit()
+        assert (await db.get_product(db_session, "p_test_milk"))["category"] == "Milk"
+
     async def test_upsert_sets_last_seen_at(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)
         await db_session.commit()
@@ -68,6 +80,20 @@ class TestGetProduct:
 
     async def test_get_nonexistent_returns_none(self, db_session):
         assert await db.get_product(db_session, "p_does_not_exist") is None
+
+
+class TestProductCategories:
+    async def test_lists_and_fills_missing_categories(self, db_session):
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_b", "category": None})
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_a", "category": None})
+        await db_session.commit()
+        assert await db.products_without_category(db_session) == ["p_a", "p_b"]
+
+        await db.set_product_category(db_session, "p_a", "Bread")
+        await db_session.commit()
+        assert await db.products_without_category(db_session) == ["p_b"]
+        assert (await db.get_product(db_session, "p_a"))["category"] == "Bread"
 
 
 class TestInsertOrder:
