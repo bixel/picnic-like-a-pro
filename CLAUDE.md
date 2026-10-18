@@ -116,8 +116,12 @@ exist, otherwise it creates them.
 > step 3 shows how to tell which revision a database matches.
 >
 > The bot refuses to start (`SchemaOutOfDateError`) when
-> `engine.missing_columns()` reports drift, and `scripts/chat_model.py` refuses
-> to run — a stale schema would otherwise silently disable history storage.
+> `engine.pending_migration()` finds Alembic's revision behind
+> `engine.SCHEMA_REVISION` — checked *before* `init_db()`, which would
+> otherwise create the new tables and make `alembic upgrade head` fail with
+> "table already exists" — or when `engine.missing_columns()` reports drift,
+> and `scripts/chat_model.py` refuses to run — a stale schema would otherwise
+> silently disable history storage.
 
 ---
 
@@ -290,6 +294,11 @@ in `picnic/auth.py`, and `client.py` applies it.
   library verifies the code against the same `PicnicAPI` instance that asked
   for it, so a pending login is an object in memory with a 10-minute TTL; a
   wrong code keeps it pending.
+- **A pending login blocks every other password login.**  A new one would
+  replace the half-authenticated session the code belongs to.  So while one
+  waits, `get_client()` and anyone else's `/picnic_login` raise
+  `PicnicLoginPending` (`LoginFlow.ensure_idle()`); only the user who started
+  it may restart it, e.g. to switch to email.
 - **Tokens are kept current.** `_call()` stores the token whenever the
   session adopts a new one.  A rejected token is cleared — only if it is still
   the stored one, so a fresh login from another process is never wiped — and
@@ -307,7 +316,7 @@ in `picnic/auth.py`, and `client.py` applies it.
 | `PICNIC_USERNAME` | — | Picnic account email |
 | `PICNIC_PASSWORD` | — | Picnic account password |
 | `PICNIC_COUNTRY_CODE` | — | `NL`, `DE`, or `BE` |
-| `PICNIC_LOGIN_USER_IDS` | — | Telegram user ids allowed to run `/picnic_login` (each sends the owner a code); empty = every allowed user |
+| `PICNIC_LOGIN_USER_IDS` | — | Telegram user ids allowed to run `/picnic_login` and `/picnic_code` (each login sends the owner a code); empty = every allowed user |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (all LLM requests) |
 | `LLM_MODEL` | `anthropic/claude-sonnet-4.6` | Default OpenRouter model id for chats without their own |

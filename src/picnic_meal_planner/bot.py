@@ -31,7 +31,12 @@ load_dotenv()
 
 # Imported after load_dotenv(): both modules read configuration at import time.
 from . import history, llm  # noqa: E402
-from .db.engine import init_db, missing_columns  # noqa: E402
+from .db.engine import (  # noqa: E402
+    SCHEMA_REVISION,
+    init_db,
+    missing_columns,
+    pending_migration,
+)
 from .picnic import auth as picnic_auth  # noqa: E402
 from .picnic import client as picnic  # noqa: E402
 
@@ -353,11 +358,11 @@ async def cmd_picnic_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     channel = (context.args[0] if context.args else "sms").upper()
     try:
-        logged_in = await picnic.start_login(channel)
+        logged_in = await picnic.start_login(channel, owner=update.effective_user.id)
     except ValueError:
         await update.message.reply_text("Usage: /picnic_login [sms|email]")
         return
-    except picnic.PicnicLoginRequired as exc:  # credentials missing from the config
+    except picnic.PicnicLoginRequired as exc:  # no credentials, or another login pending
         await update.message.reply_text(str(exc))
         return
     except PicnicAuthError:
@@ -457,11 +462,20 @@ async def _post_init(app: Application) -> None:
     """Ensure the database is usable before the bot starts handling messages.
 
     Raises :class:`SchemaOutOfDateError` — stopping the bot — when a migration
-    was skipped. ``init_db()`` creates missing tables but cannot add columns to
-    existing ones, and running on such a schema is worse than not running:
+    was skipped: Alembic's recorded revision is behind the code, or columns
+    are missing. ``init_db()`` creates missing tables but cannot add columns
+    to existing ones, and running on such a schema is worse than not running:
     every ``chat_settings`` read fails, persistence fails closed, and history
     silently stops being saved while the bot looks healthy.
     """
+    stored = await pending_migration()
+    if stored is not None:
+        # Checked before init_db(), which would create the new tables outside
+        # Alembic and make the pending migration fail on them.
+        raise SchemaOutOfDateError(
+            f"Database is at migration {stored}, the code needs "
+            f"{SCHEMA_REVISION}. Run `alembic upgrade head` before starting the bot."
+        )
     await init_db()
     missing = await missing_columns()
     if missing:

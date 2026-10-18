@@ -207,3 +207,28 @@ class TestMissingColumns:
         async with engine_mod.get_engine().begin() as conn:
             await conn.exec_driver_sql("DROP TABLE chat_settings")
         assert await engine_mod.missing_columns() == []
+
+
+class TestPendingMigration:
+    async def test_none_without_alembic(self, db_path):
+        assert await engine_mod.pending_migration() is None
+
+    @pytest.mark.parametrize("stored,expected", [
+        ("0003", "0003"),
+        (engine_mod.SCHEMA_REVISION, None),
+        ("9999", None),  # a newer DB under a rolled-back image
+    ])
+    async def test_compares_the_stored_revision(self, db_path, stored, expected):
+        async with engine_mod.get_engine().begin() as conn:
+            await conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"
+            )
+            await conn.exec_driver_sql(f"INSERT INTO alembic_version VALUES ('{stored}')")
+        assert await engine_mod.pending_migration() == expected
+
+    async def test_empty_version_table_is_pending(self, db_path):
+        async with engine_mod.get_engine().begin() as conn:
+            await conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"
+            )
+        assert await engine_mod.pending_migration() == "(none)"

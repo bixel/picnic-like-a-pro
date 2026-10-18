@@ -52,6 +52,10 @@ class PicnicLoginRequired(RuntimeError):
     """
 
 
+class PicnicLoginPending(PicnicLoginRequired):
+    """A login is already waiting for its code; starting another would break it."""
+
+
 HOW_TO_LOGIN = (
     "Send /picnic_login in Telegram, or run "
     "`uv run python scripts/picnic_login.py` on the server."
@@ -79,7 +83,9 @@ def new_api(auth_token: str | None = None):
     from python_picnic_api2 import PicnicAPI  # noqa: PLC0415
 
     return PicnicAPI(
-        country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL"),
+        # The library lowercases the code itself, but stray whitespace
+        # would end up in the storefront host name.
+        country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL").strip(),
         auth_token=auth_token,
     )
 
@@ -129,6 +135,7 @@ async def clear_token(*, only_if: str | None = None) -> int:
 class _Pending:
     api: Any
     channel: str
+    owner: Any = None
     started: float = field(default_factory=time.monotonic)
 
     def expired(self) -> bool:
@@ -141,6 +148,9 @@ class LoginFlow:
     ``start()`` returns the logged-in API when no code is needed, else
     ``None`` after asking Picnic to send a code; ``verify()`` then finishes.
     Neither stores the token — the caller installs the API and does that.
+    There is one pending login per process: while it waits, ``start()`` from
+    anyone but its owner, and every other password login, is refused
+    (:meth:`ensure_idle`).
     """
 
     def __init__(self) -> None:
@@ -155,12 +165,32 @@ class LoginFlow:
     def cancel(self) -> None:
         self._pending = None
 
-    async def start(self, channel: str = "SMS"):
+    def ensure_idle(self, owner: Any = None) -> None:
+        """Raise :class:`PicnicLoginPending` while someone else's login waits.
+
+        Any new password login would replace the half-authenticated session
+        the pending code belongs to, so it is refused until the code arrives
+        or the login expires.  The *owner* of the pending login may restart
+        it (say, to switch to email); ``owner=None`` never matches.
+        """
+        pending = self._pending
+        if pending is None or pending.expired():
+            return
+        if owner is not None and owner == pending.owner:
+            return
+        raise PicnicLoginPending(
+            f"A Picnic login is waiting for the code sent by {pending.channel.lower()}. "
+            "Send it with /picnic_code, or wait "
+            f"{CODE_TTL_SECONDS // 60} minutes for it to expire."
+        )
+
+    async def start(self, channel: str = "SMS", *, owner: Any = None):
         from python_picnic_api2 import Picnic2FARequired  # noqa: PLC0415
 
         channel = channel.upper()
         if channel not in CHANNELS:
             raise ValueError(f"channel must be one of {', '.join(CHANNELS)}")
+        self.ensure_idle(owner)
         username, password = credentials()
         api = new_api()
         self._pending = None
@@ -168,7 +198,7 @@ class LoginFlow:
             await _run(api.login, username, password)
         except Picnic2FARequired:
             await _run(api.generate_2fa_code, channel)
-            self._pending = _Pending(api=api, channel=channel)
+            self._pending = _Pending(api=api, channel=channel, owner=owner)
             return None
         _require_token(api)
         return api

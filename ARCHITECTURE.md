@@ -98,7 +98,7 @@ picnic-like-a-pro/
 ├── alembic/
 │   ├── env.py                  # Async migration env
 │   └── versions/               # 0001 initial schema, 0002 conversation history,
-│                               # 0003 per-chat LLM model
+│                               # 0003 per-chat LLM model, 0004 Picnic session
 │
 ├── src/
 │   └── picnic_meal_planner/
@@ -275,6 +275,16 @@ Per-chat preferences: the storage opt-out and the LLM model.
 | persist_history | INTEGER | 0 = chat opted out of storage      |
 | model           | TEXT NULL | OpenRouter model id; NULL = `LLM_MODEL` (migration 0003) |
 | updated_at      | TEXT    | ISO datetime                       |
+
+### `picnic_auth`
+The Picnic session token, shared by every process using the account (migration
+0004). At most one row: the deployment has one Picnic account.
+
+| Column     | Type       | Notes                                   |
+|------------|------------|-----------------------------------------|
+| id         | INTEGER PK | Always 1                                |
+| auth_token | TEXT       | Session token — a credential, never logged |
+| updated_at | TEXT       | ISO datetime                            |
 
 ### `meal_plans`
 Optional: track planned meals to drive shopping list generation.
@@ -474,8 +484,12 @@ times. It works in pages so you can stop and resume at any point.
    is skipped before its items are written, so a run interrupted between a commit
    and its batch checkpoint does not double those items on resume. The UNIQUE
    constraint on `picnic_order_id` remains the backstop.
-6. Cancelled and still-current deliveries are skipped: neither is history the
-   forecasts should learn from.
+6. Cancelled deliveries are skipped for good. A delivery that cannot be imported
+   *yet* — still `CURRENT`, a failed fetch, or a detail that
+   `picnic.client.delivery_unusable_reason()` rejects (error body, no order time,
+   no order lines) — is **deferred**: nothing is written for it, the checkpoint
+   never moves past it, and the run is not marked finished, so the next run
+   rescans and picks it up. Step 5 makes that rescan cheap.
 7. Line items come from `picnic.client.delivery_line_items()`, which flattens the
    real API's `orders → ORDER_LINE → ORDER_ARTICLE` nesting (count from the
    `QUANTITY` decorator, unit price from the line price) as well as the mock's

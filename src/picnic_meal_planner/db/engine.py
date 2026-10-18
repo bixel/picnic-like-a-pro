@@ -16,7 +16,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from sqlalchemy import event, inspect
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,6 +31,9 @@ def _db_url() -> str:
     db_path = os.getenv("DB_PATH", "data/picnic.db")
     return f"sqlite+aiosqlite:///{db_path}"
 
+
+# The Alembic head this code expects; tests/test_migrations.py keeps it in step.
+SCHEMA_REVISION = "0004"
 
 # Module-level singletons; populated lazily.
 _engine: AsyncEngine | None = None
@@ -92,6 +95,30 @@ async def init_db() -> None:
     """
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def pending_migration() -> str | None:
+    """The stored Alembic revision if it is behind :data:`SCHEMA_REVISION`.
+
+    Call it *before* :func:`init_db`.  On a database Alembic manages,
+    ``create_all`` would otherwise create a table the next migration adds,
+    and ``alembic upgrade head`` then fails with "table already exists".
+    ``None`` when the database is current, ahead (a rolled-back image), or
+    not under Alembic at all — :func:`missing_columns` covers that case.
+    Revisions are zero-padded numbers, so they compare as strings.
+    """
+
+    def _read(sync_conn) -> str | None:
+        if "alembic_version" not in inspect(sync_conn).get_table_names():
+            return None
+        row = sync_conn.execute(text("SELECT version_num FROM alembic_version")).first()
+        return row[0] if row else ""
+
+    async with get_engine().connect() as conn:
+        stored = await conn.run_sync(_read)
+    if stored is None or stored >= SCHEMA_REVISION:
+        return None
+    return stored or "(none)"
 
 
 async def missing_columns() -> list[str]:

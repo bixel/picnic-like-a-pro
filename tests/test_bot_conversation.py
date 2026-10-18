@@ -693,6 +693,35 @@ class TestPostInit:
         with pytest.raises(bot.SchemaOutOfDateError):
             await bot._post_init(MagicMock())
 
+    async def test_refuses_a_0003_database_before_creating_new_tables(
+        self, tmp_path, monkeypatch
+    ):
+        """init_db() must not run first: it would create picnic_auth outside
+        Alembic, and `alembic upgrade head` would then fail on it."""
+        from alembic import command
+        from alembic.config import Config
+        from sqlalchemy import inspect
+
+        from picnic_meal_planner.db import engine as engine_mod
+
+        root = Path(__file__).resolve().parent.parent
+        cfg = Config(str(root / "alembic.ini"))
+        cfg.set_main_option("script_location", str(root / "alembic"))
+        monkeypatch.setenv("DB_PATH", str(tmp_path / "at_0003.db"))
+        await engine_mod._engine.dispose()
+        engine_mod._engine = None
+        engine_mod._session_factory = None
+        await asyncio.to_thread(command.upgrade, cfg, "0003")
+
+        with pytest.raises(bot.SchemaOutOfDateError, match="0003"):
+            await bot._post_init(MagicMock())
+        async with engine_mod.get_engine().connect() as conn:
+            tables = await conn.run_sync(lambda c: inspect(c).get_table_names())
+        assert "picnic_auth" not in tables
+        await engine_mod._engine.dispose()
+        # And the upgrade the error asks for still works.
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
     async def test_is_safe_to_run_against_an_existing_database(self, db_path):
         """Restarting the bot must not fail or wipe data."""
         from picnic_meal_planner.db.models import Product

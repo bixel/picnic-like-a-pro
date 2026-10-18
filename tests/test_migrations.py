@@ -262,3 +262,12 @@ class TestChatModelMigration:
         [row] = self._rows(db_file)
         assert "model" not in row
         assert row["persist_history"] == 0
+
+
+def test_schema_revision_is_the_alembic_head():
+    """engine.SCHEMA_REVISION gates startup; it must move with every migration."""
+    from alembic.script import ScriptDirectory
+
+    from picnic_meal_planner.db.engine import SCHEMA_REVISION
+
+    assert ScriptDirectory.from_config(_alembic_config()).get_current_head() == SCHEMA_REVISION

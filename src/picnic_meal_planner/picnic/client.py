@@ -25,9 +25,9 @@ from functools import partial
 from typing import Any
 
 from . import auth
-from .auth import PicnicLoginRequired
+from .auth import PicnicLoginPending, PicnicLoginRequired
 
-__all__ = ["PicnicLoginRequired"]  # re-exported for callers of this module
+__all__ = ["PicnicLoginPending", "PicnicLoginRequired"]  # re-exported for callers of this module
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,8 @@ async def get_client():
 
     Real mode prefers the stored session token and logs in with the password
     only when none is stored.  Raises :class:`PicnicLoginRequired` when that
-    login needs a 2FA code.
+    login needs a 2FA code, and :class:`PicnicLoginPending` instead of
+    attempting it while a ``/picnic_login`` waits for its code.
     """
     global _client, _saved_token, _needs_login
     if _client is not None:
@@ -68,6 +69,9 @@ async def get_client():
             # also clears a pending 2FA demand.
             _client, _saved_token, _needs_login = auth.new_api(token), token, False
             return _client
+        # A password login here would replace the session a pending
+        # /picnic_login code belongs to.
+        _login.ensure_idle()
         if _needs_login:
             raise PicnicLoginRequired(
                 f"Picnic needs a one-time login code. {auth.HOW_TO_LOGIN}"
@@ -150,9 +154,13 @@ async def _call(method: str, *args, **kwargs) -> Any:
 # Login (see auth.py) — shared by /picnic_login and scripts/picnic_login.py
 # ---------------------------------------------------------------------------
 
-async def start_login(channel: str = "SMS") -> bool:
-    """Log in with the password; ``True`` if done, ``False`` if a code was sent."""
-    api = await _login.start(channel)
+async def start_login(channel: str = "SMS", *, owner: Any = None) -> bool:
+    """Log in with the password; ``True`` if done, ``False`` if a code was sent.
+
+    Raises :class:`PicnicLoginPending` while a login started by someone other
+    than *owner* waits for its code.
+    """
+    api = await _login.start(channel, owner=owner)
     if api is None:
         return False
     await _install(api)
@@ -300,12 +308,23 @@ def _price_per_unit(line_price: Any, quantity: int) -> int | None:
     return round(line_price / quantity)
 
 
-def _article_quantity(article: dict) -> int:
-    """Read the ordered count from an article's ``QUANTITY`` decorator."""
+def _article_quantity(article: dict) -> int | None:
+    """Read the ordered count from a ``QUANTITY`` decorator or a count field."""
     for decorator in article.get("decorators") or []:
         if decorator.get("type") == "QUANTITY" and decorator.get("quantity"):
             return int(decorator["quantity"])
-    return int(article.get("count") or article.get("quantity") or 1)
+    count = article.get("count") or article.get("quantity")
+    return int(count) if count else None
+
+
+def delivery_id(summary: dict) -> str | None:
+    """The id a delivery summary is keyed by in checkpoints and ``orders``.
+
+    The precedence is load-bearing: changing it would re-key existing imports.
+    python-picnic-api2 2.x summaries carry only ``delivery_id``; the mock and
+    full delivery payloads have ``id``.
+    """
+    return summary.get("id") or summary.get("delivery_id") or summary.get("order_id")
 
 
 def delivery_line_items(detail: dict) -> list[dict]:
@@ -315,24 +334,27 @@ def delivery_line_items(detail: dict) -> list[dict]:
     carries the price actually paid for the whole line, the article carries
     the product and, in a ``QUANTITY`` decorator, the count.  The mock skips
     the line level and puts flat articles straight into ``order["items"]``;
-    an item without nested ``items`` is treated as that flat article.
+    an item without nested ``items`` is treated as that flat article.  Such an
+    item may also wrap the article as ``{"product": {...}, "count", "unit_price"}``,
+    in which case the wrapper's count and paid price win over the product's.
     """
     result: list[dict] = []
     for order in detail.get("orders") or [detail]:
         for line in order.get("items") or []:
             nested = line.get("items")
             articles = nested if isinstance(nested, list) else [line]
-            for article in articles:
-                article = article.get("product") or article
+            for entry in articles:
+                article = entry.get("product") or entry
                 product_id = article.get("id") or article.get("article_id")
                 if not product_id:
                     continue
-                quantity = _article_quantity(article)
+                quantity = _article_quantity(entry) or _article_quantity(article) or 1
                 # Only a line holding a single article has a line price that
                 # belongs to that article alone.
                 line_price = line.get("price") if nested and len(articles) == 1 else None
                 unit_price = (
                     _price_per_unit(line_price, quantity)
+                    or entry.get("unit_price")
                     or article.get("unit_price")
                     or article.get("price")
                 )
@@ -383,3 +405,23 @@ def delivery_summary_fields(detail: dict) -> dict:
         total_price = sum(totals) if totals else None
 
     return {"ordered_at": ordered_at, "delivered_at": delivered_at, "total_price": total_price}
+
+
+def delivery_unusable_reason(detail: dict) -> str | None:
+    """Say why a delivery detail must not be imported, or ``None`` if it may.
+
+    ``PicnicAPI`` only raises on auth errors, so an error body or an empty
+    reply arrives as an ordinary dict.  Importing one would store an order
+    with no items that the importer then treats as done, so it is never
+    retried.  ``error`` is checked for truthiness: real payloads carry
+    ``"error": {}``.
+    """
+    if not isinstance(detail, dict) or not detail:
+        return "empty response"
+    if detail.get("error"):
+        return f"error response: {str(detail['error'])[:80]}"
+    if not delivery_summary_fields(detail)["ordered_at"]:
+        return "no order time"
+    if not delivery_line_items(detail):
+        return "no order lines"
+    return None

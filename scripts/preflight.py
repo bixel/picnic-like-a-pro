@@ -6,7 +6,7 @@ as a 401. This checks the lot up front and says which one is wrong.
 
 Usage:
     uv run python scripts/preflight.py          # config + live API checks
-                                                #   (Anthropic, Telegram, Picnic)
+                                                #   (OpenRouter, Telegram, Picnic)
     uv run python scripts/preflight.py --offline  # skip network calls
 
 Secrets are never printed — only their length, first/last characters, and
@@ -122,10 +122,21 @@ def picnic_mocked() -> bool:
     return os.getenv("PICNIC_MOCK", "").lower() == "true"
 
 
-def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
+def picnic_country() -> str:
+    # The library lowercases the code for the host name, so "nl" works too.
+    return os.getenv("PICNIC_COUNTRY_CODE", "NL").strip().upper()
+
+
+def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> bool:
+    """Report the Picnic settings; return whether a password login is possible.
+
+    False whenever a credential is missing or a placeholder, or the country
+    code FAILed here, so a placeholder is never sent to the real storefront.
+    """
     if picnic_mocked():
         record(OK, "picnic", "PICNIC_MOCK=true — no real Picnic calls, no checkout")
-        return
+        return True
+    ok = True
     record(
         WARN,
         "picnic",
@@ -134,7 +145,10 @@ def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
     for name in ("PICNIC_USERNAME", "PICNIC_PASSWORD"):
         value = os.environ.get(name)
         clean = (value or "").strip().strip('"').strip("'")
-        status = FAIL if not clean or clean in PLACEHOLDERS else OK
+        # Only WARN: a stored session needs no password, so whether this
+        # blocks is check_picnic_session's call.
+        status = WARN if not clean or clean in PLACEHOLDERS else OK
+        ok = ok and status == OK
         src = source_of(name, shell, dotenv_path)
         if name == "PICNIC_PASSWORD" and status == OK:
             # shape() shows a prefix, which is harmless for a token's fixed
@@ -144,13 +158,15 @@ def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
             detail = shape(value)
         record(status, name, f"from {src}: {detail}")
 
-    country = os.getenv("PICNIC_COUNTRY_CODE", "NL")
+    country = picnic_country()
+    valid_country = country in PICNIC_COUNTRIES
     record(
-        OK if country in PICNIC_COUNTRIES else FAIL,
+        OK if valid_country else FAIL,
         "PICNIC_COUNTRY_CODE",
-        country if country in PICNIC_COUNTRIES
+        country if valid_country
         else f"{country!r} — must be one of {', '.join(sorted(PICNIC_COUNTRIES))}",
     )
+    return ok and valid_country
 
 
 def check_history_config() -> None:
@@ -194,16 +210,16 @@ async def check_database() -> None:
         record(FAIL, "database", f"cannot open: {type(exc).__name__}")
         return
 
-    needed = {"conversation_messages", "chat_settings"}
+    needed = {"conversation_messages", "chat_settings", "picnic_auth"}
     missing = needed - tables
     if missing:
         record(
             FAIL,
-            "conversation tables",
+            "tables",
             f"missing {sorted(missing)} — run: uv run alembic upgrade head",
         )
     else:
-        record(OK, "conversation tables", "conversation_messages, chat_settings present")
+        record(OK, "tables", ", ".join(sorted(needed)) + " present")
 
     missing_cols = await engine_mod.missing_columns()
     if missing_cols:
@@ -343,7 +359,35 @@ async def check_telegram() -> None:
         record(FAIL, "telegram api", f"{type(exc).__name__}: {str(exc)[:80]}")
 
 
-async def check_picnic() -> None:
+async def check_picnic_session(config_ok: bool) -> bool:
+    """Report the stored Picnic session; return whether a live login can work.
+
+    A stored session needs no password, so missing credentials only block
+    when there is no session either.  Reads the DB only, so it runs offline.
+    """
+    if picnic_mocked():
+        return True
+    if picnic_country() not in PICNIC_COUNTRIES:
+        return False  # check_picnic_config already FAILed it
+
+    from picnic_meal_planner.picnic import auth
+
+    token = await auth.load_token()
+    if token:
+        record(OK, "picnic session", f"stored (len={len(token)})")
+        return True
+    if config_ok:
+        record(WARN, "picnic session", "none stored — the bot will log in with the password")
+        return True
+    record(
+        FAIL,
+        "picnic session",
+        "none stored, and no usable PICNIC_USERNAME / PICNIC_PASSWORD to log in with",
+    )
+    return False
+
+
+async def check_picnic(ready: bool = True) -> None:
     """Log in exactly as the bot will: stored session first, then password.
 
     A password login that succeeds stores its session, as the bot's would; one
@@ -351,20 +395,14 @@ async def check_picnic() -> None:
     """
     if picnic_mocked():
         return  # check_picnic_config already reported mock mode
+    if not ready:
+        record(FAIL, "picnic api", "skipped — fix the Picnic settings above first")
+        return
 
     import requests
     from python_picnic_api2 import PicnicAuthError
 
-    from picnic_meal_planner.picnic import auth
     from picnic_meal_planner.picnic import client as picnic
-
-    token = await auth.load_token()
-    record(
-        OK if token else WARN,
-        "picnic session",
-        f"stored (len={len(token)})" if token
-        else "none stored — the bot will log in with the password",
-    )
 
     try:
         user = await picnic.get_user()
@@ -416,16 +454,17 @@ async def main() -> int:
     print("Preflight for `uv run bot`\n")
     check_env_sources(shell, dotenv_path)
     check_auth_config()
-    check_picnic_config(shell, dotenv_path)
+    picnic_ok = check_picnic_config(shell, dotenv_path)
     check_history_config()
     llm = load_llm_config()
     await check_database()
+    picnic_ready = await check_picnic_session(picnic_ok)
     if offline:
         record(WARN, "live api checks", "skipped (--offline)")
     else:
         await check_openrouter(llm)
         await check_telegram()
-        await check_picnic()
+        await check_picnic(picnic_ready)
 
     fails = [r for r in _results if r[0] == FAIL]
     warns = [r for r in _results if r[0] == WARN]

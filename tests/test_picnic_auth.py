@@ -239,6 +239,43 @@ class TestLoginFlow:
         await picnic.submit_login_code("123456")
         assert picnic._needs_login is False
 
+    async def test_pending_login_blocks_a_password_login_from_a_tool_call(self):
+        FakePicnicAPI.needs_2fa = True
+        await picnic.start_login(owner=1)
+        with pytest.raises(picnic.PicnicLoginPending, match="/picnic_code"):
+            await picnic.get_cart()
+        # No second /user/login replaced the session the code belongs to.
+        assert len(FakePicnicAPI.instances) == 1
+        await picnic.submit_login_code("123456")
+        assert await _stored_token() == "2fa-token"
+
+    async def test_pending_login_does_not_hide_a_token_stored_elsewhere(self):
+        FakePicnicAPI.needs_2fa = True
+        await picnic.start_login(owner=1)
+        await _store("stored")
+        FakePicnicAPI.valid_tokens.add("stored")
+        assert (await picnic.get_client()).session.auth_token == "stored"
+
+    async def test_second_user_cannot_replace_a_pending_login(self):
+        FakePicnicAPI.needs_2fa = True
+        await picnic.start_login("email", owner=1)
+        with pytest.raises(picnic.PicnicLoginPending, match="by email"):
+            await picnic.start_login(owner=2)
+        assert picnic.pending_login_channel() == "EMAIL"
+        assert len(FakePicnicAPI.instances) == 1
+
+    async def test_owner_may_restart_their_pending_login(self):
+        FakePicnicAPI.needs_2fa = True
+        await picnic.start_login(owner=1)
+        assert await picnic.start_login("email", owner=1) is False
+        assert picnic.pending_login_channel() == "EMAIL"
+
+    async def test_expired_pending_login_no_longer_blocks(self, monkeypatch):
+        FakePicnicAPI.needs_2fa = True
+        await picnic.start_login(owner=1)
+        monkeypatch.setattr(auth, "CODE_TTL_SECONDS", -1)
+        assert await picnic.start_login(owner=2) is False
+
     async def test_unknown_channel_is_rejected(self):
         with pytest.raises(ValueError, match="SMS"):
             await picnic.start_login("pigeon")
@@ -294,6 +331,15 @@ class TestTelegramCommands:
         assert "by email" in reply and "/picnic_code" in reply
         assert "Logged in" in await self._reply(bot.cmd_picnic_code, "123456")
         assert await _stored_token() == "2fa-token"
+
+    async def test_second_user_is_told_a_login_is_pending(self):
+        from picnic_meal_planner import bot
+
+        FakePicnicAPI.needs_2fa = True
+        await self._reply(bot.cmd_picnic_login, user_id=1)
+        reply = await self._reply(bot.cmd_picnic_login, user_id=2)
+        assert "waiting for the code" in reply and "/picnic_code" in reply
+        assert "Logged in" in await self._reply(bot.cmd_picnic_code, "123456", user_id=1)
 
     async def test_no_code_needed(self):
         from picnic_meal_planner import bot
@@ -454,3 +500,35 @@ class TestPreflight:
         status, detail = self._api_result(preflight)
         assert status == preflight.FAIL and "expired" in detail
 
+
+    @staticmethod
+    def _statuses(preflight):
+        return {(check, status) for status, check, _ in preflight._results}
+
+    async def test_stored_session_needs_no_password(self, preflight, monkeypatch):
+        """Config and live check agree: a stored session is enough."""
+        monkeypatch.delenv("PICNIC_PASSWORD")
+        await _store("stored")
+        FakePicnicAPI.valid_tokens.add("stored")
+        config_ok = preflight.check_picnic_config({}, "")
+        assert config_ok is False  # no password login possible...
+        ready = await preflight.check_picnic_session(config_ok)
+        await preflight.check_picnic(ready)
+        # ...but nothing blocks: the missing password is only a warning.
+        assert not [r for r in preflight._results if r[0] == preflight.FAIL]
+        assert ("PICNIC_PASSWORD", preflight.WARN) in self._statuses(preflight)
+        assert ("picnic api", preflight.OK) in self._statuses(preflight)
+
+    async def test_no_session_and_no_password_fails(self, preflight, monkeypatch):
+        monkeypatch.delenv("PICNIC_PASSWORD")
+        ready = await preflight.check_picnic_session(preflight.check_picnic_config({}, ""))
+        assert ready is False
+        assert ("picnic session", preflight.FAIL) in self._statuses(preflight)
+        await preflight.check_picnic(ready)
+        assert self._api_result(preflight)[0] == preflight.FAIL
+        assert FakePicnicAPI.instances == []
+
+    async def test_bad_country_skips_even_with_a_session(self, preflight, monkeypatch):
+        monkeypatch.setenv("PICNIC_COUNTRY_CODE", "FR")
+        await _store("stored")
+        assert await preflight.check_picnic_session(True) is False

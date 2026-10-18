@@ -1,7 +1,12 @@
 """Stepwise, resumable import of Picnic delivery history into the local SQLite DB.
 
-Safe to run multiple times — already-imported deliveries are skipped via
-UNIQUE constraint on picnic_order_id.
+Safe to run multiple times — each delivery is looked up by its Picnic id
+before anything is written, and skipped if already imported; the UNIQUE
+constraint on picnic_order_id is only the backstop.
+
+A delivery that cannot be imported yet (still CURRENT, or its detail could not
+be fetched or was unusable) is deferred: the run does not mark the import
+finished and does not move the checkpoint past it, so the next run picks it up.
 
 Usage:
     uv run python scripts/import_history.py
@@ -26,21 +31,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.engine import init_db
+from picnic_meal_planner.db.engine import SCHEMA_REVISION, init_db, pending_migration
 from picnic_meal_planner.picnic import client as picnic
 
-# A cancelled delivery never arrived, and a current one can still change, so
-# neither belongs in the history the forecasts are built from.
-SKIP_STATUSES = {"CANCELLED", "CURRENT"}
-
-
-def _delivery_id(summary: dict) -> str | None:
-    # python-picnic-api2 2.x summaries carry only ``delivery_id``; the mock
-    # and full delivery payloads also have ``id``.
-    return summary.get("delivery_id") or summary.get("id") or summary.get("order_id")
+# A cancelled delivery never arrived, so it is skipped for good.  A current one
+# can still change: it is deferred, and imported by a later run once complete.
+SKIP_STATUSES = {"CANCELLED"}
+DEFER_STATUSES = {"CURRENT"}
 
 
 async def main() -> None:
+    stored = await pending_migration()
+    if stored is not None:
+        # Before init_db(), which would create the new tables outside Alembic.
+        raise SystemExit(
+            f"Database is at migration {stored}, the code needs {SCHEMA_REVISION}. "
+            "Run `uv run alembic upgrade head` first."
+        )
     await init_db()
 
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
@@ -81,7 +88,7 @@ async def main() -> None:
     # Skip already-imported deliveries if resuming
     remaining = all_deliveries
     if resume_after_id:
-        ids = [_delivery_id(d) for d in all_deliveries]
+        ids = [picnic.delivery_id(d) for d in all_deliveries]
         try:
             skip_idx = ids.index(resume_after_id) + 1
             remaining = all_deliveries[skip_idx:]
@@ -93,6 +100,14 @@ async def main() -> None:
     batch_num = 0
     last_delivery_id = resume_after_id
     total_imported = already_imported
+    # Once a delivery is deferred, the checkpoint must not move past it, or a
+    # resumed run would never see it again.
+    deferred = 0
+
+    def settled(did: str) -> None:
+        nonlocal last_delivery_id
+        if not deferred:
+            last_delivery_id = did
 
     for i in range(0, len(remaining), batch_size):
         batch = remaining[i : i + batch_size]
@@ -103,14 +118,18 @@ async def main() -> None:
 
         imported_in_batch = 0
         for delivery_summary in batch:
-            delivery_id = _delivery_id(delivery_summary)
+            delivery_id = picnic.delivery_id(delivery_summary)
             if not delivery_id:
                 continue
 
             status = (delivery_summary.get("status") or "").upper()
             if status in SKIP_STATUSES:
                 print(f"\n  Skipping {status.lower()} delivery {delivery_id}")
-                last_delivery_id = delivery_id
+                settled(delivery_id)
+                continue
+            if status in DEFER_STATUSES:
+                print(f"\n  Deferring {status.lower()} delivery {delivery_id} to a later run")
+                deferred += 1
                 continue
 
             async with db.get_db() as conn:
@@ -118,23 +137,34 @@ async def main() -> None:
             if already_there:
                 # Committed by an earlier run that stopped before its batch
                 # checkpoint; inserting its items again would double them.
-                last_delivery_id = delivery_id
+                settled(delivery_id)
                 continue
 
             try:
                 detail = await picnic.get_delivery(delivery_id)
             except Exception as exc:
                 print(f"\n  Warning: could not fetch delivery {delivery_id}: {exc}")
+                deferred += 1
                 continue
+
+            # Parsed before opening a session: an unusable detail must leave
+            # no row behind, or the check above would skip it forever.
+            reason = picnic.delivery_unusable_reason(detail)
+            if reason:
+                print(f"\n  Warning: deferring delivery {delivery_id}: {reason}")
+                deferred += 1
+                continue
+            fields = picnic.delivery_summary_fields(detail)
+            items = picnic.delivery_line_items(detail)
 
             async with db.get_db() as conn:
                 order_id = await db.insert_order(
                     conn,
                     picnic_order_id=delivery_id,
-                    **picnic.delivery_summary_fields(detail),
+                    **fields,
                 )
 
-                for item in picnic.delivery_line_items(detail):
+                for item in items:
                     await db.upsert_product(conn, item["product"])
                     await db.insert_order_item(
                         conn,
@@ -147,7 +177,7 @@ async def main() -> None:
                 await conn.commit()
 
             imported_in_batch += 1
-            last_delivery_id = delivery_id
+            settled(delivery_id)
 
         total_imported += imported_in_batch
         print(f"imported {imported_in_batch}", end="")
@@ -166,16 +196,18 @@ async def main() -> None:
         else:
             print()
 
-    # Mark as finished
+    # Mark as finished, unless something was deferred to the next run
     async with db.get_db() as conn:
         await db.save_checkpoint(
             conn,
             last_delivery_id=last_delivery_id,
             total_imported=total_imported,
-            finished=True,
+            finished=not deferred,
         )
 
     print(f"\nDone. Total deliveries imported: {total_imported}")
+    if deferred:
+        print(f"{deferred} delivery(ies) deferred — run the import again later to pick them up.")
 
 
 if __name__ == "__main__":

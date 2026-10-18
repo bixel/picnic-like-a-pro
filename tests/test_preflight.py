@@ -1,4 +1,4 @@
-"""Tests for scripts/preflight.py's LLM checks.
+"""Tests for scripts/preflight.py's LLM and Picnic checks.
 
 HTTP is served by ``httpx.MockTransport``, so nothing leaves the process.
 """
@@ -137,3 +137,45 @@ class TestCheckOpenrouter:
         await preflight.check_openrouter(None)
         details = " ".join(d for _, d in _results("openrouter api"))
         assert "ANTHROPIC_API_KEY" in details
+
+
+class TestPicnicConfig:
+    @pytest.fixture(autouse=True)
+    def real_picnic(self, monkeypatch):
+        monkeypatch.setenv("PICNIC_MOCK", "false")
+        monkeypatch.setenv("PICNIC_USERNAME", "me@example.com")
+        monkeypatch.setenv("PICNIC_PASSWORD", "hunter22")
+        monkeypatch.setenv("PICNIC_COUNTRY_CODE", "DE")
+
+    def test_valid_config_allows_login(self):
+        assert preflight.check_picnic_config({}, "") is True
+
+    @pytest.mark.parametrize("code", ["nl", " de ", "Be"])
+    def test_country_code_is_case_insensitive(self, monkeypatch, code):
+        monkeypatch.setenv("PICNIC_COUNTRY_CODE", code)
+        assert preflight.check_picnic_config({}, "") is True
+        assert _results("PICNIC_COUNTRY_CODE")[0][0] == preflight.OK
+
+    def test_unknown_country_blocks_login(self, monkeypatch):
+        monkeypatch.setenv("PICNIC_COUNTRY_CODE", "FR")
+        assert preflight.check_picnic_config({}, "") is False
+
+    @pytest.mark.parametrize("name,value", [
+        ("PICNIC_USERNAME", "your@email.com"),
+        ("PICNIC_PASSWORD", "yourpassword"),
+        ("PICNIC_PASSWORD", ""),
+    ])
+    def test_placeholder_or_empty_credential_blocks_login(self, monkeypatch, name, value):
+        monkeypatch.setenv(name, value)
+        assert preflight.check_picnic_config({}, "") is False
+
+    async def test_bad_config_never_reaches_picnic(self, monkeypatch):
+        from picnic_meal_planner.picnic import client as picnic
+
+        async def boom():
+            raise AssertionError("a live login was attempted")
+
+        monkeypatch.setattr(picnic, "get_client", boom)
+        await preflight.check_picnic(False)
+        [(status, detail)] = _results("picnic api")
+        assert status == preflight.FAIL and "skipped" in detail
