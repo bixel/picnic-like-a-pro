@@ -259,9 +259,12 @@ deploy step.
 a bad value surfaces here rather than as a 401 halfway through the walkthrough.
 It validates both tokens against the live APIs, flags placeholder values copied
 from the env templates, checks the allowlist actually allows you, confirms the
-conversation tables exist, and reports whether persistence is on. Secrets are
-never printed — only length and first/last characters. Add `--offline` to skip
-the two network calls.
+conversation tables exist, and reports whether persistence is on. Unless
+`PICNIC_MOCK=true`, it also logs in to Picnic with `PICNIC_USERNAME` /
+`PICNIC_PASSWORD` and fetches the account, so wrong credentials, an account
+that demands 2FA, or a wrong `PICNIC_COUNTRY_CODE` show up here too. Secrets
+are never printed — only length and first/last characters. Add `--offline` to
+skip the network calls.
 
 The Telegram check prints the bot's `@username`:
 

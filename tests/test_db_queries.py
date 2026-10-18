@@ -116,6 +116,16 @@ class TestInsertOrder:
         assert order.delivered_at is not None
 
 
+class TestGetOrderId:
+    async def test_returns_id_of_imported_order(self, db_session):
+        oid = await db.insert_order(db_session, picnic_order_id="known", ordered_at=_now_iso())
+        await db_session.commit()
+        assert await db.get_order_id(db_session, "known") == oid
+
+    async def test_unknown_picnic_id_returns_none(self, db_session):
+        assert await db.get_order_id(db_session, "never_imported") is None
+
+
 class TestInsertOrderItem:
     async def test_insert_order_item(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)
