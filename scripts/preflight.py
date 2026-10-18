@@ -344,34 +344,33 @@ async def check_telegram() -> None:
 
 
 async def check_picnic() -> None:
+    """Log in exactly as the bot will: stored session first, then password.
+
+    A password login that succeeds stores its session, as the bot's would; one
+    that needs 2FA sends no code — that only happens via picnic_login.
+    """
     if picnic_mocked():
         return  # check_picnic_config already reported mock mode
-    if not (os.environ.get("PICNIC_USERNAME") and os.environ.get("PICNIC_PASSWORD")):
-        record(FAIL, "picnic api", "no credentials to test")
-        return
 
     import requests
-    from python_picnic_api2 import Picnic2FARequired, PicnicAuthError
+    from python_picnic_api2 import PicnicAuthError
 
+    from picnic_meal_planner.picnic import auth
     from picnic_meal_planner.picnic import client as picnic
 
-    def login_and_fetch_user():
-        # The same constructor call the bot makes, so this logs in exactly as
-        # it will.  2.x logs in inside the constructor.
-        api = picnic._get_client()
-        if not api.logged_in():
-            raise PicnicAuthError("login returned no auth token")
-        return api.get_user()
+    token = await auth.load_token()
+    record(
+        OK if token else WARN,
+        "picnic session",
+        f"stored (len={len(token)})" if token
+        else "none stored — the bot will log in with the password",
+    )
 
     try:
-        user = await asyncio.get_running_loop().run_in_executor(None, login_and_fetch_user)
-    except Picnic2FARequired:
-        record(
-            FAIL,
-            "picnic api",
-            "credentials accepted but Picnic requires 2FA — the bot cannot "
-            "complete a 2FA login",
-        )
+        user = await picnic.get_user()
+    except picnic.PicnicLoginRequired as exc:
+        # 2FA needed, a stored session Picnic rejected, or no credentials.
+        record(FAIL, "picnic api", str(exc))
         return
     except PicnicAuthError as exc:
         record(FAIL, "picnic api", f"login rejected: {str(exc)[:80]}")
@@ -390,7 +389,7 @@ async def check_picnic() -> None:
     finally:
         picnic.reset_client()
 
-    if not user.user_id:
+    if not user.get("user_id"):
         # A request whose token Picnic does not accept comes back as an error
         # body, not an HTTP failure, and parses into an empty User.
         record(FAIL, "picnic api", "logged in, but /user returned no account")
@@ -398,8 +397,8 @@ async def check_picnic() -> None:
     record(
         OK,
         "picnic api",
-        f"logged in as {user.firstname or '?'} — "
-        f"{user.completed_deliveries or 0} completed deliveries  "
+        f"logged in as {user.get('firstname') or '?'} — "
+        f"{user.get('completed_deliveries') or 0} completed deliveries  "
         "<-- confirm this is the right account",
     )
 

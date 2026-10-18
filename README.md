@@ -406,5 +406,10 @@ docker compose run --rm picnic-bot import-history
 ### The bot replies but Picnic commands fail
 
 - Double-check `PICNIC_USERNAME`, `PICNIC_PASSWORD`, and `PICNIC_COUNTRY_CODE` in `.env`.
+- If the bot says Picnic needs a login code (2FA) or the session expired, send
+  `/picnic_login` (add `email` to get the code by email), then `/picnic_code <code>`.
+  Or, on the server: `docker compose run --rm picnic-bot python scripts/picnic_login.py`.
+  The session is stored in the database, so this is only needed when Picnic
+  expires it.
 - After editing `.env`, restart the container: `docker compose restart picnic-bot`.
 - Confirm your Picnic account is active and can log in via the Picnic app.

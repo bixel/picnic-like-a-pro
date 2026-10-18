@@ -148,70 +148,32 @@ class TestGetDelivery:
 
 
 class TestClientSelection:
+    """Mock-mode selection; real-mode login is covered in test_picnic_auth.py."""
+
     def test_reset_clears_singleton(self, monkeypatch):
         monkeypatch.setattr(picnic, "_client", object())
         picnic.reset_client()
         assert picnic._client is None
 
-    def test_mock_env_var_selects_mock_client(self, monkeypatch):
+    async def test_mock_env_var_selects_mock_client(self, monkeypatch):
         from picnic_meal_planner.picnic.mock_client import MockPicnicAPI, reset_mock_client
 
         reset_mock_client()
-        monkeypatch.setattr(picnic, "_client", None)
+        picnic.reset_client()
         monkeypatch.setenv("PICNIC_MOCK", "true")
         monkeypatch.setenv("PICNIC_MOCK_PERSIST_CART", "false")
-        assert isinstance(picnic._get_client(), MockPicnicAPI)
+        assert isinstance(await picnic.get_client(), MockPicnicAPI)
         reset_mock_client()
 
-    def test_client_is_cached_between_calls(self, monkeypatch):
+    async def test_client_is_cached_between_calls(self, monkeypatch):
         from picnic_meal_planner.picnic.mock_client import reset_mock_client
 
         reset_mock_client()
-        monkeypatch.setattr(picnic, "_client", None)
+        picnic.reset_client()
         monkeypatch.setenv("PICNIC_MOCK", "true")
         monkeypatch.setenv("PICNIC_MOCK_PERSIST_CART", "false")
-        assert picnic._get_client() is picnic._get_client()
+        assert await picnic.get_client() is await picnic.get_client()
         reset_mock_client()
-
-    def test_real_api_is_constructed_from_env_when_mock_disabled(self, monkeypatch):
-        """Without PICNIC_MOCK, credentials are read from the environment."""
-        import python_picnic_api2
-
-        constructed = {}
-
-        def fake_api(**kwargs):
-            constructed.update(kwargs)
-            return "real-client"
-
-        monkeypatch.setattr(python_picnic_api2, "PicnicAPI", fake_api)
-        monkeypatch.setattr(picnic, "_client", None)
-        monkeypatch.setenv("PICNIC_MOCK", "false")
-        monkeypatch.setenv("PICNIC_USERNAME", "user@example.com")
-        monkeypatch.setenv("PICNIC_PASSWORD", "secret")
-        monkeypatch.setenv("PICNIC_COUNTRY_CODE", "DE")
-
-        assert picnic._get_client() == "real-client"
-        assert constructed == {
-            "username": "user@example.com",
-            "password": "secret",
-            "country_code": "DE",
-        }
-
-    def test_country_code_defaults_to_nl(self, monkeypatch):
-        import python_picnic_api2
-
-        constructed = {}
-        monkeypatch.setattr(
-            python_picnic_api2, "PicnicAPI", lambda **kw: constructed.update(kw) or "c"
-        )
-        monkeypatch.setattr(picnic, "_client", None)
-        monkeypatch.setenv("PICNIC_MOCK", "false")
-        monkeypatch.setenv("PICNIC_USERNAME", "u")
-        monkeypatch.setenv("PICNIC_PASSWORD", "p")
-        monkeypatch.delenv("PICNIC_COUNTRY_CODE", raising=False)
-
-        picnic._get_client()
-        assert constructed["country_code"] == "NL"
 
 
 class TestRealLibraryModels:

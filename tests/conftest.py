@@ -44,6 +44,7 @@ from picnic_meal_planner.picnic.mock_client import MockPicnicAPI, reset_mock_cli
 def fresh_picnic_client(monkeypatch):
     """Give every test an isolated, empty-cart mock Picnic API."""
     reset_mock_client()
+    client_mod.reset_client()  # also clears login state left by a test
     monkeypatch.setenv("PICNIC_MOCK", "true")
     mock = MockPicnicAPI()
     monkeypatch.setattr(client_mod, "_client", mock)

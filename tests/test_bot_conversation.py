@@ -630,7 +630,7 @@ class TestMain:
 
         bot.main()
 
-        assert app.add_handler.call_count == 10  # 9 commands + 1 message handler
+        assert app.add_handler.call_count == 12  # 11 commands + 1 message handler
         app.run_polling.assert_called_once()
         # The DB must be initialised on startup, before any update is handled.
         builder.post_init.assert_called_once_with(bot._post_init)

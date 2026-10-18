@@ -117,6 +117,7 @@ picnic-like-a-pro/
 │       │
 │       ├── picnic/
 │       │   ├── __init__.py
+│       │   ├── auth.py         # Stored session token + password/2FA login
 │       │   ├── client.py       # Thin wrapper around python-picnic-api2
 │       │   └── mock_client.py  # In-process fake Picnic API (PICNIC_MOCK=true)
 │       │
@@ -128,6 +129,7 @@ picnic-like-a-pro/
 │   ├── import_history.py       # Optional stepwise import of Picnic delivery
 │   │                           # history (resumable, rate-limit safe)
 │   ├── chat_model.py           # List / set / reset each chat's LLM model
+│   ├── picnic_login.py         # Interactive Picnic login (2FA); stores the session
 │   └── preflight.py            # Config + live API checks before `uv run bot`
 │
 ├── tests/

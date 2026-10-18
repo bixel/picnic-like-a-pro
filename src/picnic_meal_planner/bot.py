@@ -32,6 +32,8 @@ load_dotenv()
 # Imported after load_dotenv(): both modules read configuration at import time.
 from . import history, llm  # noqa: E402
 from .db.engine import init_db, missing_columns  # noqa: E402
+from .picnic import auth as picnic_auth  # noqa: E402
+from .picnic import client as picnic  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -68,6 +70,20 @@ def _is_allowed(user_id: int) -> bool:
     if os.getenv("ALLOW_ALL_USERS", "").lower() == "true":
         return True
     return user_id in _allowed_user_ids()
+
+
+def _may_log_in_to_picnic(user_id: int) -> bool:
+    """Who may start a Picnic login — each start texts the account owner.
+
+    ``PICNIC_LOGIN_USER_IDS`` narrows it to a subset of the allowed users;
+    unset, every allowed user may.
+    """
+    if not _is_allowed(user_id):
+        return False
+    raw = os.getenv("PICNIC_LOGIN_USER_IDS", "").strip()
+    if not raw:
+        return True
+    return user_id in {int(uid.strip()) for uid in raw.split(",") if uid.strip()}
 
 
 async def _get_mcp_tools() -> list[dict]:
@@ -199,7 +215,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cart — current Picnic cart\n"
         "/forget — delete our stored conversation\n"
         "/privacy — control whether our conversation is saved\n"
-        "/model — show which AI model this chat uses\n\n"
+        "/model — show which AI model this chat uses\n"
+        "/picnic_login — log in to Picnic when it asks for a code\n\n"
         "Or just chat with me naturally!"
     )
 
@@ -323,6 +340,75 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"This chat uses {model}{suffix}.")
 
 
+async def cmd_picnic_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/picnic_login [sms|email]`` — log in, asking Picnic for a 2FA code if needed."""
+    if not _may_log_in_to_picnic(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+    if os.getenv("PICNIC_MOCK", "").lower() == "true":
+        await update.message.reply_text("Picnic is mocked here; there is nothing to log in to.")
+        return
+
+    from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
+
+    channel = (context.args[0] if context.args else "sms").upper()
+    try:
+        logged_in = await picnic.start_login(channel)
+    except ValueError:
+        await update.message.reply_text("Usage: /picnic_login [sms|email]")
+        return
+    except picnic.PicnicLoginRequired as exc:  # credentials missing from the config
+        await update.message.reply_text(str(exc))
+        return
+    except PicnicAuthError:
+        await update.message.reply_text(
+            "Picnic rejected the username or password in the bot's configuration."
+        )
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("Picnic login failed")
+        await update.message.reply_text("Sorry, I couldn't reach Picnic. Please try again.")
+        return
+
+    if logged_in:
+        await update.message.reply_text("Logged in to Picnic — no code was needed.")
+    else:
+        minutes = picnic_auth.CODE_TTL_SECONDS // 60
+        await update.message.reply_text(
+            f"Picnic sent a login code by {channel.lower()}. Send it here as "
+            f"/picnic_code 123456 within {minutes} minutes."
+        )
+
+
+async def cmd_picnic_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/picnic_code <code>`` — finish the login ``/picnic_login`` started."""
+    if not _may_log_in_to_picnic(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /picnic_code 123456")
+        return
+
+    from python_picnic_api2 import Picnic2FAError  # noqa: PLC0415
+
+    try:
+        await picnic.submit_login_code(context.args[0])
+    except Picnic2FAError:
+        await update.message.reply_text(
+            "Picnic didn't accept that code. Check it and send /picnic_code "
+            "again, or /picnic_login for a new one."
+        )
+        return
+    except picnic.PicnicLoginRequired as exc:  # nothing pending, or it expired
+        await update.message.reply_text(str(exc))
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("Picnic 2FA verification failed")
+        await update.message.reply_text("Sorry, I couldn't reach Picnic. Please try again.")
+        return
+    await update.message.reply_text("Logged in to Picnic. You're all set.")
+
+
 async def _chat(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -411,6 +497,8 @@ def main() -> None:
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("picnic_login", cmd_picnic_login))
+    app.add_handler(CommandHandler("picnic_code", cmd_picnic_code))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _chat))
 
     logger.info("Starting bot with long polling...")

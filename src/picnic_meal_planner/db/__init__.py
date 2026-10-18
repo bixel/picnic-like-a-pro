@@ -8,6 +8,7 @@ from .models import (
     ImportCheckpoint,
     Order,
     OrderItem,
+    PicnicAuth,
     Product,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "ImportCheckpoint",
     "Order",
     "OrderItem",
+    "PicnicAuth",
     "Product",
     "get_db",
     "get_engine",

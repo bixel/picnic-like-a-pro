@@ -7,6 +7,11 @@ Since python-picnic-api2 2.0 the library returns pydantic models.  Everything
 here converts them back to plain dicts via ``_plain()`` so callers (MCP tools,
 the import script) keep working on JSON-serialisable data.
 
+Logging in is ``auth.py``'s job: the client starts from the session token
+stored in the database, and raises :class:`PicnicLoginRequired` when a person
+has to log in (2FA).  Every call goes through ``_call()``, which keeps that
+stored token current.
+
 Set PICNIC_MOCK=true to swap the real Picnic API for the in-process mock
 (useful for demos, automated tests, and local development without credentials).
 """
@@ -14,40 +19,160 @@ Set PICNIC_MOCK=true to swap the real Picnic API for the in-process mock
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from functools import partial
 from typing import Any
 
+from . import auth
+from .auth import PicnicLoginRequired
+
+__all__ = ["PicnicLoginRequired"]  # re-exported for callers of this module
+
+logger = logging.getLogger(__name__)
 
 _client = None  # PicnicAPI | MockPicnicAPI | None
+_saved_token: str | None = None  # last token written to / read from the DB
+# Set once a password login has been answered with a 2FA demand, so later
+# calls fail fast instead of repeating the password login on every tool call.
+_needs_login = False
+_client_lock = asyncio.Lock()
+_login = auth.LoginFlow()
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        if os.getenv("PICNIC_MOCK", "").lower() == "true":
+def _mocked() -> bool:
+    return os.getenv("PICNIC_MOCK", "").lower() == "true"
+
+
+async def get_client():
+    """Return the Picnic client, building it on first use.
+
+    Real mode prefers the stored session token and logs in with the password
+    only when none is stored.  Raises :class:`PicnicLoginRequired` when that
+    login needs a 2FA code.
+    """
+    global _client, _saved_token, _needs_login
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        if _client is not None:
+            return _client
+        if _mocked():
             from .mock_client import get_mock_client  # noqa: PLC0415
             _client = get_mock_client()
-        else:
-            # Deferred so mock mode never requires the real library to import.
-            from python_picnic_api2 import PicnicAPI  # noqa: PLC0415
-            _client = PicnicAPI(
-                username=os.environ["PICNIC_USERNAME"],
-                password=os.environ["PICNIC_PASSWORD"],
-                country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL"),
+            return _client
+
+        token = await auth.load_token()
+        if token:
+            # A token logged in elsewhere (picnic_login.py, the other process)
+            # also clears a pending 2FA demand.
+            _client, _saved_token, _needs_login = auth.new_api(token), token, False
+            return _client
+        if _needs_login:
+            raise PicnicLoginRequired(
+                f"Picnic needs a one-time login code. {auth.HOW_TO_LOGIN}"
             )
-    return _client
+
+        from python_picnic_api2 import Picnic2FARequired  # noqa: PLC0415
+
+        api = auth.new_api()
+        try:
+            await _run(api.login, *auth.credentials())
+        except Picnic2FARequired:
+            _needs_login = True
+            raise PicnicLoginRequired(
+                f"Picnic needs a one-time login code. {auth.HOW_TO_LOGIN}"
+            ) from None
+        await _install(api)
+        return _client
+
+
+async def _install(api) -> None:
+    """Make *api* the client and store its token for every other process."""
+    global _client, _saved_token, _needs_login
+    _client, _needs_login = api, False
+    token = auth.token_of(api)
+    if token:
+        await auth.save_token(token)
+        _saved_token = token
 
 
 def reset_client() -> None:
     """Discard the client singleton so the next call builds a fresh instance."""
-    global _client
-    _client = None
+    global _client, _saved_token, _needs_login, _client_lock
+    _client, _saved_token, _needs_login = None, None, False
+    # A fresh lock, so one never outlives the event loop it was used on
+    # (each test runs on its own loop).
+    _client_lock = asyncio.Lock()
+    _login.cancel()
 
 
 async def _run(func, *args, **kwargs) -> Any:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+
+async def _call(method: str, *args, **kwargs) -> Any:
+    """Call a client method, keeping the stored token in step with the session.
+
+    Picnic may hand out a new token on any response, and the session adopts
+    it; storing it keeps a restart from resuming with a stale one.  A
+    rejected token is cleared and turned into :class:`PicnicLoginRequired`.
+    """
+    global _client, _saved_token
+    client = await get_client()
+    try:
+        result = await _run(getattr(client, method), *args, **kwargs)
+    except Exception as exc:
+        from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
+
+        if not isinstance(exc, PicnicAuthError) or _mocked():
+            raise
+        failed = auth.token_of(client)
+        logger.warning("Picnic rejected the session token; a new login is needed")
+        try:
+            await auth.clear_token(only_if=failed)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not clear the rejected Picnic token", exc_info=True)
+        _client, _saved_token = None, None
+        raise PicnicLoginRequired(
+            f"The Picnic session has expired. {auth.HOW_TO_LOGIN}"
+        ) from exc
+
+    token = auth.token_of(client)
+    if token and token != _saved_token:
+        await auth.save_token(token)
+        _saved_token = token
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Login (see auth.py) — shared by /picnic_login and scripts/picnic_login.py
+# ---------------------------------------------------------------------------
+
+async def start_login(channel: str = "SMS") -> bool:
+    """Log in with the password; ``True`` if done, ``False`` if a code was sent."""
+    api = await _login.start(channel)
+    if api is None:
+        return False
+    await _install(api)
+    return True
+
+
+async def submit_login_code(code: str) -> None:
+    """Finish a login that is waiting for its 2FA code."""
+    await _install(await _login.verify(code))
+
+
+def pending_login_channel() -> str | None:
+    """``"SMS"`` / ``"EMAIL"`` while a login waits for a code, else ``None``."""
+    return _login.pending_channel
+
+
+async def logout() -> int:
+    """Forget the session here and in the database."""
+    reset_client()
+    return await auth.clear_token()
 
 
 def _plain(value: Any) -> Any:
@@ -70,8 +195,7 @@ def _plain(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 async def search_products(query: str, limit: int = 10) -> list[dict]:
-    client = _get_client()
-    raw = await _run(client.search, query)
+    raw = await _call("search", query)
     if hasattr(raw, "items") and not isinstance(raw, (dict, list)):
         # 2.x SearchResult: a flat list of tiles.  Its ``.raw`` is the whole
         # page tree, so dump the parsed tiles instead.
@@ -86,9 +210,8 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
 
 
 async def get_categories() -> list[dict]:
-    client = _get_client()
     try:
-        raw = await _run(client.get_categories)
+        raw = await _call("get_categories")
     except NotImplementedError:
         # Picnic removed this endpoint; python-picnic-api2 2.x raises.
         return []
@@ -100,27 +223,23 @@ async def get_categories() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def get_cart() -> dict:
-    client = _get_client()
-    return _plain(await _run(client.get_cart))
+    return _plain(await _call("get_cart"))
 
 
 async def add_to_cart(product_id: str, quantity: int = 1) -> dict:
-    client = _get_client()
-    return _plain(await _run(client.add_product, product_id, count=quantity))
+    return _plain(await _call("add_product", product_id, count=quantity))
 
 
 async def remove_from_cart(product_id: str) -> dict:
-    client = _get_client()
-    return _plain(await _run(client.remove_product, product_id))
+    return _plain(await _call("remove_product", product_id))
 
 
 async def clear_cart() -> dict:
-    client = _get_client()
-    cart = _plain(await _run(client.get_cart))
+    cart = _plain(await _call("get_cart"))
     for item in cart.get("items", []):
         pid = item.get("id") or item.get("article_id")
         if pid:
-            await _run(client.remove_product, pid)
+            await _call("remove_product", pid)
     return {"status": "cart cleared"}
 
 
@@ -129,8 +248,7 @@ async def clear_cart() -> dict:
 # ---------------------------------------------------------------------------
 
 async def get_delivery_slots() -> list[dict]:
-    client = _get_client()
-    raw = _plain(await _run(client.get_delivery_slots))
+    raw = _plain(await _call("get_delivery_slots"))
     if isinstance(raw, dict):
         return raw.get("delivery_slots", [])
     return raw if isinstance(raw, list) else []
@@ -142,14 +260,17 @@ async def get_delivery_slots() -> list[dict]:
 
 async def get_deliveries() -> list[dict]:
     """Return full list of past deliveries (summary only)."""
-    client = _get_client()
-    return _plain(await _run(client.get_deliveries))
+    return _plain(await _call("get_deliveries"))
 
 
 async def get_delivery(delivery_id: str) -> dict:
     """Return detailed delivery data including line items."""
-    client = _get_client()
-    return _plain(await _run(client.get_delivery, delivery_id))
+    return _plain(await _call("get_delivery", delivery_id))
+
+
+async def get_user() -> dict:
+    """Return the logged-in account (used by preflight and the login flows)."""
+    return _plain(await _call("get_user"))
 
 
 # ---------------------------------------------------------------------------
