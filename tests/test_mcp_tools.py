@@ -49,12 +49,24 @@ class TestSearchProductsTool:
 
 
 class TestGetCategoriesTool:
-    async def test_returns_categories(self):
-        assert len(await get_categories()) >= 5
+    async def test_lists_the_categories_of_known_products(self, seeded_db_path):
+        categories = await get_categories()
+        assert len(categories) >= 5
+        dairy = next(c for c in categories if c["name"] == "Zuivel, Eieren & Boter")
+        assert dairy["product_count"] >= 2
 
-    async def test_categories_have_name(self):
-        for cat in await get_categories():
-            assert "name" in cat
+    async def test_lists_the_products_in_a_category(self, seeded_db_path):
+        products = await get_categories(category="Zuivel, Eieren & Boter")
+        assert "p_milk_whole" in {p["id"] for p in products}
+        assert {"id", "name", "unit_quantity", "unit_price"} <= products[0].keys()
+
+    async def test_unknown_category_is_empty(self, seeded_db_path):
+        assert await get_categories(category="Nope") == []
+
+    async def test_products_without_category_are_not_listed(self):
+        assert await get_categories() == []
+        await search_products("melk")   # search tiles carry no category
+        assert await get_categories() == []
 
 
 class TestGetCartTool:

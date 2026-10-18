@@ -116,6 +116,27 @@ async def products_without_category(session: AsyncSession) -> list[str]:
     return list(rows)
 
 
+async def get_categories(session: AsyncSession) -> list[dict]:
+    """The categories of the stored products, each with its product count."""
+    stmt = (
+        select(Product.category.label("name"), func.count().label("product_count"))
+        .where(Product.category.is_not(None))
+        .group_by(Product.category)
+        .order_by(Product.category)
+    )
+    return [row._asdict() for row in (await session.execute(stmt)).all()]
+
+
+async def get_products_in_category(session: AsyncSession, category: str) -> list[dict]:
+    """The stored products in *category* (exact name, as :func:`get_categories` lists it)."""
+    stmt = (
+        select(Product.id, Product.name, Product.unit_quantity, Product.unit_price)
+        .where(Product.category == category)
+        .order_by(Product.name)
+    )
+    return [row._asdict() for row in (await session.execute(stmt)).all()]
+
+
 async def set_product_category(session: AsyncSession, product_id: str, category: str) -> None:
     await session.execute(
         update(Product).where(Product.id == product_id).values(category=category)

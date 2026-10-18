@@ -75,11 +75,6 @@ class TestSearchProducts:
         assert await picnic.search_products("xyzzy_none") == []
 
 
-class TestGetCategories:
-    async def test_returns_list(self):
-        assert len(await picnic.get_categories()) >= 5
-
-
 class TestGetProductCategory:
     async def test_mock_product(self):
         assert await picnic.get_product_category("p_milk_whole") == "Zuivel, Eieren & Boter"
@@ -273,13 +268,6 @@ class TestRealLibraryModels:
         assert await picnic.get_delivery_slots() == [{"slot_id": "s1"}]
         assert await picnic.get_deliveries() == [summary]
         assert await picnic.get_delivery("d1") == detail
-
-    async def test_removed_categories_endpoint_returns_empty(self, real):
-        def gone():
-            raise NotImplementedError("removed by picnic")
-
-        real.get_categories = gone
-        assert await picnic.get_categories() == []
 
 
 # Trimmed from python-picnic-api2's tests/fixtures/delivery_de.json: the real

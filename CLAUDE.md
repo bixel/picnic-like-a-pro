@@ -138,6 +138,8 @@ idempotent for re-imports.
   `scripts/import_history.py` fills `products.category` afterwards via
   `client.get_product_category()` (`get_article(id, add_category=True)`, two
   requests per product), on every run, for products that still have none.
+  The `get_categories` MCP tool lists these local categories (and, given a
+  name, the products in one); there is no live category listing any more.
 - `insert_order`: conflict-do-nothing on `picnic_order_id`; returns the
   existing row's id when the row already exists.
 

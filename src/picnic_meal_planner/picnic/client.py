@@ -217,15 +217,6 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
     return items
 
 
-async def get_categories() -> list[dict]:
-    try:
-        raw = await _call("get_categories")
-    except NotImplementedError:
-        # Picnic removed this endpoint; python-picnic-api2 2.x raises.
-        return []
-    return raw if isinstance(raw, list) else []
-
-
 async def get_product_category(product_id: str) -> str | None:
     """Return the name of a product's (L3) category, or ``None`` if unknown.
 
