@@ -27,7 +27,7 @@ dev` will reconcile it.
 ```bash
 make test-fast
 ```
-**Expect:** `504 passed`. If you want coverage instead, `make test`.
+**Expect:** `542 passed`. If you want coverage instead, `make test`.
 
 The tests that matter most for the history and OpenRouter work. Run them alone
 to see what they assert:

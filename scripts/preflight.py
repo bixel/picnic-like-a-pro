@@ -6,7 +6,7 @@ as a 401. This checks the lot up front and says which one is wrong.
 
 Usage:
     uv run python scripts/preflight.py          # config + live API checks
-                                                #   (Anthropic, Telegram, Picnic)
+                                                #   (OpenRouter, Telegram, Picnic)
     uv run python scripts/preflight.py --offline  # skip network calls
 
 Secrets are never printed — only their length, first/last characters, and
@@ -122,10 +122,16 @@ def picnic_mocked() -> bool:
     return os.getenv("PICNIC_MOCK", "").lower() == "true"
 
 
-def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
+def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> bool:
+    """Report the Picnic settings; return whether a live login is worth trying.
+
+    False whenever a credential or the country code already FAILed here, so
+    a placeholder is never sent to the real storefront.
+    """
     if picnic_mocked():
         record(OK, "picnic", "PICNIC_MOCK=true — no real Picnic calls, no checkout")
-        return
+        return True
+    ok = True
     record(
         WARN,
         "picnic",
@@ -135,6 +141,7 @@ def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
         value = os.environ.get(name)
         clean = (value or "").strip().strip('"').strip("'")
         status = FAIL if not clean or clean in PLACEHOLDERS else OK
+        ok = ok and status == OK
         src = source_of(name, shell, dotenv_path)
         if name == "PICNIC_PASSWORD" and status == OK:
             # shape() shows a prefix, which is harmless for a token's fixed
@@ -144,13 +151,16 @@ def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> None:
             detail = shape(value)
         record(status, name, f"from {src}: {detail}")
 
-    country = os.getenv("PICNIC_COUNTRY_CODE", "NL")
+    # The library lowercases the code for the host name, so "nl" works too.
+    country = os.getenv("PICNIC_COUNTRY_CODE", "NL").strip().upper()
+    valid_country = country in PICNIC_COUNTRIES
     record(
-        OK if country in PICNIC_COUNTRIES else FAIL,
+        OK if valid_country else FAIL,
         "PICNIC_COUNTRY_CODE",
-        country if country in PICNIC_COUNTRIES
+        country if valid_country
         else f"{country!r} — must be one of {', '.join(sorted(PICNIC_COUNTRIES))}",
     )
+    return ok and valid_country
 
 
 def check_history_config() -> None:
@@ -343,11 +353,11 @@ async def check_telegram() -> None:
         record(FAIL, "telegram api", f"{type(exc).__name__}: {str(exc)[:80]}")
 
 
-async def check_picnic() -> None:
+async def check_picnic(config_ok: bool) -> None:
     if picnic_mocked():
         return  # check_picnic_config already reported mock mode
-    if not (os.environ.get("PICNIC_USERNAME") and os.environ.get("PICNIC_PASSWORD")):
-        record(FAIL, "picnic api", "no credentials to test")
+    if not config_ok:
+        record(FAIL, "picnic api", "skipped — fix the Picnic settings above first")
         return
 
     import requests
@@ -417,7 +427,7 @@ async def main() -> int:
     print("Preflight for `uv run bot`\n")
     check_env_sources(shell, dotenv_path)
     check_auth_config()
-    check_picnic_config(shell, dotenv_path)
+    picnic_ok = check_picnic_config(shell, dotenv_path)
     check_history_config()
     llm = load_llm_config()
     await check_database()
@@ -426,7 +436,7 @@ async def main() -> int:
     else:
         await check_openrouter(llm)
         await check_telegram()
-        await check_picnic()
+        await check_picnic(picnic_ok)
 
     fails = [r for r in _results if r[0] == FAIL]
     warns = [r for r in _results if r[0] == WARN]
