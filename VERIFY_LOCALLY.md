@@ -27,7 +27,7 @@ dev` will reconcile it.
 ```bash
 make test-fast
 ```
-**Expect:** `542 passed`. If you want coverage instead, `make test`.
+**Expect:** `597 passed`. If you want coverage instead, `make test`.
 
 The tests that matter most for the history and OpenRouter work. Run them alone
 to see what they assert:
@@ -45,10 +45,10 @@ Migration round-trip on a scratch DB (never touches `data/picnic.db`):
 
 ```bash
 export DB_PATH=/tmp/verify.db && rm -f $DB_PATH
-uv run alembic upgrade head        # -> runs 0001, 0002, then 0003
-uv run alembic downgrade -1        # -> 0003 -> 0002, no error
+uv run alembic upgrade head        # -> runs 0001 through 0004
+uv run alembic downgrade -1        # -> 0004 -> 0003, no error
 uv run alembic upgrade head
-uv run alembic current             # -> 0003 (head)
+uv run alembic current             # -> 0004 (head)
 uv run alembic revision --autogenerate -m drift
 ```
 **Expect:** the generated file's `upgrade()` body is just `pass` — models and
@@ -245,7 +245,7 @@ export PERSIST_CONVERSATIONS=true
 
 ```bash
 rm -f "$DB_PATH"
-uv run alembic upgrade head     # 0001, 0002, then 0003
+uv run alembic upgrade head     # 0001 through 0004
 uv run python scripts/preflight.py
 ```
 
@@ -261,9 +261,11 @@ It validates both tokens against the live APIs, flags placeholder values copied
 from the env templates, checks the allowlist actually allows you, confirms the
 conversation tables exist, and reports whether persistence is on. Unless
 `PICNIC_MOCK=true`, it also logs in to Picnic with `PICNIC_USERNAME` /
-`PICNIC_PASSWORD` and fetches the account, so wrong credentials, an account
-that demands 2FA, or a wrong `PICNIC_COUNTRY_CODE` show up here too. Secrets
-are never printed — only length and first/last characters. Add `--offline` to
+`PICNIC_PASSWORD` (or reuses the stored session) and fetches the account, so
+wrong credentials, an expired session, an account that demands 2FA, or a wrong
+`PICNIC_COUNTRY_CODE` show up here too. If it says Picnic needs a code, run
+`uv run python scripts/picnic_login.py` (or send `/picnic_login` to the bot)
+and run preflight again. Secrets are never printed — only length and first/last characters. Add `--offline` to
 skip the network calls.
 
 The Telegram check prints the bot's `@username`:
@@ -418,8 +420,9 @@ and names the missing column.)
 ## Before deploying to production
 
 1. `uv run alembic upgrade head` **before** restarting the bot — the history
-   branch adds migration `0002`, this one `0003`. On a DB originally created by
-   `init_db()`, stamp the revision it actually matches first (never `stamp
+   history branch added `0002`, the OpenRouter branch `0003`, the Picnic 2FA
+   branch `0004` (`picnic_auth`). The bot refuses to start on a DB whose
+   Alembic revision is behind. On a DB originally created by `init_db()`, stamp the revision it actually matches first (never `stamp
    head`); `MIGRATION_OPENROUTER.md` step 3 has the diagnostic and the full
    production procedure.
 2. Existing chats start empty; history accrues from the first message after the

@@ -39,7 +39,7 @@ that the caller can batch multiple writes into one transaction.
 
 ### Models: `db/models.py`
 
-Six ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
+Seven ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
 columns:
 
 | Model | Table | Notes |
@@ -50,6 +50,7 @@ columns:
 | `ImportCheckpoint` | `import_checkpoints` | Resumable import progress |
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
 | `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
+| `PicnicAuth` | `picnic_auth` | The Picnic session token (one row); a credential — never log it |
 
 Datetime values are stored as **ISO-8601 strings** (`String` column type,
 not `DateTime`) to avoid SQLite timezone edge-cases and to keep the existing
@@ -72,6 +73,7 @@ Alembic manages all schema changes.
 | `alembic/versions/0001_*.py` | Initial schema (products, orders, order_items, import_checkpoints) |
 | `alembic/versions/0002_*.py` | Conversation history (`conversation_messages`, `chat_settings`) — purely additive |
 | `alembic/versions/0003_*.py` | Per-chat LLM model (`chat_settings.model`, nullable) — purely additive |
+| `alembic/versions/0004_*.py` | Picnic session token (`picnic_auth`) — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -114,8 +116,12 @@ exist, otherwise it creates them.
 > step 3 shows how to tell which revision a database matches.
 >
 > The bot refuses to start (`SchemaOutOfDateError`) when
-> `engine.missing_columns()` reports drift, and `scripts/chat_model.py` refuses
-> to run — a stale schema would otherwise silently disable history storage.
+> `engine.pending_migration()` finds Alembic's revision behind
+> `engine.SCHEMA_REVISION` — checked *before* `init_db()`, which would
+> otherwise create the new tables and make `alembic upgrade head` fail with
+> "table already exists" — or when `engine.missing_columns()` reports drift,
+> and `scripts/chat_model.py` refuses to run — a stale schema would otherwise
+> silently disable history storage.
 
 ---
 
@@ -147,6 +153,7 @@ src/picnic_meal_planner/
 │   ├── models.py     # SQLAlchemy ORM models
 │   └── queries.py    # Query helpers (accept AsyncSession, return plain dicts)
 ├── picnic/
+│   ├── auth.py       # Stored session token + password/2FA login flow
 │   └── client.py     # Thin async wrapper around python-picnic-api2
 └── forecasting/
     └── engine.py     # Urgency-score model (pure Python, no DB access)
@@ -265,6 +272,42 @@ not treated as authoritative.
 
 ---
 
+## Picnic Login and 2FA
+
+Picnic may demand a one-time code (2FA) on a password login, and it cannot
+be turned off.  So the password is used as rarely as possible; policy lives
+in `picnic/auth.py`, and `client.py` applies it.
+
+- **Session token first.** A successful login stores its token in
+  `picnic_auth`, and every process (bot, MCP server, import script,
+  preflight) starts from it.  The password is used only when none is stored.
+- **No unprompted codes.** A password login that hits 2FA raises
+  `PicnicLoginRequired` instead of requesting a code; texting the owner on
+  every tool call would be worse than an error.  After the first 2FA demand
+  the client fails fast without logging in again, but still re-reads the DB,
+  so a token stored by another process takes effect without a restart.
+- **The message is the UI.** MCP tools surface exceptions as
+  `{"error": str(exc)}`, so `PicnicLoginRequired`'s message is written for the
+  end user and names both ways to log in.
+- **Two front ends, one `LoginFlow`:** `scripts/picnic_login.py` (shell) and
+  `/picnic_login [sms|email]` + `/picnic_code <code>` (Telegram).  The
+  library verifies the code against the same `PicnicAPI` instance that asked
+  for it, so a pending login is an object in memory with a 10-minute TTL; a
+  wrong code keeps it pending.
+- **A pending login blocks every other password login.**  A new one would
+  replace the half-authenticated session the code belongs to.  So while one
+  waits, `get_client()` and anyone else's `/picnic_login` raise
+  `PicnicLoginPending` (`LoginFlow.ensure_idle()`); only the user who started
+  it may restart it, e.g. to switch to email.
+- **Tokens are kept current.** `_call()` stores the token whenever the
+  session adopts a new one.  A rejected token is cleared — only if it is still
+  the stored one, so a fresh login from another process is never wiped — and
+  becomes `PicnicLoginRequired`.
+- **Failure behaviour** follows `history.py`: reading or writing the token
+  degrades (log, continue in memory); clearing propagates.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -273,6 +316,7 @@ not treated as authoritative.
 | `PICNIC_USERNAME` | — | Picnic account email |
 | `PICNIC_PASSWORD` | — | Picnic account password |
 | `PICNIC_COUNTRY_CODE` | — | `NL`, `DE`, or `BE` |
+| `PICNIC_LOGIN_USER_IDS` | — | Telegram user ids allowed to run `/picnic_login` and `/picnic_code` (each login sends the owner a code); empty = every allowed user |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (all LLM requests) |
 | `LLM_MODEL` | `anthropic/claude-sonnet-4.6` | Default OpenRouter model id for chats without their own |
@@ -306,4 +350,6 @@ uv run alembic revision --autogenerate -m "msg"  # generate migration from model
 uv run alembic downgrade -1           # roll back one migration
 uv run python scripts/chat_model.py list          # per-chat models
 uv run python scripts/chat_model.py set <chat_id> <model>
+uv run python scripts/picnic_login.py             # log in to Picnic (2FA), store the session
+uv run python scripts/picnic_login.py --status    # is the stored session valid?
 ```

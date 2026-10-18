@@ -98,7 +98,7 @@ picnic-like-a-pro/
 ├── alembic/
 │   ├── env.py                  # Async migration env
 │   └── versions/               # 0001 initial schema, 0002 conversation history,
-│                               # 0003 per-chat LLM model
+│                               # 0003 per-chat LLM model, 0004 Picnic session
 │
 ├── src/
 │   └── picnic_meal_planner/
@@ -117,6 +117,7 @@ picnic-like-a-pro/
 │       │
 │       ├── picnic/
 │       │   ├── __init__.py
+│       │   ├── auth.py         # Stored session token + password/2FA login
 │       │   ├── client.py       # Thin wrapper around python-picnic-api2
 │       │   └── mock_client.py  # In-process fake Picnic API (PICNIC_MOCK=true)
 │       │
@@ -128,6 +129,7 @@ picnic-like-a-pro/
 │   ├── import_history.py       # Optional stepwise import of Picnic delivery
 │   │                           # history (resumable, rate-limit safe)
 │   ├── chat_model.py           # List / set / reset each chat's LLM model
+│   ├── picnic_login.py         # Interactive Picnic login (2FA); stores the session
 │   └── preflight.py            # Config + live API checks before `uv run bot`
 │
 ├── tests/
@@ -273,6 +275,16 @@ Per-chat preferences: the storage opt-out and the LLM model.
 | persist_history | INTEGER | 0 = chat opted out of storage      |
 | model           | TEXT NULL | OpenRouter model id; NULL = `LLM_MODEL` (migration 0003) |
 | updated_at      | TEXT    | ISO datetime                       |
+
+### `picnic_auth`
+The Picnic session token, shared by every process using the account (migration
+0004). At most one row: the deployment has one Picnic account.
+
+| Column     | Type       | Notes                                   |
+|------------|------------|-----------------------------------------|
+| id         | INTEGER PK | Always 1                                |
+| auth_token | TEXT       | Session token — a credential, never logged |
+| updated_at | TEXT       | ISO datetime                            |
 
 ### `meal_plans`
 Optional: track planned meals to drive shopping list generation.

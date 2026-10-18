@@ -122,3 +122,19 @@ class ChatSettings(Base):
     # moves every chat that has not chosen a model of its own.
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime
+
+
+class PicnicAuth(Base):
+    """The Picnic session token, shared by every process using the account.
+
+    At most one row (``id = 1``): the deployment has one Picnic account.
+    Storing the token means a restart reuses the session instead of logging
+    in with the password again, which on a 2FA account would demand a new
+    code every time.  The token is a credential: never log it.
+    """
+
+    __tablename__ = "picnic_auth"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    auth_token: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime

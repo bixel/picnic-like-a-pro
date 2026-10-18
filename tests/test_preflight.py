@@ -172,10 +172,10 @@ class TestPicnicConfig:
     async def test_bad_config_never_reaches_picnic(self, monkeypatch):
         from picnic_meal_planner.picnic import client as picnic
 
-        def boom():
+        async def boom():
             raise AssertionError("a live login was attempted")
 
-        monkeypatch.setattr(picnic, "_get_client", boom)
+        monkeypatch.setattr(picnic, "get_client", boom)
         await preflight.check_picnic(False)
         [(status, detail)] = _results("picnic api")
         assert status == preflight.FAIL and "skipped" in detail

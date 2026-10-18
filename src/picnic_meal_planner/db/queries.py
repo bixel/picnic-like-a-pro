@@ -33,6 +33,7 @@ from .models import (
     ImportCheckpoint,
     Order,
     OrderItem,
+    PicnicAuth,
     Product,
 )
 
@@ -662,3 +663,47 @@ async def list_chat_models(session: AsyncSession) -> list[dict]:
     ids |= set(await session.scalars(select(ConversationMessage.chat_id).distinct()))
     pinned = dict((await session.execute(select(ChatSettings.chat_id, ChatSettings.model))).all())
     return [{"chat_id": cid, "model": pinned.get(cid)} for cid in sorted(ids)]
+
+
+# ---------------------------------------------------------------------------
+# Picnic session token
+#
+# One row (id = 1): the deployment has one Picnic account.  The token is a
+# credential, so nothing here logs it.
+# ---------------------------------------------------------------------------
+
+_PICNIC_AUTH_ID = 1
+
+
+async def get_picnic_token(session: AsyncSession) -> str | None:
+    return await session.scalar(
+        select(PicnicAuth.auth_token).where(PicnicAuth.id == _PICNIC_AUTH_ID)
+    )
+
+
+async def set_picnic_token(session: AsyncSession, token: str) -> None:
+    stmt = (
+        sqlite_insert(PicnicAuth)
+        .values(id=_PICNIC_AUTH_ID, auth_token=token, updated_at=_now())
+        .on_conflict_do_update(
+            index_elements=["id"],
+            set_=dict(auth_token=token, updated_at=_now()),
+        )
+    )
+    await session.execute(stmt)
+
+
+async def delete_picnic_token(
+    session: AsyncSession, *, only_if: str | None = None
+) -> int:
+    """Forget the stored token; return how many rows were removed (0 or 1).
+
+    With *only_if*, delete only while the stored token is still that one.  A
+    process whose token was just rejected must not wipe a fresh token that
+    another process (e.g. ``scripts/picnic_login.py``) stored meanwhile.
+    """
+    stmt = delete(PicnicAuth).where(PicnicAuth.id == _PICNIC_AUTH_ID)
+    if only_if is not None:
+        stmt = stmt.where(PicnicAuth.auth_token == only_if)
+    result = await session.execute(stmt)
+    return result.rowcount
