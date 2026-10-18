@@ -80,6 +80,35 @@ class TestGetCategories:
         assert len(await picnic.get_categories()) >= 5
 
 
+class TestGetProductCategory:
+    async def test_mock_product(self):
+        assert await picnic.get_product_category("p_milk_whole") == "Zuivel, Eieren & Boter"
+
+    async def test_unknown_product_is_none(self):
+        assert await picnic.get_product_category("p_nonexistent") is None
+
+    async def test_reads_the_typed_article(self, monkeypatch):
+        from python_picnic_api2.models import Article, Category
+
+        class Api:
+            def get_article(self, article_id, add_category=False):
+                assert add_category
+                return Article(id=article_id, category=Category(l2_id=1, l3_id=2, name="Koffiebonen"))
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_product_category("s1") == "Koffiebonen"
+
+    async def test_page_without_category_is_none(self, monkeypatch):
+        from python_picnic_api2 import PicnicParseError
+
+        class Api:
+            def get_article(self, article_id, add_category=False):
+                raise PicnicParseError("no category button", endpoint="product-details-page-root")
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_product_category("s1") is None
+
+
 class TestGetCart:
     async def test_empty_cart(self):
         cart = await picnic.get_cart()

@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,9 +60,15 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 async def upsert_product(session: AsyncSession, product: dict) -> None:
-    """Insert or update a product row (keyed on ``product["id"]``)."""
+    """Insert or update a product row (keyed on ``product["id"]``).
+
+    A ``None`` category keeps the stored one: delivery and search data never
+    carry a category, so overwriting would erase what
+    :func:`set_product_category` filled in.
+    """
+    insert = sqlite_insert(Product)
     stmt = (
-        sqlite_insert(Product)
+        insert
         .values(
             id=product["id"],
             name=product.get("name", ""),
@@ -79,7 +85,7 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
                 unit_price=product.get("unit_price"),
                 unit_quantity=product.get("unit_quantity"),
                 image_id=product.get("image_id"),
-                category=product.get("category"),
+                category=func.coalesce(insert.excluded.category, Product.category),
                 last_seen_at=_now(),
             ),
         )
@@ -100,6 +106,20 @@ async def get_product(session: AsyncSession, product_id: str) -> dict | None:
         "category": row.category,
         "last_seen_at": row.last_seen_at,
     }
+
+
+async def products_without_category(session: AsyncSession) -> list[str]:
+    """Ids of the stored products whose category is not known yet."""
+    rows = await session.scalars(
+        select(Product.id).where(Product.category.is_(None)).order_by(Product.id)
+    )
+    return list(rows)
+
+
+async def set_product_category(session: AsyncSession, product_id: str, category: str) -> None:
+    await session.execute(
+        update(Product).where(Product.id == product_id).values(category=category)
+    )
 
 
 # ---------------------------------------------------------------------------

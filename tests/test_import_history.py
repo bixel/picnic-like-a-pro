@@ -34,7 +34,7 @@ def _detail(did: str) -> dict:
 def fake_picnic(monkeypatch):
     """Summaries and details the test can change between runs."""
     monkeypatch.setenv("IMPORT_DELAY_SECONDS", "0")
-    state = {"summaries": [], "details": {}}
+    state = {"summaries": [], "details": {}, "categories": {}}
 
     async def get_deliveries():
         return list(state["summaries"])
@@ -45,7 +45,14 @@ def fake_picnic(monkeypatch):
             raise detail
         return detail
 
+    async def get_product_category(product_id):
+        category = state["categories"].get(product_id)
+        if isinstance(category, Exception):
+            raise category
+        return category
+
     monkeypatch.setattr(picnic, "get_deliveries", get_deliveries)
+    monkeypatch.setattr(picnic, "get_product_category", get_product_category)
     monkeypatch.setattr(picnic, "get_delivery", get_delivery)
     return state
 
@@ -119,3 +126,39 @@ async def test_fetch_failure_is_retried(fake_picnic):
     fake_picnic["details"]["d1"] = _detail("d1")
     await import_history.main()
     assert await _orders() == {"d1": 1}
+
+
+async def _category(product_id: str) -> str | None:
+    async with db.get_db() as conn:
+        return (await db.get_product(conn, product_id))["category"]
+
+
+async def test_categories_are_filled_in(fake_picnic):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    fake_picnic["categories"] = {"p_milk": "Milch"}
+    await import_history.main()
+    assert await _orders() == {"d1": 1}
+    assert await _category("p_milk") == "Milch"
+
+
+async def test_categories_are_backfilled_after_a_finished_import(fake_picnic):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    fake_picnic["categories"] = {"p_milk": ConnectionError("boom")}
+    await import_history.main()
+    assert (await _checkpoint())["finished"]
+    assert await _category("p_milk") is None
+
+    fake_picnic["categories"] = {"p_milk": "Milch"}
+    await import_history.main()
+    assert await _category("p_milk") == "Milch"
+
+
+async def test_login_error_stops_the_backfill(fake_picnic, capsys):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    fake_picnic["categories"] = {"p_milk": picnic.PicnicLoginRequired("log in")}
+    await import_history.main()
+    assert await _category("p_milk") is None
+    assert "Stopped: log in" in capsys.readouterr().err

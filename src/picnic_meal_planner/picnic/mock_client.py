@@ -235,6 +235,15 @@ class MockPicnicAPI:
     def get_categories(self) -> list[dict]:
         return list(CATEGORIES)
 
+    def get_article(self, article_id: str, add_category: bool = False) -> dict | None:
+        product = _CATALOG_BY_ID.get(article_id)
+        if product is None:
+            return None
+        article = {k: v for k, v in product.items() if k != "category"}
+        if add_category:
+            article["category"] = {"name": product["category"]}
+        return article
+
     # -- Cart ----------------------------------------------------------
 
     def get_cart(self) -> dict:
