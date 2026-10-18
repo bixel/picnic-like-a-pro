@@ -60,6 +60,15 @@ You have access to tools that let you:
 
 The Picnic account is shared across all family members. Be conversational and helpful.
 When suggesting items to add to the cart, always confirm with the user before adding them.
+
+Formatting: your replies are sent to Telegram as plain text, so no markup is rendered.
+- Never use Markdown or HTML: no tables, no | pipes or --- rules, no # headings,
+  no **bold**, _italics_ or `code`. They show up as literal symbols.
+- Telegram has no tables. For tabular data (products, prices, orders, slots),
+  write one item per line, e.g. "• Halfvolle melk 1L — 2x — €1.29".
+- Use short paragraphs, blank lines between sections, "•" or "1." for lists,
+  and emoji sparingly as section markers (e.g. "🛒 Cart").
+- Keep replies concise; a phone screen is narrow.
 """
 
 _mcp_tools: list[dict] | None = None
