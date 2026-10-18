@@ -289,3 +289,164 @@ class TestRealLibraryModels:
 
         real.get_categories = gone
         assert await picnic.get_categories() == []
+
+
+# Trimmed from python-picnic-api2's tests/fixtures/delivery_de.json: the real
+# API nests orders -> ORDER_LINE -> ORDER_ARTICLE, with the count in a
+# QUANTITY decorator and the paid price on the line.
+REAL_DELIVERY = {
+    "type": "DELIVERY",
+    "delivery_id": "d0000000000",
+    "id": "d0000000000",
+    "creation_time": "2026-07-14T22:36:46.115+02:00",
+    "slot": {"window_start": "2026-07-15T14:15:00.000+02:00"},
+    "status": "COMPLETED",
+    "orders": [
+        {
+            "type": "ORDER",
+            "id": "000-000-0000",
+            "items": [
+                {
+                    "type": "ORDER_LINE",
+                    "id": "2528",
+                    "items": [
+                        {
+                            "type": "ORDER_ARTICLE",
+                            "id": "s1021945",
+                            "name": "Edeka Herzstücke Brioche Burger Buns",
+                            "image_ids": ["img1", "img2"],
+                            "unit_quantity": "4 Stück",
+                            "price": 189,
+                            "decorators": [
+                                {"type": "IMMUTABLE"},
+                                {"type": "QUANTITY", "quantity": 2},
+                            ],
+                        }
+                    ],
+                    "display_price": 338,
+                    "price": 338,
+                }
+            ],
+            "total_price": 4996,
+        },
+        {"type": "ORDER", "id": "000-000-0001", "items": [], "total_price": 1004},
+    ],
+    "error": {},
+}
+
+
+class TestDeliveryLineItems:
+    def test_real_payload_uses_article_not_order_line(self):
+        [item] = picnic.delivery_line_items(REAL_DELIVERY)
+        assert item["product"]["id"] == "s1021945"       # not the line id "2528"
+        assert item["product"]["name"] == "Edeka Herzstücke Brioche Burger Buns"
+        assert item["product"]["unit_quantity"] == "4 Stück"
+        assert item["product"]["image_id"] == "img1"
+
+    def test_real_payload_quantity_from_decorator(self):
+        [item] = picnic.delivery_line_items(REAL_DELIVERY)
+        assert item["quantity"] == 2
+
+    def test_real_payload_unit_price_from_line_price(self):
+        [item] = picnic.delivery_line_items(REAL_DELIVERY)
+        assert item["unit_price"] == 169
+        assert item["product"]["unit_price"] == 169
+
+    def test_multi_article_line_falls_back_to_article_price(self):
+        line = {"items": [
+            {"id": "a", "price": 100, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            {"id": "b", "price": 250, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+        ], "price": 999}
+        items = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert [i["unit_price"] for i in items] == [100, 250]
+
+    def test_article_without_id_is_skipped(self):
+        detail = {"orders": [{"items": [{"items": [{"name": "?"}], "price": 5}]}]}
+        assert picnic.delivery_line_items(detail) == []
+
+    async def test_mock_payload_flat_articles(self):
+        deliveries = await picnic.get_deliveries()
+        detail = await picnic.get_delivery(deliveries[0]["id"])
+        items = picnic.delivery_line_items(detail)
+        assert items
+        milk = next(i for i in items if i["product"]["id"] == "p_milk_whole")
+        assert milk["quantity"] == 2
+        assert milk["unit_price"] == 119
+        assert milk["product"]["image_id"] == "img_milk_whole"
+
+    def test_real_payload_survives_model_round_trip(self):
+        """What the importer actually gets: a 2.x model run through _plain()."""
+        from python_picnic_api2 import Delivery
+
+        detail = picnic._plain(Delivery.from_api(REAL_DELIVERY))
+        assert [i["product"]["id"] for i in picnic.delivery_line_items(detail)] == ["s1021945"]
+
+    def test_legacy_wrapper_keeps_count_and_paid_price(self):
+        """``{"product": {...}, "count", "unit_price"}``, as the old importer read it."""
+        line = {"product": {"id": "p_milk", "price": 189}, "count": 3, "unit_price": 169}
+        [item] = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert item["product"]["id"] == "p_milk"
+        assert item["quantity"] == 3
+        assert item["unit_price"] == 169
+
+    def test_legacy_wrapper_falls_back_to_product_price(self):
+        line = {"product": {"id": "p_milk", "price": 189}}
+        [item] = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert (item["quantity"], item["unit_price"]) == (1, 189)
+
+
+class TestDeliverySummaryFields:
+    def test_real_payload_sums_order_totals(self):
+        fields = picnic.delivery_summary_fields(REAL_DELIVERY)
+        assert fields["total_price"] == 6000
+        assert fields["ordered_at"] == "2026-07-14T22:36:46.115+02:00"
+        assert fields["delivered_at"] is None
+
+    def test_delivery_time_object_uses_start(self):
+        detail = {"delivery_time": {"start": "2026-07-15T14:30:00", "end": "2026-07-15T14:40:00"}}
+        assert picnic.delivery_summary_fields(detail)["delivered_at"] == "2026-07-15T14:30:00"
+
+    def test_null_slot_does_not_crash(self):
+        assert picnic.delivery_summary_fields({"slot": None})["ordered_at"] == ""
+
+    async def test_mock_payload(self):
+        deliveries = await picnic.get_deliveries()
+        detail = await picnic.get_delivery(deliveries[0]["id"])
+        fields = picnic.delivery_summary_fields(detail)
+        assert fields["total_price"] == detail["total_price"]
+        assert fields["delivered_at"] == detail["delivery_time"]
+
+
+class TestDeliveryId:
+    def test_id_wins_over_delivery_id(self):
+        # The order the importer has always keyed checkpoints and orders by.
+        assert picnic.delivery_id({"id": "a", "delivery_id": "b", "order_id": "c"}) == "a"
+
+    def test_falls_back_to_delivery_id(self):
+        assert picnic.delivery_id({"delivery_id": "b", "order_id": "c"}) == "b"
+
+    def test_falls_back_to_order_id(self):
+        assert picnic.delivery_id({"order_id": "c"}) == "c"
+
+    def test_none_without_any_id(self):
+        assert picnic.delivery_id({}) is None
+
+
+class TestDeliveryUnusableReason:
+    def test_real_payload_is_usable(self):
+        # Carries "error": {} — present but empty, so not an error.
+        assert picnic.delivery_unusable_reason(REAL_DELIVERY) is None
+
+    async def test_mock_payload_is_usable(self):
+        deliveries = await picnic.get_deliveries()
+        detail = await picnic.get_delivery(deliveries[0]["id"])
+        assert picnic.delivery_unusable_reason(detail) is None
+
+    @pytest.mark.parametrize("detail", [
+        {},
+        {"error": {"code": "DELIVERY_NOT_FOUND"}},
+        {**REAL_DELIVERY, "creation_time": None, "slot": None},
+        {**REAL_DELIVERY, "orders": [{"items": []}]},
+    ])
+    def test_unusable_payloads(self, detail):
+        assert picnic.delivery_unusable_reason(detail)

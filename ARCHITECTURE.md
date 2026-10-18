@@ -468,9 +468,21 @@ times. It works in pages so you can stop and resume at any point.
 3. After each batch it writes a checkpoint (`import_checkpoints` table) with the last
    processed delivery ID and sleeps `IMPORT_DELAY_SECONDS` (default 2 s).
 4. On subsequent runs it reads the checkpoint and skips already-imported deliveries.
-5. Duplicate prevention: `picnic_order_id` has a UNIQUE constraint; conflicts are
-   silently ignored (`INSERT OR IGNORE`).
-6. Prints a progress summary after each batch and a final total on completion.
+5. Duplicate prevention: a delivery whose `picnic_order_id` is already in `orders`
+   is skipped before its items are written, so a run interrupted between a commit
+   and its batch checkpoint does not double those items on resume. The UNIQUE
+   constraint on `picnic_order_id` remains the backstop.
+6. Cancelled deliveries are skipped for good. A delivery that cannot be imported
+   *yet* — still `CURRENT`, a failed fetch, or a detail that
+   `picnic.client.delivery_unusable_reason()` rejects (error body, no order time,
+   no order lines) — is **deferred**: nothing is written for it, the checkpoint
+   never moves past it, and the run is not marked finished, so the next run
+   rescans and picks it up. Step 5 makes that rescan cheap.
+7. Line items come from `picnic.client.delivery_line_items()`, which flattens the
+   real API's `orders → ORDER_LINE → ORDER_ARTICLE` nesting (count from the
+   `QUANTITY` decorator, unit price from the line price) as well as the mock's
+   flat shape.
+8. Prints a progress summary after each batch and a final total on completion.
 
 ```
 $ uv run import-history

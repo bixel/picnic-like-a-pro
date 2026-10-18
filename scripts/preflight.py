@@ -6,10 +6,11 @@ as a 401. This checks the lot up front and says which one is wrong.
 
 Usage:
     uv run python scripts/preflight.py          # config + live API checks
+                                                #   (OpenRouter, Telegram, Picnic)
     uv run python scripts/preflight.py --offline  # skip network calls
 
 Secrets are never printed — only their length, first/last characters, and
-whether they look malformed. The Telegram bot's @username *is* printed, so you
+whether they look malformed; for the Picnic password, only its length. The Telegram bot's @username *is* printed, so you
 can confirm you are about to run your test bot rather than the production one.
 """
 
@@ -35,6 +36,10 @@ PLACEHOLDERS = {
     "your@email.com",
     "yourpassword",
 }
+
+# Countries python-picnic-api2 has a storefront for; the host name is built
+# from this code, so anything else fails as a DNS error rather than a 4xx.
+PICNIC_COUNTRIES = {"NL", "DE", "BE"}
 
 OK, WARN, FAIL = "PASS", "WARN", "FAIL"
 _results: list[tuple[str, str, str]] = []
@@ -113,15 +118,49 @@ def check_auth_config() -> None:
     record(OK, "authorisation", f"{len(ids)} allowed user id(s)")
 
 
-def check_picnic_mode() -> None:
-    if os.getenv("PICNIC_MOCK", "").lower() == "true":
+def picnic_mocked() -> bool:
+    return os.getenv("PICNIC_MOCK", "").lower() == "true"
+
+
+def check_picnic_config(shell: dict[str, str], dotenv_path: str) -> bool:
+    """Report the Picnic settings; return whether a live login is worth trying.
+
+    False whenever a credential or the country code already FAILed here, so
+    a placeholder is never sent to the real storefront.
+    """
+    if picnic_mocked():
         record(OK, "picnic", "PICNIC_MOCK=true — no real Picnic calls, no checkout")
-    else:
-        record(
-            WARN,
-            "picnic",
-            "PICNIC_MOCK is not true — this will hit the REAL Picnic account",
-        )
+        return True
+    ok = True
+    record(
+        WARN,
+        "picnic",
+        "PICNIC_MOCK is not true — this will hit the REAL Picnic account",
+    )
+    for name in ("PICNIC_USERNAME", "PICNIC_PASSWORD"):
+        value = os.environ.get(name)
+        clean = (value or "").strip().strip('"').strip("'")
+        status = FAIL if not clean or clean in PLACEHOLDERS else OK
+        ok = ok and status == OK
+        src = source_of(name, shell, dotenv_path)
+        if name == "PICNIC_PASSWORD" and status == OK:
+            # shape() shows a prefix, which is harmless for a token's fixed
+            # "sk-ant-" start but would reveal most of a human password.
+            detail = f"len={len(clean)}"
+        else:
+            detail = shape(value)
+        record(status, name, f"from {src}: {detail}")
+
+    # The library lowercases the code for the host name, so "nl" works too.
+    country = os.getenv("PICNIC_COUNTRY_CODE", "NL").strip().upper()
+    valid_country = country in PICNIC_COUNTRIES
+    record(
+        OK if valid_country else FAIL,
+        "PICNIC_COUNTRY_CODE",
+        country if valid_country
+        else f"{country!r} — must be one of {', '.join(sorted(PICNIC_COUNTRIES))}",
+    )
+    return ok and valid_country
 
 
 def check_history_config() -> None:
@@ -314,6 +353,67 @@ async def check_telegram() -> None:
         record(FAIL, "telegram api", f"{type(exc).__name__}: {str(exc)[:80]}")
 
 
+async def check_picnic(config_ok: bool) -> None:
+    if picnic_mocked():
+        return  # check_picnic_config already reported mock mode
+    if not config_ok:
+        record(FAIL, "picnic api", "skipped — fix the Picnic settings above first")
+        return
+
+    import requests
+    from python_picnic_api2 import Picnic2FARequired, PicnicAuthError
+
+    from picnic_meal_planner.picnic import client as picnic
+
+    def login_and_fetch_user():
+        # The same constructor call the bot makes, so this logs in exactly as
+        # it will.  2.x logs in inside the constructor.
+        api = picnic._get_client()
+        if not api.logged_in():
+            raise PicnicAuthError("login returned no auth token")
+        return api.get_user()
+
+    try:
+        user = await asyncio.get_running_loop().run_in_executor(None, login_and_fetch_user)
+    except Picnic2FARequired:
+        record(
+            FAIL,
+            "picnic api",
+            "credentials accepted but Picnic requires 2FA — the bot cannot "
+            "complete a 2FA login",
+        )
+        return
+    except PicnicAuthError as exc:
+        record(FAIL, "picnic api", f"login rejected: {str(exc)[:80]}")
+        return
+    except requests.ConnectionError:
+        record(
+            FAIL,
+            "picnic api",
+            "cannot reach the Picnic storefront — network down, or a wrong "
+            "PICNIC_COUNTRY_CODE",
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        record(FAIL, "picnic api", f"{type(exc).__name__}: {str(exc)[:80]}")
+        return
+    finally:
+        picnic.reset_client()
+
+    if not user.user_id:
+        # A request whose token Picnic does not accept comes back as an error
+        # body, not an HTTP failure, and parses into an empty User.
+        record(FAIL, "picnic api", "logged in, but /user returned no account")
+        return
+    record(
+        OK,
+        "picnic api",
+        f"logged in as {user.firstname or '?'} — "
+        f"{user.completed_deliveries or 0} completed deliveries  "
+        "<-- confirm this is the right account",
+    )
+
+
 # ---------------------------------------------------------------------------
 
 async def main() -> int:
@@ -327,7 +427,7 @@ async def main() -> int:
     print("Preflight for `uv run bot`\n")
     check_env_sources(shell, dotenv_path)
     check_auth_config()
-    check_picnic_mode()
+    picnic_ok = check_picnic_config(shell, dotenv_path)
     check_history_config()
     llm = load_llm_config()
     await check_database()
@@ -336,6 +436,7 @@ async def main() -> int:
     else:
         await check_openrouter(llm)
         await check_telegram()
+        await check_picnic(picnic_ok)
 
     fails = [r for r in _results if r[0] == FAIL]
     warns = [r for r in _results if r[0] == WARN]
