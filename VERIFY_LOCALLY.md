@@ -2,17 +2,17 @@
 
 Cheapest first. **Tiers 0 and 1 need no credentials and no Docker.** Tier 2
 runs the real bot locally with plain Python — the first tier that proves the
-Telegram transport and that the Anthropic API accepts what we store, since
+Telegram transport and that the LLM API (via OpenRouter) accepts what we store, since
 everything below it uses stubs. Tier 3 is Docker, and is optional: it proves
 packaging, not behaviour.
 
 Every command was run on this branch before being written down; the expected
 output is what it actually produced. The exceptions are the steps that need
-outbound Telegram/Anthropic access or a Docker daemon — neither was available
+outbound Telegram/OpenRouter access or a Docker daemon — neither was available
 where this was written, and those are called out where they appear.
 
 ```bash
-git checkout claude/persist-conversation-history-90CmU
+git checkout claude/openrouter-llm-integration-uqletp
 make install          # uv sync --group dev
 ```
 
@@ -27,37 +27,28 @@ dev` will reconcile it.
 ```bash
 make test-fast
 ```
-**Expect:** `438 passed`. If you want coverage instead, `make test`.
+**Expect:** `504 passed`. If you want coverage instead, `make test`.
 
-The 11 tests added by the review-fix commit are the ones that matter most.
-Run them alone to see what they assert:
+The tests that matter most for the history and OpenRouter work. Run them alone
+to see what they assert:
 
 ```bash
 uv run pytest tests/test_history.py -q \
   -k "window or concurrent or leak or head"
-uv run pytest tests/test_bot_conversation.py::TestRunClaudeUnfinishedTurns -v
-```
-
-**Prove they are real regression tests** — they must fail against the code as
-it was before the fixes:
-
-```bash
-git stash -u                       # if you have local edits
-git checkout HEAD~1 -- src/        # old source, new tests
-uv run pytest tests/test_history.py tests/test_bot_conversation.py -q
-#   -> expect 10 failed
-git checkout HEAD -- src/          # put it back
-uv run pytest -q                   # -> 438 passed
+uv run pytest tests/test_bot_conversation.py::TestRunLlmUnfinishedTurns -v
+uv run pytest tests/test_llm.py -q                        # translation both ways
+uv run pytest tests/test_bot_conversation.py -v \
+  -k "ModelSelection or RealAdapter or schema or 0002"    # per-chat model, drift
 ```
 
 Migration round-trip on a scratch DB (never touches `data/picnic.db`):
 
 ```bash
 export DB_PATH=/tmp/verify.db && rm -f $DB_PATH
-uv run alembic upgrade head        # -> runs 0001 then 0002
-uv run alembic downgrade -1        # -> 0002 -> 0001, no error
+uv run alembic upgrade head        # -> runs 0001, 0002, then 0003
+uv run alembic downgrade -1        # -> 0003 -> 0002, no error
 uv run alembic upgrade head
-uv run alembic current             # -> 0002 (head)
+uv run alembic current             # -> 0003 (head)
 uv run alembic revision --autogenerate -m drift
 ```
 **Expect:** the generated file's `upgrade()` body is just `pass` — models and
@@ -65,7 +56,7 @@ migration agree. **Delete it afterwards:** `rm alembic/versions/*drift*.py`.
 
 ---
 
-## Tier 1 — the feature, without Telegram or Anthropic (~10 min)
+## Tier 1 — the feature, without Telegram or an LLM (~10 min)
 
 Still on the scratch DB. This drives `history.py` directly, which is where all
 the policy lives.
@@ -221,11 +212,11 @@ No Docker. This runs the same `uv run bot` entry point the container runs, just
 directly on your machine, so a "restart" is Ctrl-C and up-arrow.
 
 This is the first tier that exercises the Telegram transport and a **real**
-Anthropic call. Nothing below it proves the API accepts our normalized content,
+LLM call via OpenRouter. Nothing below it proves the API accepts our translated content,
 because every test above stubs the client.
 
 **You need:** a *second* Telegram bot token (never the production one — talk to
-@BotFather) and an `ANTHROPIC_API_KEY`. The Picnic API is mocked, so no Picnic
+@BotFather) and an `OPENROUTER_API_KEY`. The Picnic API is mocked, so no Picnic
 credentials are used and no real order can be placed.
 
 ### Configure
@@ -242,7 +233,8 @@ is still filled in from a `.env` in the repo root, and that includes
 
 ```bash
 export TELEGRAM_BOT_TOKEN='<your TEST bot token>'
-export ANTHROPIC_API_KEY='sk-ant-...'
+export OPENROUTER_API_KEY='sk-or-v1-...'
+export LLM_MODEL='anthropic/claude-sonnet-4.6'   # optional; this is the default
 export ALLOWED_TELEGRAM_USER_IDS='<your telegram user id>'   # or ALLOW_ALL_USERS=true
 export PICNIC_MOCK=true
 export DB_PATH="$PWD/data/verify.db"
@@ -253,7 +245,7 @@ export PERSIST_CONVERSATIONS=true
 
 ```bash
 rm -f "$DB_PATH"
-uv run alembic upgrade head     # 0001, then 0002
+uv run alembic upgrade head     # 0001, 0002, then 0003
 uv run python scripts/preflight.py
 ```
 
@@ -299,83 +291,43 @@ If instead you get `Network Retry Loop (Bootstrap Initialize Application)` with
 an httpx/proxy error, that is Telegram connectivity — a bad token, or a network
 that blocks `api.telegram.org`. It is not a problem with this branch.
 
-### If you get `AuthenticationError: 401 — API key is invalid`
+### If you get `AuthenticationError: 401`
 
 `uv run python scripts/preflight.py` diagnoses this directly — it is the
-`anthropic api` line. The rest of this section is the manual version, and
-explains why it happens.
+`openrouter api` line, and the `llm model` line below it checks that
+`LLM_MODEL` is a real OpenRouter model id. The rest of this section is the
+manual version.
 
 The bot is fine — Telegram connected, the DB initialised, and the request
-reached Anthropic, which rejected the key. Nothing was stored (a failed turn is
-never persisted), so the database is untouched.
+reached OpenRouter, which rejected the key. Nothing was stored (a failed turn
+is never persisted), so the database is untouched.
 
-`bot.py` reads `os.environ["ANTHROPIC_API_KEY"]`, which would raise `KeyError`
-if it were unset. So *something* supplied a value Anthropic doesn't accept.
-Three placeholders in this repo are the usual culprits:
+`llm.py` reads `os.environ["OPENROUTER_API_KEY"]`, which would raise
+`KeyError` if it were unset. So *something* supplied a value OpenRouter doesn't
+accept. The repo's placeholders are the usual culprits:
 
 | File | Value |
 |---|---|
-| `.env.example` | `sk-ant-...` |
+| `.env.example` | `sk-or-v1-...` |
 | `.env.mock.example` | `REPLACE_WITH_API_KEY` |
-| `.env.test` | `sk-ant-test-key-not-real` |
+| `.env.test` | `sk-or-test-key-not-real` |
 
-If you copied one of those to `.env` and did not export a real key, `load_dotenv()`
-supplies the placeholder. Find out which source wins:
-
-```bash
-uv run python - <<'EOF'
-import os
-from dotenv import dotenv_values, find_dotenv, load_dotenv
-
-PLACEHOLDERS = {"sk-ant-...", "REPLACE_WITH_API_KEY", "sk-ant-test-key-not-real"}
-
-def shape(v):
-    if v is None:
-        return "<unset>"
-    clean = v.strip().strip('"').strip("'")
-    notes = []
-    if v != clean:            notes.append("HAS SURROUNDING WHITESPACE/QUOTES")
-    if clean in PLACEHOLDERS: notes.append("IS A PLACEHOLDER FROM THE REPO")
-    if "\n" in v or "\r" in v: notes.append("CONTAINS A NEWLINE")
-    if not clean.startswith("sk-ant-"):
-        notes.append(f"DOES NOT START WITH sk-ant- (starts {clean[:7]!r})")
-    return (f"len={len(v)} {clean[:11]}...{clean[-4:] if len(clean) > 15 else ''}"
-            + ("  <-- " + "; ".join(notes) if notes else "  (looks well-formed)"))
-
-print("1. exported in your shell :", shape(os.environ.get("ANTHROPIC_API_KEY")))
-path = find_dotenv(usecwd=True)
-print("2. dotenv file found      :", path or "<none>")
-if path:
-    print("   value inside it        :", shape(dotenv_values(path).get("ANTHROPIC_API_KEY")))
-load_dotenv()          # exactly what bot.py does; override=False
-print("3. what bot.py will use   :", shape(os.environ.get("ANTHROPIC_API_KEY")))
-EOF
-```
-
-It prints only the length and the first/last few characters, never the key.
-Line 3 is what the bot uses; a shell export wins over the dotenv file, so if
-line 1 is `<unset>` the value in line 2 is the one being sent.
-
-Then confirm the key independently of the bot:
+If you copied one of those to `.env` and did not export a real key,
+`load_dotenv()` supplies the placeholder (a shell export wins over the dotenv
+file). Confirm the key independently of the bot — this call is free:
 
 ```bash
-uv run python -c "
-import anthropic, os
-try:
-    anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY']).messages.create(
-        model='claude-sonnet-4-6', max_tokens=8,
-        messages=[{'role':'user','content':'hi'}])
-    print('KEY WORKS')
-except anthropic.AuthenticationError:
-    print('AUTH FAILED (401) — reached Anthropic and was rejected')
-"
+curl -s https://openrouter.ai/api/v1/key -H "Authorization: Bearer $OPENROUTER_API_KEY"
 ```
 
-If that says `AUTH FAILED`, the key itself is the problem, not this project.
-Common causes beyond the placeholders: a trailing newline from copy-paste, a
-Console *session* token rather than an API key, or a key from a different
-workspace. Mint a fresh one at console.anthropic.com and
-`export ANTHROPIC_API_KEY='sk-ant-...'` in the shell you run `uv run bot` from.
+A valid key returns `{"data": {...}}`; a bad one returns a 401 error body.
+Common causes beyond the placeholders: a trailing newline from copy-paste, or a
+key that was deleted or has hit its credit limit. Mint a fresh one at
+openrouter.ai/settings/keys and `export OPENROUTER_API_KEY='sk-or-v1-...'` in
+the shell you run `uv run bot` from.
+
+A **402** instead of a 401 means the key is fine but the account has no
+credits left.
 
 ### Walk through it in Telegram
 
@@ -432,7 +384,7 @@ packaging, not behaviour. Tier 2 already covered the feature.
 
 ```bash
 docker build --target runtime -t picnic-local:verify .
-cp .env.mock.example .env.mock     # fill in the TEST token + Anthropic key
+cp .env.mock.example .env.mock     # fill in the TEST token + OpenRouter key
 # point `image:` in docker-compose.mock.yml at picnic-local:verify
 make mock-up && make mock-logs
 ```
@@ -440,8 +392,10 @@ make mock-up && make mock-logs
 Here `_post_init`'s `init_db()` does create the tables on a fresh volume. On a
 volume that predates this branch, run
 `docker compose -f docker-compose.mock.yml run --rm picnic-bot-mock alembic
-upgrade head` first — and `alembic stamp head` before that if the DB was
-originally created by `init_db()` rather than Alembic.
+upgrade head` first. If the DB was originally created by `init_db()` rather
+than Alembic, stamp the revision it actually matches before that — see
+`MIGRATION_OPENROUTER.md` step 3. (The bot refuses to start on a stale schema
+and names the missing column.)
 
 **Tear down:** `make mock-down`, or add `-v` to drop the volume.
 
@@ -452,7 +406,7 @@ originally created by `init_db()` rather than Alembic.
 | Tier | Proves | Does **not** prove |
 |---|---|---|
 | 0 | Logic, migrations, no regressions | Anything about real I/O |
-| 1 | Persistence, turn integrity, deletion, opt-out, log hygiene against a real SQLite file | Telegram, or that the Anthropic API accepts our messages |
+| 1 | Persistence, turn integrity, deletion, opt-out, log hygiene against a real SQLite file | Telegram, or that OpenRouter accepts our messages |
 | 2 | The whole path, including a real API round-trip | Behaviour against a *large* archive, or the real Picnic API |
 | 3 | The image builds and runs the same way | Nothing about the feature that tier 2 didn't |
 
@@ -460,9 +414,11 @@ originally created by `init_db()` rather than Alembic.
 
 ## Before deploying to production
 
-1. `uv run alembic upgrade head` **before** restarting the bot — this branch
-   adds migration `0002`. On a DB originally created by `init_db()`, run
-   `uv run alembic stamp head` first so Alembic doesn't try to recreate tables.
+1. `uv run alembic upgrade head` **before** restarting the bot — the history
+   branch adds migration `0002`, this one `0003`. On a DB originally created by
+   `init_db()`, stamp the revision it actually matches first (never `stamp
+   head`); `MIGRATION_OPENROUTER.md` step 3 has the diagnostic and the full
+   production procedure.
 2. Existing chats start empty; history accrues from the first message after the
    upgrade. Nothing is back-filled.
 3. Conversations are now **stored unencrypted** on the data volume. If that is

@@ -24,6 +24,8 @@ from dotenv import dotenv_values, find_dotenv, load_dotenv
 # Placeholders shipped in this repo's env templates. Copying one into .env and
 # forgetting to replace it is the single most common cause of a 401 / 404 here.
 PLACEHOLDERS = {
+    "sk-or-v1-...",
+    "sk-or-test-key-not-real",
     "sk-ant-...",
     "REPLACE_WITH_API_KEY",
     "sk-ant-test-key-not-real",
@@ -81,7 +83,7 @@ def check_env_sources(shell: dict[str, str], dotenv_path: str) -> None:
         "dotenv file",
         dotenv_path or "none found — relying entirely on shell exports",
     )
-    for name in ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY"):
+    for name in ("TELEGRAM_BOT_TOKEN", "OPENROUTER_API_KEY"):
         src = source_of(name, shell, dotenv_path)
         value = os.environ.get(name)
         status = FAIL if value is None else OK
@@ -174,42 +176,124 @@ async def check_database() -> None:
     else:
         record(OK, "conversation tables", "conversation_messages, chat_settings present")
 
+    missing_cols = await engine_mod.missing_columns()
+    if missing_cols:
+        record(
+            FAIL,
+            "schema",
+            f"missing columns {missing_cols} — run: uv run alembic upgrade head",
+        )
+
     if "alembic_version" in tables:
         record(OK, "alembic", "schema is under migration control")
     else:
         record(
             WARN,
             "alembic",
-            "no alembic_version table — created by init_db(); run `alembic stamp head`",
+            "no alembic_version table — created by init_db(); stamp it at the "
+            "revision it matches (see MIGRATION_OPENROUTER.md), then upgrade",
         )
 
 
-async def check_anthropic() -> None:
-    import anthropic
+def load_llm_config():
+    """Import ``llm`` for its parsed settings, or record why that fails.
 
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        record(FAIL, "anthropic api", "no key to test")
-        return
+    Imported lazily, after ``load_dotenv()``, so preflight reads the same
+    defaults the bot does instead of keeping its own copies. ``llm`` parses its
+    settings at import, so a bad value here is a bot that crashes on start.
+    """
     try:
-        client = anthropic.AsyncAnthropic(api_key=key)
-        await client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-            max_tokens=4,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        record(OK, "anthropic api", "key accepted")
-    except anthropic.AuthenticationError:
+        from picnic_meal_planner import llm
+    except ValueError as exc:
         record(
             FAIL,
-            "anthropic api",
-            "401 invalid key — this is what makes /plan fail. Mint a new one and "
-            "export ANTHROPIC_API_KEY in this shell",
+            "LLM_MAX_TOKENS",
+            f"not an integer: {os.getenv('LLM_MAX_TOKENS')!r} (bot will crash at import: {exc})",
         )
-    except anthropic.NotFoundError as exc:
-        record(FAIL, "anthropic api", f"model not found: {str(exc)[:80]}")
-    except Exception as exc:  # noqa: BLE001
-        record(WARN, "anthropic api", f"could not verify: {type(exc).__name__}")
+        return None
+    if llm.MAX_TOKENS <= 0:
+        record(FAIL, "LLM_MAX_TOKENS", f"{llm.MAX_TOKENS} — every request would be rejected")
+    else:
+        record(OK, "LLM_MAX_TOKENS", str(llm.MAX_TOKENS))
+    allowed = llm.allowed_models()
+    record(OK, "LLM_MODEL", f"{llm.DEFAULT_MODEL} (default for chats without their own)")
+    if allowed:
+        record(OK, "LLM_ALLOWED_MODELS", ", ".join(sorted(allowed)))
+    return llm
+
+
+async def check_openrouter(llm) -> None:
+    """Key validity via /key, then — independently — that the model id exists.
+
+    Neither call generates tokens, so the check costs nothing. Any failure is
+    a FAIL: if preflight cannot get an answer, neither can the bot.
+    """
+    import httpx
+
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            record(
+                FAIL,
+                "openrouter api",
+                "ANTHROPIC_API_KEY is set but no longer used — set OPENROUTER_API_KEY "
+                "(see MIGRATION_OPENROUTER.md)",
+            )
+        else:
+            record(FAIL, "openrouter api", "no key to test")
+    if llm is None:
+        record(FAIL, "openrouter api", "skipped — fix the LLM settings above first")
+        return
+
+    base = llm.OPENROUTER_BASE_URL.rstrip("/")
+    async with httpx.AsyncClient(timeout=15) as client:
+        if key:
+            await _check_key(client, base, key)
+        await _check_model(client, base, llm.DEFAULT_MODEL)
+
+
+async def _check_key(client, base: str, key: str) -> None:
+    import httpx
+
+    try:
+        r = await client.get(f"{base}/key", headers={"Authorization": f"Bearer {key}"})
+    except httpx.RequestError as exc:
+        record(FAIL, "openrouter api", f"cannot reach {base}: {type(exc).__name__}")
+        return
+    if r.status_code == 401:
+        record(
+            FAIL,
+            "openrouter api",
+            "401 invalid key — this is what makes /plan fail. Mint a new one at "
+            "openrouter.ai/settings/keys and export OPENROUTER_API_KEY",
+        )
+    elif r.status_code == 402:
+        record(FAIL, "openrouter api", "402 — key is valid but the account has no credits")
+    elif r.is_error:
+        record(FAIL, "openrouter api", f"HTTP {r.status_code} from {base}/key")
+    else:
+        data = r.json().get("data", {})
+        remaining = data.get("limit_remaining")
+        detail = "key accepted"
+        if remaining is not None:
+            detail += f", {remaining} credits left on this key"
+        record(OK, "openrouter api", detail)
+
+
+async def _check_model(client, base: str, model: str) -> None:
+    import httpx
+
+    try:
+        r = await client.get(f"{base}/models")
+        r.raise_for_status()
+        ids = {m.get("id") for m in r.json().get("data", [])}
+    except httpx.HTTPError as exc:
+        record(FAIL, "llm model", f"cannot list models at {base}: {type(exc).__name__}")
+        return
+    if model in ids:
+        record(OK, "llm model", f"{model} is available")
+    else:
+        record(FAIL, "llm model", f"LLM_MODEL={model!r} is not an OpenRouter model id")
 
 
 async def check_telegram() -> None:
@@ -245,11 +329,12 @@ async def main() -> int:
     check_auth_config()
     check_picnic_mode()
     check_history_config()
+    llm = load_llm_config()
     await check_database()
     if offline:
         record(WARN, "live api checks", "skipped (--offline)")
     else:
-        await check_anthropic()
+        await check_openrouter(llm)
         await check_telegram()
 
     fails = [r for r in _results if r[0] == FAIL]

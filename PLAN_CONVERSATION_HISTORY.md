@@ -13,8 +13,9 @@ see *Architecture note* immediately after this table.
 
 > **Deploy note:** this adds a migration. Run `uv run alembic upgrade head`
 > before restarting the bot. On a database bootstrapped by `init_db()`
-> (`create_all`) rather than Alembic, `uv run alembic stamp head` first — see
-> `CLAUDE.md`.
+> (`create_all`) rather than Alembic, `uv run alembic stamp <revision it
+> matches>` first — never `stamp head`. See `CLAUDE.md` and
+> `MIGRATION_OPENROUTER.md` step 3.
 
 | Step | Status | Notes |
 |---|---|---|

@@ -4,16 +4,16 @@ This module owns everything about *how* conversation history is kept. ``bot.py``
 only calls :func:`get_context` and :func:`commit_turn`; the DB layer only stores
 what it is handed. Nothing here imports ``bot``.
 
-Three responsibilities:
+Two responsibilities:
 
-1. **Serialization** — the Anthropic SDK returns pydantic content blocks, which
-   are not JSON-serializable. :func:`normalize_content` converts them to plain
-   dicts once, at append time, so the same representation serves both the API
-   and the database.
-2. **Safe truncation** — only the most recent window is sent to the API, but the
+1. **Safe truncation** — only the most recent window is sent to the API, but the
    cut must land on a real turn boundary. See :func:`trim_history`.
-3. **Persistence policy** — lazy per-chat loading, a write-through cache, and
+2. **Persistence policy** — lazy per-chat loading, a write-through cache, and
    the opt-out checks.
+
+Messages are Anthropic-shaped content blocks as plain dicts. ``llm.py``
+produces them already JSON-safe, so one representation serves both the next
+request and the database row; nothing here needs to convert them.
 
 The in-memory cache is per-process. That is fine for the current
 single-container deployment; a second replica would see stale caches and
@@ -27,7 +27,6 @@ import logging
 import os
 from collections.abc import Iterable
 from datetime import date, timedelta
-from typing import Any
 
 from .db.queries import (
     append_turn,
@@ -58,38 +57,6 @@ def _persistence_enabled_globally() -> bool:
         "0",
         "no",
     )
-
-
-# ---------------------------------------------------------------------------
-# Serialization
-# ---------------------------------------------------------------------------
-
-def normalize_content(content: Any) -> str | list[dict]:
-    """Convert Anthropic SDK content into plain JSON-serializable data.
-
-    ``response.content`` is a list of pydantic models (``TextBlock``,
-    ``ToolUseBlock``, ...). The Messages API accepts plain dicts on the way back
-    in, so normalizing here gives one representation for both the next request
-    and the database row.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-
-    blocks: list[dict] = []
-    for block in content:
-        if isinstance(block, dict):
-            blocks.append(block)
-        elif hasattr(block, "model_dump"):
-            # exclude_none drops nullable fields the API does not need echoed
-            # back; mode="json" guarantees primitives all the way down.
-            blocks.append(block.model_dump(mode="json", exclude_none=True))
-        elif hasattr(block, "to_dict"):
-            blocks.append(block.to_dict())
-        else:
-            raise TypeError(f"Cannot serialize content block of type {type(block)!r}")
-    return blocks
 
 
 # ---------------------------------------------------------------------------

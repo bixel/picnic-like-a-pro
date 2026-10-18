@@ -97,24 +97,6 @@ class TestAccessControl:
         assert bot._allowed_user_ids() == {123, 456}
 
 
-class TestAnthropicClient:
-    def test_client_is_built_from_env_key(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        assert bot._get_anthropic_client() is not None
-
-    def test_client_is_cached(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        assert bot._get_anthropic_client() is bot._get_anthropic_client()
-
-    def test_missing_api_key_raises(self, monkeypatch):
-        monkeypatch.setattr(bot, "_anthropic_client", None)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        with pytest.raises(KeyError):
-            bot._get_anthropic_client()
-
-
 class TestMcpToolWiring:
     async def test_get_mcp_tools_returns_schemas(self, monkeypatch):
         monkeypatch.setattr(bot, "_mcp_tools", None)
