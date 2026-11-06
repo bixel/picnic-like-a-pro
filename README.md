@@ -251,7 +251,14 @@ cd ~/picnic-bot
 docker compose run --rm picnic-bot import-history
 ```
 
-The import is resumable — if it is interrupted, re-run the same command and it will continue from where it left off. Depending on how many past deliveries you have, this may take a few minutes (the script waits 2 seconds between batches to respect Picnic's rate limits).
+The import is resumable — if it is interrupted, re-run the same command and it will continue with the deliveries that are still missing. Depending on how many past deliveries you have, this may take a few minutes (the script waits 2 seconds between batches to respect Picnic's rate limits).
+
+Re-run it whenever you want to pick up new deliveries: each run imports only the ones that have no order in the local database yet, so it is safe to run on a schedule (for example a weekly cron job), and it also retries deliveries that were still in progress last time. Cancelled deliveries are skipped, and a run that finds nothing new writes nothing to the database. With Docker Compose:
+
+```bash
+# e.g. every Monday at 07:00
+0 7 * * 1 cd ~/picnic-bot && docker compose run --rm picnic-bot import-history
+```
 
 ---
 
@@ -358,7 +365,7 @@ docker compose down -v
 # Open a shell inside the running container
 docker compose exec picnic-bot bash
 
-# Run the history import (one-off, safe to re-run)
+# Run the history import (safe to re-run; picks up new deliveries)
 docker compose run --rm picnic-bot import-history
 
 # Check how much disk the volume uses
@@ -397,7 +404,7 @@ docker system df -v | grep picnic-data
 
 ### History import fails partway through
 
-Re-run the same command — it resumes from the last checkpoint:
+Re-run the same command — deliveries already in the database are skipped, so it continues with the ones still missing:
 
 ```bash
 docker compose run --rm picnic-bot import-history

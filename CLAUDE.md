@@ -47,7 +47,7 @@ columns:
 | `Product` | `products` | Picnic product catalogue cache |
 | `Order` | `orders` | Delivery records |
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
-| `ImportCheckpoint` | `import_checkpoints` | Resumable import progress |
+| `ImportCheckpoint` | `import_checkpoints` | Import progress log, written only by runs that import something (what to import is read from `orders`) |
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
 | `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
 | `PicnicAuth` | `picnic_auth` | The Picnic session token (one row); a credential — never log it |
@@ -352,7 +352,7 @@ Copy `.env.example` to `.env` and fill in your values.
 uv sync                               # install dependencies
 uv run bot                            # start Telegram bot
 uv run mcp-server                     # start MCP server (stdio)
-uv run python scripts/import_history.py  # import Picnic delivery history
+uv run python scripts/import_history.py  # import new Picnic deliveries (re-runnable)
 uv run alembic upgrade head           # apply all pending migrations
 uv run alembic revision --autogenerate -m "msg"  # generate migration from model diff
 uv run alembic downgrade -1           # roll back one migration

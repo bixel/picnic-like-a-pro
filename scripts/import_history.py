@@ -1,12 +1,22 @@
-"""Stepwise, resumable import of Picnic delivery history into the local SQLite DB.
+"""Import Picnic delivery history into the local SQLite DB, resumably.
 
-Safe to run multiple times — each delivery is looked up by its Picnic id
-before anything is written, and skipped if already imported; the UNIQUE
-constraint on picnic_order_id is only the backstop.
+Safe to run any number of times, including on a schedule: what needs importing
+is decided by what the ``orders`` table already holds, not by how far an
+earlier run got, so each run adds the deliveries that are new since the last
+one and leaves the rest alone.  Each delivery is looked up by its Picnic id
+before anything is written; the UNIQUE constraint on picnic_order_id is only
+the backstop.
 
-A delivery that cannot be imported yet (still CURRENT, or its detail could not
-be fetched or was unusable) is deferred: the run does not mark the import
-finished and does not move the checkpoint past it, so the next run picks it up.
+Picnic returns the whole delivery list with the newest first, so a new delivery
+arrives *above* everything already imported — which is why the checkpoint's
+``last_delivery_id`` (the newest delivery a run imported) is a progress log
+only and never a resume position.  A checkpoint row is written only by runs
+that import something; an idle run writes nothing.
+
+Cancelled deliveries are left out of the work list.  A delivery that cannot be
+imported yet (still CURRENT, or its detail could not be fetched or was
+unusable) is deferred: it has no row in ``orders``, so a later run finds it
+again, and the run's checkpoint is not marked finished.
 
 Every run then looks up the category of each stored product that has none
 yet (delivery data carries no categories), including runs that find no new
@@ -106,16 +116,6 @@ async def import_deliveries() -> None:
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
-    async with db.get_db() as conn:
-        checkpoint = await db.get_latest_checkpoint(conn)
-
-    if checkpoint and checkpoint["finished"]:
-        print("Import already complete (checkpoint marked finished). Nothing to do.")
-        return
-
-    already_imported = checkpoint["total_imported"] if checkpoint else 0
-    resume_after_id = checkpoint["last_delivery_id"] if checkpoint else None
-
     print("Fetching delivery list from Picnic...")
     try:
         all_deliveries = await picnic.get_deliveries()
@@ -129,69 +129,63 @@ async def import_deliveries() -> None:
         print(f"Unexpected response format: {type(all_deliveries)}", file=sys.stderr)
         sys.exit(1)
 
-    total = len(all_deliveries)
-    print(f"Found {total} deliveries. {already_imported} already imported.")
+    async with db.get_db() as conn:
+        imported_ids = await db.get_picnic_order_ids(conn)
 
-    if already_imported >= total:
+    # What to import is decided by `orders`, not by the checkpoint: Picnic hands
+    # back the whole list newest-first, so a delivery ordered since the last run
+    # sits above everything that run imported.  This also covers a run that was
+    # interrupted between a commit and its batch checkpoint.
+    #
+    # Statuses are sorted out here rather than in the loop: a cancelled
+    # delivery never gets a row in `orders`, so if it went into `pending` it
+    # would be "new" on every run and the run would never find nothing to do.
+    pending: list[dict] = []
+    cancelled = 0
+    deferred = 0   # still CURRENT now; failed fetches are added in the loop
+    for summary in all_deliveries:
+        delivery_id = picnic.delivery_id(summary)
+        if not delivery_id or delivery_id in imported_ids:
+            continue
+        status = (summary.get("status") or "").upper()
+        if status in SKIP_STATUSES:
+            cancelled += 1
+        elif status in DEFER_STATUSES:
+            deferred += 1
+        else:
+            pending.append(summary)
+
+    print(
+        f"Found {len(all_deliveries)} deliveries: {len(imported_ids)} already imported, "
+        f"{len(pending)} to import, {cancelled} cancelled, {deferred} still in progress."
+    )
+
+    if not pending:
+        # No checkpoint row: an idle run (e.g. a scheduled one) leaves the
+        # database untouched, so `import_checkpoints` only grows with imports.
         print("Nothing new to import.")
-        async with db.get_db() as conn:
-            await db.save_checkpoint(conn, last_delivery_id=resume_after_id, total_imported=already_imported, finished=True)
+        if deferred:
+            print(f"{deferred} delivery(ies) still in progress — a later run will import them.")
         return
 
-    # Skip already-imported deliveries if resuming
-    remaining = all_deliveries
-    if resume_after_id:
-        ids = [picnic.delivery_id(d) for d in all_deliveries]
-        try:
-            skip_idx = ids.index(resume_after_id) + 1
-            remaining = all_deliveries[skip_idx:]
-            print(f"Resuming from checkpoint (last: {resume_after_id})")
-        except ValueError:
-            print(f"Checkpoint delivery ID {resume_after_id!r} not found in list; starting from beginning.")
+    num_batches = (len(pending) + batch_size - 1) // batch_size
+    total_imported = len(imported_ids)
+    imported_this_run = 0
+    last_delivery_id: str | None = None
 
-    num_batches = (len(remaining) + batch_size - 1) // batch_size
-    batch_num = 0
-    last_delivery_id = resume_after_id
-    total_imported = already_imported
-    # Once a delivery is deferred, the checkpoint must not move past it, or a
-    # resumed run would never see it again.
-    deferred = 0
-
-    def settled(did: str) -> None:
-        nonlocal last_delivery_id
-        if not deferred:
-            last_delivery_id = did
-
-    for i in range(0, len(remaining), batch_size):
-        batch = remaining[i : i + batch_size]
-        batch_num += 1
-        start = already_imported + i + 1
-        end = already_imported + i + len(batch)
-        print(f"\nBatch {batch_num}/{num_batches} (deliveries {start}–{end})...", end="  ", flush=True)
+    for i in range(0, len(pending), batch_size):
+        batch = pending[i : i + batch_size]
+        batch_num = i // batch_size + 1
+        end = i + len(batch)
+        print(
+            f"\nBatch {batch_num}/{num_batches} (deliveries {i + 1}–{end} of {len(pending)})...",
+            end="  ",
+            flush=True,
+        )
 
         imported_in_batch = 0
         for delivery_summary in batch:
             delivery_id = picnic.delivery_id(delivery_summary)
-            if not delivery_id:
-                continue
-
-            status = (delivery_summary.get("status") or "").upper()
-            if status in SKIP_STATUSES:
-                print(f"\n  Skipping {status.lower()} delivery {delivery_id}")
-                settled(delivery_id)
-                continue
-            if status in DEFER_STATUSES:
-                print(f"\n  Deferring {status.lower()} delivery {delivery_id} to a later run")
-                deferred += 1
-                continue
-
-            async with db.get_db() as conn:
-                already_there = await db.get_order_id(conn, delivery_id) is not None
-            if already_there:
-                # Committed by an earlier run that stopped before its batch
-                # checkpoint; inserting its items again would double them.
-                settled(delivery_id)
-                continue
 
             try:
                 detail = await picnic.get_delivery(delivery_id)
@@ -201,7 +195,7 @@ async def import_deliveries() -> None:
                 continue
 
             # Parsed before opening a session: an unusable detail must leave
-            # no row behind, or the check above would skip it forever.
+            # no row behind, or it would drop out of `pending` for good.
             reason = picnic.delivery_unusable_reason(detail)
             if reason:
                 print(f"\n  Warning: deferring delivery {delivery_id}: {reason}")
@@ -211,6 +205,13 @@ async def import_deliveries() -> None:
             items = picnic.delivery_line_items(detail)
 
             async with db.get_db() as conn:
+                # `pending` already excludes what was in `orders` when this run
+                # started; this guards against an overlapping run (e.g. two
+                # cron jobs) that imported it since — inserting its items again
+                # would double them.  The UNIQUE constraint is the backstop.
+                if await db.get_order_id(conn, delivery_id) is not None:
+                    continue
+
                 order_id = await db.insert_order(
                     conn,
                     picnic_order_id=delivery_id,
@@ -230,35 +231,41 @@ async def import_deliveries() -> None:
                 await conn.commit()
 
             imported_in_batch += 1
-            settled(delivery_id)
+            last_delivery_id = delivery_id
 
         total_imported += imported_in_batch
+        imported_this_run += imported_in_batch
         print(f"imported {imported_in_batch}", end="")
 
-        # Save checkpoint after each batch
-        async with db.get_db() as conn:
-            await db.save_checkpoint(
-                conn,
-                last_delivery_id=last_delivery_id,
-                total_imported=total_imported,
-            )
+        # Checkpoint after each batch that imported something
+        if imported_in_batch:
+            async with db.get_db() as conn:
+                await db.save_checkpoint(
+                    conn,
+                    last_delivery_id=last_delivery_id,
+                    total_imported=total_imported,
+                )
 
-        if i + batch_size < len(remaining):
+        if end < len(pending):
             print(f"  [sleeping {delay_seconds}s]", flush=True)
             await asyncio.sleep(delay_seconds)
         else:
             print()
 
     # Mark as finished, unless something was deferred to the next run
-    async with db.get_db() as conn:
-        await db.save_checkpoint(
-            conn,
-            last_delivery_id=last_delivery_id,
-            total_imported=total_imported,
-            finished=not deferred,
-        )
+    if imported_this_run:
+        async with db.get_db() as conn:
+            await db.save_checkpoint(
+                conn,
+                last_delivery_id=last_delivery_id,
+                total_imported=total_imported,
+                finished=not deferred,
+            )
 
-    print(f"\nDone. Total deliveries imported: {total_imported}")
+    print(
+        f"\nDone. Imported {imported_this_run} new delivery(ies); "
+        f"{total_imported} in the database."
+    )
     if deferred:
         print(f"{deferred} delivery(ies) deferred — run the import again later to pick them up.")
 

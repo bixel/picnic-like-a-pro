@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import func, select
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.models import Order, OrderItem
+from picnic_meal_planner.db.models import ImportCheckpoint, Order, OrderItem
 from picnic_meal_planner.picnic import client as picnic
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "import_history.py"
@@ -95,7 +95,7 @@ async def test_current_delivery_is_imported_by_a_later_run(fake_picnic):
     assert await _orders() == {"d2": 1}
     checkpoint = await _checkpoint()
     assert not checkpoint["finished"]
-    assert checkpoint["last_delivery_id"] is None   # never past the deferred one
+    assert checkpoint["total_imported"] == 1
 
     fake_picnic["summaries"][0]["status"] = "COMPLETED"
     await import_history.main()
@@ -104,13 +104,99 @@ async def test_current_delivery_is_imported_by_a_later_run(fake_picnic):
     assert (await _checkpoint())["finished"]
 
 
+async def test_new_delivery_is_imported_after_a_finished_run(fake_picnic, capsys):
+    fake_picnic["summaries"] = [
+        {"id": "d1", "status": "COMPLETED"},
+        {"id": "d0", "status": "COMPLETED"},
+    ]
+    fake_picnic["details"] = {"d0": _detail("d0"), "d1": _detail("d1")}
+    await import_history.main()
+    assert await _orders() == {"d0": 1, "d1": 1}
+    assert (await _checkpoint())["finished"]
+
+    # A delivery placed since the last run arrives at the top of the list, as
+    # Picnic returns it, and the older ones are not fetched again.
+    fake_picnic["summaries"].insert(0, {"id": "d2", "status": "COMPLETED"})
+    fake_picnic["details"] = {"d2": _detail("d2")}
+    capsys.readouterr()
+    await import_history.main()
+
+    assert "Imported 1 new delivery(ies); 3 in the database." in capsys.readouterr().out
+    assert await _orders() == {"d0": 1, "d1": 1, "d2": 1}
+    checkpoint = await _checkpoint()
+    assert checkpoint["finished"]
+    assert checkpoint["total_imported"] == 3
+
+
+async def test_nothing_new_is_reported_without_fetching_details(fake_picnic, capsys):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    await import_history.main()
+
+    fake_picnic["details"] = {}   # a second fetch of d1 would raise KeyError
+    await import_history.main()
+
+    assert "Nothing new to import." in capsys.readouterr().out
+    assert await _orders() == {"d1": 1}
+
+
+async def test_cancelled_delivery_does_not_count_as_new(fake_picnic, capsys):
+    fake_picnic["summaries"] = [
+        {"id": "d2", "status": "COMPLETED"},
+        {"id": "d1", "status": "CANCELLED"},
+    ]
+    fake_picnic["details"] = {"d2": _detail("d2")}
+    await import_history.main()
+
+    fake_picnic["details"] = {}   # any fetch would raise KeyError
+    capsys.readouterr()
+    await import_history.main()
+
+    out = capsys.readouterr().out
+    assert "0 to import, 1 cancelled" in out
+    assert "Nothing new to import." in out
+    assert await _orders() == {"d2": 1}
+
+
+async def test_idle_run_writes_no_checkpoint(fake_picnic):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    await import_history.main()
+    first = await _checkpoint()
+
+    await import_history.main()
+
+    async with db.get_db() as conn:
+        rows = await conn.scalar(select(func.count(ImportCheckpoint.id)))
+    assert (await _checkpoint())["id"] == first["id"]
+    assert rows == 2   # one batch checkpoint + the finished one, both from run 1
+
+
+async def test_only_in_progress_left_is_nothing_new(fake_picnic, capsys):
+    fake_picnic["summaries"] = [
+        {"id": "d2", "status": "CURRENT"},
+        {"id": "d1", "status": "COMPLETED"},
+    ]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    await import_history.main()
+    assert not (await _checkpoint())["finished"]
+
+    capsys.readouterr()
+    await import_history.main()
+
+    out = capsys.readouterr().out
+    assert "Nothing new to import." in out
+    assert "1 delivery(ies) still in progress" in out
+    assert not (await _checkpoint())["finished"]   # never claimed finished
+
+
 async def test_error_detail_is_not_stored_and_is_retried(fake_picnic):
     fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
     fake_picnic["details"] = {"d1": {"error": {"code": "DELIVERY_NOT_FOUND"}}}
     await import_history.main()
 
     assert await _orders() == {}
-    assert not (await _checkpoint())["finished"]
+    assert await _checkpoint() is None   # nothing imported, nothing logged
 
     fake_picnic["details"]["d1"] = _detail("d1")
     await import_history.main()
@@ -121,7 +207,8 @@ async def test_fetch_failure_is_retried(fake_picnic):
     fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
     fake_picnic["details"] = {"d1": ConnectionError("boom")}
     await import_history.main()
-    assert not (await _checkpoint())["finished"]
+    assert await _orders() == {}
+    assert await _checkpoint() is None
 
     fake_picnic["details"]["d1"] = _detail("d1")
     await import_history.main()

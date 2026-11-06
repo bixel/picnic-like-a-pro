@@ -126,8 +126,8 @@ picnic-like-a-pro/
 │           └── engine.py       # Order frequency analysis + forecasting
 │
 ├── scripts/
-│   ├── import_history.py       # Optional stepwise import of Picnic delivery
-│   │                           # history (resumable, rate-limit safe)
+│   ├── import_history.py       # Incremental import of Picnic delivery history
+│   │                           # (re-runnable, rate-limit safe)
 │   ├── chat_model.py           # List / set / reset each chat's LLM model
 │   ├── picnic_login.py         # Interactive Picnic login (2FA); stores the session
 │   └── preflight.py            # Config + live API checks before `uv run bot`
@@ -237,16 +237,17 @@ Line items for each order. Core table for forecasting.
 | unit_price | INTEGER | price at time of order (cents) |
 
 ### `import_checkpoints`
-Tracks progress of the stepwise history import so it can be paused and resumed
-without re-fetching already-imported deliveries or hammering the Picnic API.
+A log of history-import progress: one row per batch that imported something,
+plus one when such a run ends.  Runs that import nothing write no row.  What to
+import is read from `orders`, not from here.
 
 | Column        | Type    | Notes                                   |
 |---------------|---------|-----------------------------------------|
 | id            | INTEGER PK AUTOINCREMENT |                        |
-| last_delivery_id | TEXT | Picnic delivery ID of the last successfully imported delivery |
+| last_delivery_id | TEXT | Newest Picnic delivery ID that run imported (a log, never a resume position) |
 | imported_at   | TEXT    | ISO datetime of the import run          |
-| total_imported | INTEGER | Cumulative count of deliveries imported |
-| finished      | INTEGER | 0 = more pages remain, 1 = fully done   |
+| total_imported | INTEGER | Number of deliveries stored locally after that run |
+| finished      | INTEGER | 0 = something was deferred by that run, 1 = nothing left to import |
 
 ### `conversation_messages`
 Per-chat conversation history with Claude. Messages are grouped into **turns**
@@ -463,51 +464,67 @@ Run with:
 uv sync
 uv run bot          # start the Telegram bot
 uv run mcp-server   # start MCP server standalone (for Claude Desktop)
-uv run import-history  # one-time: pull real history from Picnic
+uv run import-history  # pull history from Picnic (re-run for new deliveries)
 ```
 
 ---
 
 ## History Import Script
 
-`scripts/import_history.py` is **optional** and designed to be safe to run multiple
-times. It works in pages so you can stop and resume at any point.
+`scripts/import_history.py` is **optional** and safe to run any number of times,
+including on a schedule: each run imports the deliveries that are new since the
+last one.
 
 ### How it works
-1. On first run, fetches the full list of past Picnic deliveries (summary only).
-2. Iterates in batches of `IMPORT_BATCH_SIZE` (default 10), fetching line items for
-   each delivery and inserting into `orders` + `order_items`.
-3. After each batch it writes a checkpoint (`import_checkpoints` table) with the last
-   processed delivery ID and sleeps `IMPORT_DELAY_SECONDS` (default 2 s).
-4. On subsequent runs it reads the checkpoint and skips already-imported deliveries.
-5. Duplicate prevention: a delivery whose `picnic_order_id` is already in `orders`
-   is skipped before its items are written, so a run interrupted between a commit
-   and its batch checkpoint does not double those items on resume. The UNIQUE
+1. Every run fetches the full list of past Picnic deliveries (summary only) and
+   the set of `picnic_order_id`s already in `orders`.
+2. The deliveries with no row in `orders` are the work list — **not** the ones
+   after the checkpoint's `last_delivery_id`. Picnic returns the list
+   newest-first, so a new delivery appears *above* everything an earlier run
+   imported and a positional resume would never see it. Cancelled and
+   still-`CURRENT` deliveries are counted and left out of the work list up
+   front; a cancelled one never gets a row, so otherwise it would be "new" on
+   every run.
+3. Iterates the work list in batches of `IMPORT_BATCH_SIZE` (default 10), fetching
+   line items for each delivery and inserting into `orders` + `order_items`.
+4. After each batch that imported something it writes a checkpoint
+   (`import_checkpoints` table) with the newest delivery it imported, and sleeps
+   `IMPORT_DELAY_SECONDS` (default 2 s) between batches. The checkpoint is a
+   progress log: what to import is read from `orders`.
+5. Duplicate prevention: the work list excludes everything already in `orders`,
+   which covers a run interrupted between a commit and its batch checkpoint.
+   Inside the insert's session the script checks `orders` once more, against an
+   overlapping run that imported the same delivery meanwhile. The UNIQUE
    constraint on `picnic_order_id` remains the backstop.
 6. Cancelled deliveries are skipped for good. A delivery that cannot be imported
    *yet* — still `CURRENT`, a failed fetch, or a detail that
    `picnic.client.delivery_unusable_reason()` rejects (error body, no order time,
-   no order lines) — is **deferred**: nothing is written for it, the checkpoint
-   never moves past it, and the run is not marked finished, so the next run
-   rescans and picks it up. Step 5 makes that rescan cheap.
+   no order lines) — is **deferred**: nothing is written for it, so it has no row
+   in `orders` and the next run retries it; the run is not marked finished.
 7. Line items come from `picnic.client.delivery_line_items()`, which flattens the
    real API's `orders → ORDER_LINE → ORDER_ARTICLE` nesting (count from the
    `QUANTITY` decorator, unit price from the line price) as well as the mock's
    flat shape.
-8. Prints a progress summary after each batch and a final total on completion.
+8. Prints a progress summary after each batch and, at the end, how many
+   deliveries this run imported and how many the database now holds.
+9. When nothing is new it prints "Nothing new to import.", writes **no**
+   checkpoint (so a scheduled run leaves the database untouched) and moves on to
+   the category backfill.
 
 ```
 $ uv run import-history
 Fetching delivery list from Picnic...
-Found 47 deliveries. 0 already imported.
+Found 47 deliveries: 0 already imported, 47 to import, 0 cancelled, 0 still in progress.
 
-Batch 1/5 (deliveries 1–10)...  imported 10  [sleeping 2s]
-Batch 2/5 (deliveries 11–20)... imported 10  [sleeping 2s]
+Batch 1/5 (deliveries 1–10 of 47)...  imported 10  [sleeping 2s]
+Batch 2/5 (deliveries 11–20 of 47)... imported 10  [sleeping 2s]
 ^C   ← safe to interrupt here
 
-$ uv run import-history      ← resumes from batch 2
-Resuming from checkpoint (last: DEL-20241105-abc123)
-Batch 3/5 ...
+$ uv run import-history      ← resumes with the 27 that still have no row
+Found 47 deliveries: 20 already imported, 27 to import, 0 cancelled, 0 still in progress.
+
+Batch 1/3 (deliveries 1–10 of 27)... imported 10  [sleeping 2s]
+...
 ```
 
 ---
@@ -518,7 +535,7 @@ Batch 3/5 ...
 - `pyproject.toml` + `uv` setup
 - `db/schema.py` — all CREATE TABLE statements including `import_checkpoints`
 - `db/queries.py` — async helpers for all tables
-- `scripts/import_history.py` — stepwise, resumable import of real Picnic history
+- `scripts/import_history.py` — incremental, resumable import of real Picnic history
 
 ### Phase 2 — MCP server
 - `picnic/client.py` — authenticated Picnic wrapper
