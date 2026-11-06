@@ -202,6 +202,14 @@ async def get_order_id(session: AsyncSession, picnic_order_id: str) -> int | Non
     )
 
 
+async def get_picnic_order_ids(session: AsyncSession) -> set[str]:
+    """Return the Picnic delivery id of every order already imported."""
+    result = await session.scalars(
+        select(Order.picnic_order_id).where(Order.picnic_order_id.is_not(None))
+    )
+    return set(result.all())
+
+
 async def insert_order_item(
     session: AsyncSession,
     *,

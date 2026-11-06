@@ -95,13 +95,47 @@ async def test_current_delivery_is_imported_by_a_later_run(fake_picnic):
     assert await _orders() == {"d2": 1}
     checkpoint = await _checkpoint()
     assert not checkpoint["finished"]
-    assert checkpoint["last_delivery_id"] is None   # never past the deferred one
+    assert checkpoint["total_imported"] == 1
 
     fake_picnic["summaries"][0]["status"] = "COMPLETED"
     await import_history.main()
 
     assert await _orders() == {"d2": 1, "d3": 1}    # d2 not doubled
     assert (await _checkpoint())["finished"]
+
+
+async def test_new_delivery_is_imported_after_a_finished_run(fake_picnic):
+    fake_picnic["summaries"] = [
+        {"id": "d1", "status": "COMPLETED"},
+        {"id": "d0", "status": "COMPLETED"},
+    ]
+    fake_picnic["details"] = {"d0": _detail("d0"), "d1": _detail("d1")}
+    await import_history.main()
+    assert await _orders() == {"d0": 1, "d1": 1}
+    assert (await _checkpoint())["finished"]
+
+    # A delivery placed since the last run arrives at the top of the list, as
+    # Picnic returns it, and the older ones are not fetched again.
+    fake_picnic["summaries"].insert(0, {"id": "d2", "status": "COMPLETED"})
+    fake_picnic["details"] = {"d2": _detail("d2")}
+    await import_history.main()
+
+    assert await _orders() == {"d0": 1, "d1": 1, "d2": 1}
+    checkpoint = await _checkpoint()
+    assert checkpoint["finished"]
+    assert checkpoint["total_imported"] == 3
+
+
+async def test_nothing_new_is_reported_without_fetching_details(fake_picnic, capsys):
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    await import_history.main()
+
+    fake_picnic["details"] = {}   # a second fetch of d1 would raise KeyError
+    await import_history.main()
+
+    assert "Nothing new to import." in capsys.readouterr().out
+    assert await _orders() == {"d1": 1}
 
 
 async def test_error_detail_is_not_stored_and_is_retried(fake_picnic):

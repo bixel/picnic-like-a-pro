@@ -152,6 +152,19 @@ class TestGetOrderId:
         assert await db.get_order_id(db_session, "never_imported") is None
 
 
+class TestGetPicnicOrderIds:
+    async def test_returns_every_imported_picnic_id(self, db_session):
+        await db.insert_order(db_session, picnic_order_id="d1", ordered_at=_now_iso())
+        await db.insert_order(db_session, picnic_order_id="d2", ordered_at=_now_iso())
+        await db.insert_order(db_session, ordered_at=_now_iso())  # no picnic id
+        await db_session.commit()
+
+        assert await db.get_picnic_order_ids(db_session) == {"d1", "d2"}
+
+    async def test_empty_database_returns_empty_set(self, db_session):
+        assert await db.get_picnic_order_ids(db_session) == set()
+
+
 class TestInsertOrderItem:
     async def test_insert_order_item(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)
