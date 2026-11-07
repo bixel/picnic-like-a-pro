@@ -94,6 +94,14 @@ CATALOG: list[dict] = [
 
 _CATALOG_BY_ID: dict[str, dict] = {p["id"]: p for p in CATALOG}
 
+# Mock (l1_id, l2_id, l3_id) per category name, mirroring the deep link on a
+# real product page's category button.
+_CATEGORY_IDS: dict[str, tuple[int, int, int]] = {
+    name: (1000 + n, 2000 + n, 3000 + n)
+    for n, name in enumerate(dict.fromkeys(p["category"] for p in CATALOG))
+}
+_CATEGORY_BY_IDS = {(l2, l3): name for name, (_, l2, l3) in _CATEGORY_IDS.items()}
+
 CATEGORIES: list[dict] = [
     {"id": "cat_dairy",     "name": "Zuivel, Eieren & Boter",  "depth": 0},
     {"id": "cat_bread",     "name": "Brood & Banket",           "depth": 0},
@@ -240,9 +248,22 @@ class MockPicnicAPI:
         if product is None:
             return None
         article = {k: v for k, v in product.items() if k != "category"}
+        l1_id, l2_id, l3_id = _CATEGORY_IDS[product["category"]]
+        article["category_ids"] = [l1_id, l2_id, l3_id]
         if add_category:
-            article["category"] = {"name": product["category"]}
+            article["category"] = self.get_category_by_ids(l2_id, l3_id)
         return article
+
+    def get_category_by_ids(self, l2_id: int, l3_id: int) -> dict:
+        name = _CATEGORY_BY_IDS.get((l2_id, l3_id))
+        if name is None:
+            from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
+
+            raise PicnicParseError(
+                "Could not find category with specified IDs",
+                endpoint="L2-category-page-root",
+            )
+        return {"l2_id": l2_id, "l3_id": l3_id, "name": name}
 
     # -- Cart ----------------------------------------------------------
 

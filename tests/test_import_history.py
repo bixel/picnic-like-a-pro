@@ -45,10 +45,12 @@ def fake_picnic(monkeypatch):
             raise detail
         return detail
 
-    async def get_product_category(product_id):
+    async def get_product_category(product_id, known_names=None):
         category = state["categories"].get(product_id)
         if isinstance(category, Exception):
             raise category
+        if isinstance(category, str):
+            category = {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": category}
         return category
 
     monkeypatch.setattr(picnic, "get_deliveries", get_deliveries)
@@ -227,6 +229,9 @@ async def test_categories_are_filled_in(fake_picnic):
     await import_history.main()
     assert await _orders() == {"d1": 1}
     assert await _category("p_milk") == "Milch"
+    async with db.get_db() as conn:
+        assert (await db.get_product(conn, "p_milk"))["category_id"] == 3
+        assert await db.get_category_names(conn) == {3: "Milch"}
 
 
 async def test_categories_are_backfilled_after_a_finished_import(fake_picnic):

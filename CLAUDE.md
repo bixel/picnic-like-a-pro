@@ -44,7 +44,8 @@ columns:
 
 | Model | Table | Notes |
 |---|---|---|
-| `Product` | `products` | Picnic product catalogue cache |
+| `Product` | `products` | Picnic product catalogue cache; `category` (L3 name) + `category_id` → `categories` |
+| `Category` | `categories` | Picnic leaf (L3) categories: id = L3 id, plus `l2_id`, `l1_id`, `name` |
 | `Order` | `orders` | Delivery records |
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
 | `ImportCheckpoint` | `import_checkpoints` | Import progress log, written only by runs that import something (what to import is read from `orders`) |
@@ -78,6 +79,7 @@ Alembic manages all schema changes.
 | `alembic/versions/0005_*.py` | API request log (`api_requests`) — purely additive |
 | `alembic/versions/0006_*.py` | HTTP method, URL and headers on `api_requests` — purely additive |
 | `alembic/versions/0007_*.py` | `api_requests.chat_id` for consent-aware deletion — purely additive |
+| `alembic/versions/0008_*.py` | Category ids (`categories`, `products.category_id`) — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -139,11 +141,24 @@ idempotent for re-imports.
   except that a `None` category keeps the stored one.  Search tiles and
   delivery articles carry no category, and Picnic removed both category
   endpoints (`get_categories`, `get_article_category`), so
-  `scripts/import_history.py` fills `products.category` afterwards via
-  `client.get_product_category()` (`get_article(id, add_category=True)`, two
-  requests per product), on every run, for products that still have none.
-  The `get_categories` MCP tool lists these local categories (and, given a
-  name, the products in one); there is no live category listing any more.
+  `scripts/import_history.py` fills the category afterwards via
+  `client.get_product_category()`, on every run, for products whose
+  `category_id` is still NULL (including rows that only have a name).
+- **Category structure** (from `python-picnic-api2`): the product page's
+  `category-button` links to `app.picnic://categories/{l1}/l2/{l2}/l3/{l3}`
+  — a three-level tree.  The library parses all three ids but keeps only
+  l2/l3; the name is the L3 sub-header
+  (`vertical-article-tiles-sub-header-{l3}`) on
+  `/pages/L2-category-page-root?category_id={l2}&l3_category_id={l3}`.
+  So a lookup is one request for the product page, plus one L2 page only if
+  the L3 name is not known yet; every L3 header on a fetched L2 page is
+  cached, so sibling categories are free.  Where the L2/L1 *names* live is
+  not known yet — `scripts/inspect_category.py <product_id> --save DIR`
+  dumps the pages to find out.
+- L3 names are **not unique** (e.g. "Alkoholfrei" under several L2s), so
+  `categories` is keyed by L3 id.  The `get_categories` MCP tool lists the
+  local categories with their ids and, given a name or `category_id`, the
+  products in one; there is no live category listing any more.
 - `insert_order`: conflict-do-nothing on `picnic_order_id`; returns the
   existing row's id when the row already exists.
 
@@ -425,4 +440,5 @@ uv run python scripts/chat_model.py list          # per-chat models
 uv run python scripts/chat_model.py set <chat_id> <model>
 uv run python scripts/picnic_login.py             # log in to Picnic (2FA), store the session
 uv run python scripts/picnic_login.py --status    # is the stored session valid?
+uv run python scripts/inspect_category.py <product_id> [--save DIR]  # dump category pages
 ```

@@ -80,31 +80,74 @@ class TestSearchProducts:
 
 class TestGetProductCategory:
     async def test_mock_product(self):
-        assert await picnic.get_product_category("p_milk_whole") == "Zuivel, Eieren & Boter"
+        category = await picnic.get_product_category("p_milk_whole")
+        assert category["name"] == "Zuivel, Eieren & Boter"
+        assert {"l1_id", "l2_id", "l3_id"} <= category.keys()
 
     async def test_unknown_product_is_none(self):
         assert await picnic.get_product_category("p_nonexistent") is None
 
-    async def test_reads_the_typed_article(self, monkeypatch):
+    async def test_reads_ids_from_the_page_and_names_siblings(self, monkeypatch):
         from python_picnic_api2.models import Article, Category
+
+        product_page = {"children": [{"id": "category-button", "pml": {"component": {
+            "onPress": {"actionType": "OPEN", "target": "app.picnic://categories/10/l2/20/l3/30"},
+        }}}]}
+        l2_page = {"children": [
+            {"id": f"vertical-article-tiles-sub-header-{l3}",
+             "pml": {"component": {"accessibilityLabel": name}}}
+            for l3, name in ((30, "Alkoholfrei"), (31, "Pils"))
+        ]}
+        calls = []
 
         class Api:
             def get_article(self, article_id, add_category=False):
-                assert add_category
-                return Article(id=article_id, category=Category(l2_id=1, l3_id=2, name="Koffiebonen"))
+                calls.append("article")
+                return Article(id=article_id, raw=product_page)
+
+            def get_category_by_ids(self, l2_id, l3_id):
+                calls.append(("l2", l2_id, l3_id))
+                return Category(l2_id=l2_id, l3_id=l3_id, name="Alkoholfrei", raw=l2_page)
 
         monkeypatch.setattr(picnic, "_client", Api())
-        assert await picnic.get_product_category("s1") == "Koffiebonen"
+        known: dict[int, str] = {}
+        assert await picnic.get_product_category("s1", known) == {
+            "l1_id": 10, "l2_id": 20, "l3_id": 30, "name": "Alkoholfrei",
+        }
+        assert known == {30: "Alkoholfrei", 31: "Pils"}
+        assert calls == ["article", ("l2", 20, 30)]
 
-    async def test_page_without_category_is_none(self, monkeypatch):
+        # A known L3 costs one request.
+        calls.clear()
+        assert (await picnic.get_product_category("s2", known))["name"] == "Alkoholfrei"
+        assert calls == ["article"]
+
+    async def test_page_without_category_button_is_none(self, monkeypatch):
+        from python_picnic_api2.models import Article
+
+        class Api:
+            def get_article(self, article_id, add_category=False):
+                return Article(id=article_id, raw={"children": []})
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_product_category("s1") is None
+
+    async def test_unparseable_page_is_none(self, monkeypatch):
         from python_picnic_api2 import PicnicParseError
 
         class Api:
             def get_article(self, article_id, add_category=False):
-                raise PicnicParseError("no category button", endpoint="product-details-page-root")
+                raise PicnicParseError("no page", endpoint="product-details-page-root")
 
         monkeypatch.setattr(picnic, "_client", Api())
         assert await picnic.get_product_category("s1") is None
+
+    async def test_missing_l3_on_the_l2_page_is_none(self, monkeypatch):
+        from python_picnic_api2 import PicnicParseError
+
+        monkeypatch.setattr(picnic._client, "get_category_by_ids", lambda l2, l3: (_ for _ in ()).throw(
+            PicnicParseError("Could not find category", endpoint="L2-category-page-root")))
+        assert await picnic.get_product_category("p_milk_whole") is None
 
 
 class TestGetCart:

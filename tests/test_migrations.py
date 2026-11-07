@@ -117,6 +117,7 @@ class TestMigrationRuns:
             "chat_settings",
             "picnic_auth",
             "api_requests",
+            "categories",
         }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):

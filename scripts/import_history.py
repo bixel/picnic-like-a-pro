@@ -19,9 +19,11 @@ imported yet (still CURRENT, or its detail could not be fetched or was
 unusable) is deferred: it has no row in ``orders``, so a later run finds it
 again, and the run's checkpoint is not marked finished.
 
-Every run then looks up the category of each stored product that has none
-yet (delivery data carries no categories), including runs that find no new
-deliveries.  A product Picnic no longer lists is retried on the next run.
+Every run then looks up the category (its L1/L2/L3 ids and L3 name) of each
+stored product whose category id is not known yet (delivery data carries no
+categories), including runs that find no new deliveries.  That costs one
+request per product, plus one per L2 category page whose L3 names are not
+known yet.  A product Picnic no longer lists is retried on the next run.
 
 Every Picnic HTTP request is recorded in the ``api_requests`` table by
 ``picnic/client.py`` (best-effort; method, full URL, headers and the full
@@ -84,12 +86,15 @@ async def main() -> None:
 
 
 async def backfill_categories() -> None:
-    """Fill in the category of every stored product that has none."""
+    """Fill in the category of every stored product without a category id."""
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
     async with db.get_db() as conn:
         product_ids = await db.products_without_category(conn)
+        # {l3_id: name}; grows with every L2 page fetched, so a product whose
+        # L3 is already named costs one request instead of two.
+        known_names = await db.get_category_names(conn)
     if not product_ids:
         return
     print(f"\nLooking up categories for {len(product_ids)} product(s)...")
@@ -97,10 +102,10 @@ async def backfill_categories() -> None:
     found = 0
     login_error = None
     for i in range(0, len(product_ids), batch_size):
-        categories: dict[str, str] = {}
+        categories: dict[str, dict] = {}
         for product_id in product_ids[i : i + batch_size]:
             try:
-                category = await picnic.get_product_category(product_id)
+                category = await picnic.get_product_category(product_id, known_names)
             except (picnic.PicnicLoginRequired, picnic.PicnicLoginPending) as exc:
                 login_error = exc
                 break

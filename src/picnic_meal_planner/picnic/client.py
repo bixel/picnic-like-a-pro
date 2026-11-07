@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import MutableMapping
 from typing import Any
 
 from .. import api_log
@@ -254,26 +255,90 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
     return items
 
 
-async def get_product_category(product_id: str) -> str | None:
-    """Return the name of a product's (L3) category, or ``None`` if unknown.
+def _category_ids(article) -> tuple[int | None, int, int] | None:
+    """``(l1_id, l2_id, l3_id)`` from a product page, or ``None``.
 
-    Neither search tiles nor delivery articles carry a category, and the
-    per-article category endpoint is gone, so this loads the product page and
-    then its category page: two requests per product.  ``None`` means Picnic
-    has no page for the product any more, or the page has no category button.
-    Login errors propagate.
+    The page's category button links to
+    ``app.picnic://categories/{l1}/l2/{l2}/l3/{l3}``.
+    """
+    if isinstance(article, dict):  # the mock client
+        ids = article.get("category_ids")
+        return tuple(ids) if ids else None
+    from python_picnic_api2.models import Article  # noqa: PLC0415
+
+    raw = getattr(article, "raw", None)
+    return Article.category_ids_from_page(raw) if isinstance(raw, dict) else None
+
+
+_L3_HEADER_PREFIX = "vertical-article-tiles-sub-header-"
+
+
+def l3_names_on_page(page) -> dict[int, str]:
+    """``{l3_id: name}`` for every L3 sub-header on an L2 category page.
+
+    The page lists its L3 categories under headers with the id
+    ``vertical-article-tiles-sub-header-{l3_id}``, labelled with the name.
+    """
+    if not isinstance(page, dict):
+        return {}
+    from python_picnic_api2.models import pml  # noqa: PLC0415
+
+    names: dict[int, str] = {}
+    for node in pml.find_all(page, id_prefix=_L3_HEADER_PREFIX):
+        suffix = node["id"][len(_L3_HEADER_PREFIX):]
+        label = pml.accessibility_label(node)
+        if suffix.isdigit() and label:
+            names[int(suffix)] = label
+    return names
+
+
+async def get_product_category(
+    product_id: str, known_names: MutableMapping[int, str] | None = None
+) -> dict | None:
+    """Return a product's (L3) category, or ``None`` if unknown.
+
+    The result is ``{"l1_id", "l2_id", "l3_id", "name"}``.  Neither search
+    tiles nor delivery articles carry a category, and the per-article
+    category endpoint is gone, so this loads the product page, whose category
+    button holds the three ids.  The name is the L3 sub-header on the L2
+    category page — a second request, skipped when *known_names* (``{l3_id:
+    name}``) already has it.  Every L3 named on that L2 page is added to
+    *known_names*, so products in sibling categories skip it.  ``None`` means Picnic has no page for the
+    product any more, the page has no category button, or the L2 page lacks
+    the L3.  Login errors propagate.
     """
     from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
 
     try:
-        article = await _call("get_article", product_id, add_category=True)
+        article = await _call("get_article", product_id)
     except PicnicParseError:
         return None
-    category = getattr(article, "category", None)
-    if isinstance(article, dict):  # the mock client
-        category = article.get("category")
-    name = category.get("name") if isinstance(category, dict) else getattr(category, "name", None)
-    return name or None
+    if article is None:
+        return None
+    ids = _category_ids(article)
+    if ids is None:
+        return None
+    l1_id, l2_id, l3_id = ids
+
+    name = (known_names or {}).get(l3_id)
+    if not name:
+        try:
+            category = await _call("get_category_by_ids", l2_id, l3_id)
+        except PicnicParseError:
+            return None
+        if isinstance(category, dict):  # the mock client
+            name = category.get("name")
+            page = category.get("page")
+        else:
+            name = getattr(category, "name", None)
+            page = getattr(category, "raw", None)
+        if known_names is not None:
+            known_names.update(l3_names_on_page(page))
+            if name:
+                known_names[l3_id] = name
+    if not name:
+        return None
+    return {"l1_id": l1_id, "l2_id": l2_id, "l3_id": l3_id, "name": name}
 
 
 # ---------------------------------------------------------------------------

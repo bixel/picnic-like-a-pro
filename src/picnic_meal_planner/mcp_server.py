@@ -55,19 +55,26 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
-async def get_categories(category: str | None = None) -> list[dict]:
+async def get_categories(
+    category: str | None = None, category_id: int | None = None
+) -> list[dict]:
     """List the categories of products the family has ordered or searched for.
 
     Picnic no longer offers its own category listing, so this covers only
-    products known locally (order history and earlier searches).
+    products known locally (order history and earlier searches).  Each entry
+    has the category ``name``, its ``category_id`` and parent ``l2_id`` (both
+    ``None`` if not looked up yet), and a ``product_count``.  Names can repeat
+    under different parents; the id tells them apart.
 
     Args:
         category: A category name as listed by this tool.  If given, return
-            the products in that category instead of the category list.
+            the products in every category of that name instead of the list.
+        category_id: A ``category_id`` as listed by this tool.  If given,
+            return the products in exactly that category.
     """
     async with db.get_db() as conn:
-        if category:
-            return await db.get_products_in_category(conn, category)
+        if category_id is not None or category:
+            return await db.get_products_in_category(conn, category, category_id)
         return await db.get_categories(conn)
 
 
