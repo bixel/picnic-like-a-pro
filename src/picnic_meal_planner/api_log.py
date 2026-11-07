@@ -27,6 +27,14 @@ tool-result and order data, so treat the database file as sensitive and prune
 the log with ``db.queries.prune_api_requests()``.  ``API_LOG_BODIES=false``
 disables body capture; URLs and headers are still recorded.
 
+Consent
+-------
+The bot opens a :func:`request_context` per chat turn with the chat's id and
+its history-persistence decision.  A chat that opted out of history (or
+``PERSIST_CONVERSATIONS=false``) gets rows without bodies or query strings;
+OpenRouter requests outside any context store no bodies either.  Rows with a
+``chat_id`` are deleted by ``history.py`` with the turns they belong to.
+
 Instrumentation
 ---------------
 - Picnic: :func:`install_picnic_capture` wraps the ``requests.Session`` used by
@@ -125,6 +133,8 @@ _SENSITIVE_HEADERS = frozenset(
 class _Context:
     source: str
     run_id: str
+    chat_id: int | None = None
+    store_bodies: bool = True
 
 
 _context: contextvars.ContextVar[_Context | None] = contextvars.ContextVar(
@@ -229,14 +239,29 @@ def error_response_body(error: BaseException | None) -> Any:
 
 @asynccontextmanager
 async def request_context(
-    source: str, *, run_id: str | None = None
+    source: str,
+    *,
+    run_id: str | None = None,
+    chat_id: int | None = None,
+    store_bodies: bool = True,
 ) -> AsyncIterator[str]:
     """Attribute every request logged inside the block to *source*/*run_id*.
+
+    *chat_id* ties the rows to a chat, so deleting its history deletes them.
+    *store_bodies* is the caller's consent decision (the bot passes
+    ``history.is_persistence_enabled``): when false, rows keep their metadata
+    but no bodies and no URL query string.  This module makes no consent
+    decision of its own; see :func:`_may_store_bodies` for the default.
 
     Yields the run id (generated when not given).  Contexts nest: the inner
     block wins, and the outer one resumes when it exits.
     """
-    ctx = _Context(source=source, run_id=run_id or uuid.uuid4().hex)
+    ctx = _Context(
+        source=source,
+        run_id=run_id or uuid.uuid4().hex,
+        chat_id=chat_id,
+        store_bodies=store_bodies,
+    )
     token = _context.set(ctx)
     try:
         yield ctx.run_id
@@ -465,6 +490,9 @@ def _row(
 ) -> dict:
     """The column values for one row: truncated, redacted and encoded."""
     ctx = _context.get()
+    if not _may_store_bodies(provider, ctx):
+        request_body = response_body = None
+        url = _without_query(url)
     return dict(
         provider=provider,
         operation=operation[:_MAX_OPERATION],
@@ -484,10 +512,33 @@ def _row(
         response_body=_body_text(response_body),
         source=ctx.source if ctx else None,
         run_id=ctx.run_id if ctx else None,
+        chat_id=ctx.chat_id if ctx else None,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         requested_at=timer.requested_at,
     )
+
+
+def _may_store_bodies(provider: str, ctx: _Context | None) -> bool:
+    """Whether a row may carry bodies (and a URL query string).
+
+    Inside a :func:`request_context`, the caller decided.  Outside one, an
+    OpenRouter request fails closed: its body is a chat transcript, and
+    nothing has confirmed that chat's consent.  Picnic requests outside a
+    context (import script, MCP server, login) carry no chat content.
+    """
+    if not BODIES_ENABLED:
+        return False
+    if ctx is not None:
+        return ctx.store_bodies
+    return provider != PROVIDER_OPENROUTER
+
+
+def _without_query(url: str | None) -> str | None:
+    """*url* without its query string, which can carry a search term."""
+    if not url:
+        return url
+    return url.split("?", 1)[0]
 
 
 def _http_status_of(error: BaseException | None) -> int | None:

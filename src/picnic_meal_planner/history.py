@@ -30,12 +30,14 @@ from datetime import date, timedelta
 
 from .db.queries import (
     append_turn,
+    delete_api_requests,
     delete_conversation,
-    delete_turns_in_range,
     get_chat_settings,
     get_db,
     load_recent_turns,
     set_chat_persist_history,
+    turn_ids_in_range,
+    turn_time_windows,
 )
 from .db.queries import delete_turns as _delete_turns_rows
 from .db.queries import list_turns as _list_turns_rows
@@ -175,8 +177,9 @@ async def is_persistence_enabled(chat_id: int) -> bool:
 async def set_persistence(chat_id: int, enabled: bool) -> None:
     """Set this chat's opt-out flag.
 
-    Disabling also deletes everything already stored for the chat — opting out
-    of storage while leaving the old transcript on disk would be surprising.
+    Disabling also deletes everything already stored for the chat, including
+    its rows in the API request log — opting out of storage while leaving the
+    old transcript on disk would be surprising.
     The in-memory window is deliberately left intact so the conversation in
     progress stays coherent; it simply stops being written down.
     """
@@ -184,6 +187,7 @@ async def set_persistence(chat_id: int, enabled: bool) -> None:
         await set_chat_persist_history(session, chat_id, enabled)
         if not enabled:
             await delete_conversation(session, chat_id)
+            await delete_api_requests(session, chat_id)
         await session.commit()
     _persist_flags[chat_id] = enabled
 
@@ -257,10 +261,13 @@ async def clear_history(chat_id: int) -> int:
     """Forget a chat entirely: the in-memory window and every stored row.
 
     The database is cleared first so that a failure leaves both sides
-    untouched, rather than wiping memory and reporting an error.
+    untouched, rather than wiping memory and reporting an error.  The chat's
+    rows in the API request log go in the same transaction: they hold the
+    same conversation, re-sent with every request.
     """
     async with get_db() as session:
         removed = await delete_conversation(session, chat_id)
+        await delete_api_requests(session, chat_id)
         await session.commit()
 
     _contexts[chat_id] = []
@@ -271,7 +278,7 @@ async def clear_history(chat_id: int) -> int:
 async def delete_turns(chat_id: int, turn_ids: Iterable[int]) -> int:
     """Delete specific turns in full. Returns the number of messages removed."""
     async with get_db() as session:
-        removed = await _delete_turns_rows(session, chat_id, turn_ids)
+        removed = await _delete_turns_with_requests(session, chat_id, turn_ids)
         await session.commit()
     invalidate(chat_id)
     return removed
@@ -284,15 +291,28 @@ async def delete_day(chat_id: int, day: date) -> int:
     correctly as a half-open string range.
     """
     async with get_db() as session:
-        removed = await delete_turns_in_range(
+        turn_ids = await turn_ids_in_range(
             session,
             chat_id,
             since=day.isoformat(),
             until=(day + timedelta(days=1)).isoformat(),
         )
+        removed = await _delete_turns_with_requests(session, chat_id, turn_ids)
         await session.commit()
     invalidate(chat_id)
     return removed
+
+
+async def _delete_turns_with_requests(session, chat_id: int, turn_ids) -> int:
+    """Delete whole turns and the API requests they made; the caller commits.
+
+    Requests are matched by time window (see ``turn_time_windows``), which is
+    computed before the turns are gone.
+    """
+    turn_ids = list(turn_ids)
+    for after, until in await turn_time_windows(session, chat_id, turn_ids):
+        await delete_api_requests(session, chat_id, after=after, until=until)
+    return await _delete_turns_rows(session, chat_id, turn_ids)
 
 
 async def list_turns(chat_id: int) -> list[dict]:

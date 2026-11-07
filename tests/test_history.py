@@ -12,7 +12,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from picnic_meal_planner import history
+from picnic_meal_planner import api_log, history
+from picnic_meal_planner.db import queries as db
 
 
 @pytest.fixture(autouse=True)
@@ -302,6 +303,75 @@ class TestDeletion:
         await _commit(CHAT, TOOL_TURN)
         assert await history.delete_turns(CHAT, []) == 0
         assert len(await history.get_context(CHAT)) == 4
+
+
+async def _log_request(chat_id: int, operation: str) -> None:
+    """One API request made during *chat_id*'s turn, as the bot logs it."""
+    async with api_log.request_context("bot", chat_id=chat_id):
+        await api_log.record(api_log.PROVIDER_PICNIC, operation, api_log.Timer.start())
+
+
+async def _logged_operations(chat_id: int | None = None) -> list[str]:
+    async with db.get_db() as session:
+        rows = await db.list_api_requests(session)
+    return sorted(
+        r["operation"] for r in rows if chat_id is None or r["chat_id"] == chat_id
+    )
+
+
+class TestDeletionReachesTheRequestLog:
+    """The log re-holds the conversation, so it must not outlive a deletion."""
+
+    async def test_clear_history_deletes_the_chats_requests_only(self, db_path):
+        await _log_request(CHAT, "first")
+        await _commit(CHAT, TOOL_TURN)
+        await _log_request(CHAT + 1, "other_chat")
+        await _log_request(CHAT, "discarded_turn")  # never committed
+
+        await history.clear_history(CHAT)
+
+        assert await _logged_operations() == ["other_chat"]
+
+    async def test_delete_turns_deletes_that_turns_requests(self, db_path):
+        await _log_request(CHAT, "turn1")
+        await _commit(CHAT, TOOL_TURN)
+        await _log_request(CHAT, "turn2_a")
+        await _log_request(CHAT, "turn2_b")
+        await _commit(CHAT, PLAIN_TURN)
+        await _log_request(CHAT, "turn3")
+        await _commit(CHAT, PLAIN_TURN)
+        turns = await history.list_turns(CHAT)
+
+        await history.delete_turns(CHAT, [turns[1]["turn_id"]])
+
+        assert await _logged_operations(CHAT) == ["turn1", "turn3"]
+
+    async def test_deleting_the_first_turn_has_no_lower_bound(self, db_path):
+        await _log_request(CHAT, "turn1")
+        await _commit(CHAT, TOOL_TURN)
+        await _log_request(CHAT, "turn2")
+        await _commit(CHAT, PLAIN_TURN)
+        turns = await history.list_turns(CHAT)
+
+        await history.delete_turns(CHAT, [turns[0]["turn_id"]])
+
+        assert await _logged_operations(CHAT) == ["turn2"]
+
+    async def test_delete_day_deletes_that_days_requests(self, db_path):
+        await _log_request(CHAT, "today")
+        await _commit(CHAT, TOOL_TURN)
+
+        await history.delete_day(CHAT, date.today())
+
+        assert await _logged_operations(CHAT) == []
+
+    async def test_opting_out_deletes_the_chats_requests(self, db_path):
+        await _log_request(CHAT, "turn1")
+        await _commit(CHAT, TOOL_TURN)
+
+        await history.set_persistence(CHAT, False)
+
+        assert await _logged_operations(CHAT) == []
 
 
 # ---------------------------------------------------------------------------

@@ -197,7 +197,7 @@ class TestRecord:
 
         error = _HttpError("boom")
         await api_log.record(
-            api_log.PROVIDER_OPENROUTER,
+            api_log.PROVIDER_PICNIC,
             "op",
             _timer(),
             error=error,
@@ -605,3 +605,28 @@ class TestLockedDatabase:
         assert "timeout" not in engine_mod.get_engine().dialect.create_connect_args(
             engine_mod.get_engine().url
         )[1]
+
+
+class TestConsent:
+    async def test_without_consent_the_query_string_is_dropped(self):
+        async with api_log.request_context("bot", chat_id=3, store_bodies=False):
+            await api_log.record(
+                api_log.PROVIDER_PICNIC,
+                "search",
+                _timer(),
+                http_method="GET",
+                url="https://storefront/api/15/pages/search?search_term=pregnancy+test",
+                request_body={"q": "pregnancy test"},
+                response_body={"items": []},
+            )
+        [row] = await _rows()
+        assert row["url"] == "https://storefront/api/15/pages/search"
+        assert row["request_body"] is None and row["response_body"] is None
+        assert row["chat_id"] == 3
+
+    async def test_picnic_bodies_outside_a_context_are_kept(self):
+        await api_log.record(
+            api_log.PROVIDER_PICNIC, "get_cart", _timer(), response_body={"items": []}
+        )
+        [row] = await _rows()
+        assert row["response_body"] is not None and row["chat_id"] is None
