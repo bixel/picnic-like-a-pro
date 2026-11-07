@@ -210,7 +210,7 @@ class TestRecord:
         def broken():
             raise RuntimeError("db down")
 
-        monkeypatch.setattr(api_log.db, "get_db", broken)
+        monkeypatch.setattr(api_log, "get_log_db", broken)
         with caplog.at_level(logging.WARNING):
             await api_log.record(api_log.PROVIDER_PICNIC, "get_deliveries", _timer())
         assert "Could not record API request" in caplog.text
@@ -573,3 +573,35 @@ class TestQueryHelpers:
         async with db.get_db() as session:
             with pytest.raises(ValueError):
                 await db.prune_api_requests(session, keep_days=-1)
+
+
+class TestLockedDatabase:
+    """A lock held by another connection must not stall the logged request."""
+
+    async def test_a_held_lock_costs_a_row_not_a_stall(self, db_path, caplog):
+        import sqlite3
+        import time as _time
+
+        blocker = sqlite3.connect(db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            started = _time.perf_counter()
+            with caplog.at_level(logging.WARNING):
+                await api_log.record(api_log.PROVIDER_PICNIC, "get_cart", _timer())
+            elapsed = _time.perf_counter() - started
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert elapsed < 2, f"logging waited {elapsed:.1f}s on a held lock"
+        assert "Could not record API request" in caplog.text
+        assert await _rows() == []
+
+    async def test_the_short_timeout_is_confined_to_the_log_engine(self):
+        from picnic_meal_planner.db import engine as engine_mod
+
+        # History and order writes keep sqlite3's default wait.
+        assert engine_mod.get_log_engine() is not engine_mod.get_engine()
+        assert "timeout" not in engine_mod.get_engine().dialect.create_connect_args(
+            engine_mod.get_engine().url
+        )[1]

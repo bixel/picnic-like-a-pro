@@ -46,7 +46,10 @@ Policy
   request being logged: every failure here is a warning, never an exception.
 - **Await, do not detach.**  The insert is awaited so the row is committed
   before the caller returns.  Losing rows to a fire-and-forget task would be
-  worse than one INSERT.
+  worse than one INSERT.  It runs on a separate engine whose lock timeout is
+  ``engine.LOG_LOCK_TIMEOUT_SECONDS``, so a database locked by another
+  connection costs a lost row, not a 5 s stall per call.  All rows of one
+  wrapped call are written in one transaction.
 - **Retention is explicit.**  Rows are not truncated; use
   ``db.queries.prune_api_requests()`` from an operator task.
 """
@@ -66,6 +69,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .db import queries as db
+from .db.engine import get_log_db
 
 logger = logging.getLogger(__name__)
 
@@ -259,11 +263,14 @@ async def capture_http_requests(
         raise
     finally:
         _captures.reset(token)
-        if session.captures:
-            for capture in session.captures:
-                await _record_capture(session, capture)
-        else:
-            await record(
+        await _persist(provider, operation, _session_rows(session))
+
+
+def _session_rows(session: CaptureSession) -> list[dict]:
+    """One row per captured HTTP request, or one fallback row if there were none."""
+    if not session.captures:
+        return [
+            _row(
                 session.provider,
                 session.operation,
                 session.timer,
@@ -272,6 +279,24 @@ async def capture_http_requests(
                 request_body=session.fallback_request_body,
                 response_body=session.fallback_response_body,
             )
+        ]
+    return [
+        _row(
+            session.provider,
+            session.operation,
+            Timer(capture.started_perf, capture.requested_at),
+            target=session.target,
+            error=capture.error,
+            http_status=capture.status_code,
+            http_method=capture.method,
+            url=capture.url,
+            request_headers=capture.request_headers,
+            response_headers=capture.response_headers,
+            request_body=capture.request_body,
+            response_body=capture.response_body,
+        )
+        for capture in session.captures
+    ]
 
 
 def install_picnic_capture(api: Any) -> bool:
@@ -350,37 +375,43 @@ async def record(
 ) -> None:
     """Persist one log row; never raises.
 
-    Callers that need a request's *usage* (OpenRouter token counts) or its raw
-    completion call this directly; everything else should use
-    :func:`capture_http_requests`.
+    Prefer :func:`capture_http_requests`; this is the low-level writer.
     """
-    ctx = _context.get()
-    try:
-        async with db.get_db() as session:
-            await db.insert_api_request(
-                session,
-                provider=provider,
-                operation=operation[:_MAX_OPERATION],
-                target=target[:_MAX_TARGET] if target else None,
-                http_method=http_method[:20] if http_method else None,
+    await _persist(
+        provider,
+        operation,
+        [
+            _row(
+                provider,
+                operation,
+                timer,
+                target=target,
+                error=error,
+                http_status=http_status,
+                http_method=http_method,
                 url=url,
-                request_headers=_headers_text(request_headers),
-                response_headers=_headers_text(response_headers),
-                status="error" if error is not None else "success",
-                http_status=(
-                    http_status if http_status is not None else _http_status_of(error)
-                ),
-                duration_ms=timer.duration_ms,
-                error_type=type(error).__name__ if error is not None else None,
-                error_message=_error_message(error),
-                request_body=_body_text(request_body),
-                response_body=_body_text(response_body),
-                source=ctx.source if ctx else None,
-                run_id=ctx.run_id if ctx else None,
+                request_headers=request_headers,
+                response_headers=response_headers,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                requested_at=timer.requested_at,
+                request_body=request_body,
+                response_body=response_body,
             )
+        ],
+    )
+
+
+async def _persist(provider: str, operation: str, rows: list[dict]) -> None:
+    """Insert *rows* in one transaction on the log engine; never raises.
+
+    The log engine gives up on a held lock after
+    ``engine.LOG_LOCK_TIMEOUT_SECONDS``, so a busy database costs the request
+    a lost row, not a multi-second stall.
+    """
+    try:
+        async with get_log_db() as session:
+            for row in rows:
+                await db.insert_api_request(session, **row)
             await session.commit()
     except Exception:  # observability must not break the request
         logger.warning(
@@ -388,20 +419,47 @@ async def record(
         )
 
 
-async def _record_capture(session: CaptureSession, capture: HttpCapture) -> None:
-    await record(
-        session.provider,
-        session.operation,
-        Timer(capture.started_perf, capture.requested_at),
-        target=session.target,
-        error=capture.error,
-        http_status=capture.status_code,
-        http_method=capture.method,
-        url=capture.url,
-        request_headers=capture.request_headers,
-        response_headers=capture.response_headers,
-        request_body=capture.request_body,
-        response_body=capture.response_body,
+def _row(
+    provider: str,
+    operation: str,
+    timer: Timer,
+    *,
+    target: str | None = None,
+    error: BaseException | None = None,
+    http_status: int | None = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: Any = None,
+    response_headers: Any = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    request_body: Any = None,
+    response_body: Any = None,
+) -> dict:
+    """The column values for one row: truncated, redacted and encoded."""
+    ctx = _context.get()
+    return dict(
+        provider=provider,
+        operation=operation[:_MAX_OPERATION],
+        target=target[:_MAX_TARGET] if target else None,
+        http_method=http_method[:20] if http_method else None,
+        url=url,
+        request_headers=_headers_text(request_headers),
+        response_headers=_headers_text(response_headers),
+        status="error" if error is not None else "success",
+        http_status=(
+            http_status if http_status is not None else _http_status_of(error)
+        ),
+        duration_ms=timer.duration_ms,
+        error_type=type(error).__name__ if error is not None else None,
+        error_message=_error_message(error),
+        request_body=_body_text(request_body),
+        response_body=_body_text(response_body),
+        source=ctx.source if ctx else None,
+        run_id=ctx.run_id if ctx else None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        requested_at=timer.requested_at,
     )
 
 

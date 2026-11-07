@@ -35,9 +35,18 @@ def _db_url() -> str:
 # The Alembic head this code expects; tests/test_migrations.py keeps it in step.
 SCHEMA_REVISION = "0006"
 
+# How long a write to the API request log waits for a database lock held by
+# another connection before giving up.  sqlite3's default is 5 s, and the log
+# is written inline on every Picnic/OpenRouter call: a lock held elsewhere (an
+# import committing, a backup, the sqlite3 CLI) would otherwise stall each
+# call by that much.  A lost log row is the cheaper failure.
+LOG_LOCK_TIMEOUT_SECONDS = 0.2
+
 # Module-level singletons; populated lazily.
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_log_engine: AsyncEngine | None = None
+_log_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 def _mute_driver_statement_logging() -> None:
@@ -53,26 +62,43 @@ def _mute_driver_statement_logging() -> None:
     logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 
+def _create_engine(**connect_args) -> AsyncEngine:
+    _mute_driver_statement_logging()
+    # hide_parameters keeps bound values out of exception text. Without it,
+    # SQLAlchemy appends "[parameters: ...]" to DBAPIError, so any logged
+    # write failure would spill the row being written — for
+    # conversation_messages that is the message content itself.
+    engine = create_async_engine(
+        _db_url(), echo=False, hide_parameters=True, connect_args=connect_args
+    )
+
+    # SQLite requires an explicit PRAGMA to honour FK constraints.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
+
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _mute_driver_statement_logging()
-        # hide_parameters keeps bound values out of exception text. Without it,
-        # SQLAlchemy appends "[parameters: ...]" to DBAPIError, so any logged
-        # write failure would spill the row being written — for
-        # conversation_messages that is the message content itself.
-        _engine = create_async_engine(
-            _db_url(), echo=False, hide_parameters=True
-        )
-
-        # SQLite requires an explicit PRAGMA to honour FK constraints.
-        @event.listens_for(_engine.sync_engine, "connect")
-        def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
-
+        _engine = _create_engine()
     return _engine
+
+
+def get_log_engine() -> AsyncEngine:
+    """A separate engine for the API request log, with a short lock timeout.
+
+    Separate so the short timeout never applies to history or order writes,
+    which should keep waiting the default 5 s rather than fail.
+    """
+    global _log_engine
+    if _log_engine is None:
+        _log_engine = _create_engine(timeout=LOG_LOCK_TIMEOUT_SECONDS)
+    return _log_engine
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -84,6 +110,26 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
             expire_on_commit=False,
         )
     return _session_factory
+
+
+def get_log_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _log_session_factory
+    if _log_session_factory is None:
+        _log_session_factory = async_sessionmaker(
+            get_log_engine(),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+    return _log_session_factory
+
+
+async def dispose_engines() -> None:
+    """Dispose both engines and forget them; the next use rebuilds from DB_PATH."""
+    global _engine, _session_factory, _log_engine, _log_session_factory
+    for engine in (_engine, _log_engine):
+        if engine is not None:
+            await engine.dispose()
+    _engine = _session_factory = _log_engine = _log_session_factory = None
 
 
 async def init_db() -> None:
@@ -150,4 +196,11 @@ async def missing_columns() -> list[str]:
 async def get_db():
     """Async context manager that yields an open :class:`AsyncSession`."""
     async with get_session_factory()() as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_log_db():
+    """Like :func:`get_db`, on the API request log's short-timeout engine."""
+    async with get_log_session_factory()() as session:
         yield session
