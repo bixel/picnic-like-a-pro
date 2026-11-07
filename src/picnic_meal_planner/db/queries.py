@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .engine import get_session_factory
 from .models import (
+    Category,
     ChatSettings,
     ConversationMessage,
     ImportCheckpoint,
@@ -104,42 +105,98 @@ async def get_product(session: AsyncSession, product_id: str) -> dict | None:
         "unit_quantity": row.unit_quantity,
         "image_id": row.image_id,
         "category": row.category,
+        "category_id": row.category_id,
         "last_seen_at": row.last_seen_at,
     }
 
 
 async def products_without_category(session: AsyncSession) -> list[str]:
-    """Ids of the stored products whose category is not known yet."""
+    """Ids of the stored products whose category id is not known yet.
+
+    This includes products that have a category *name* from before category
+    ids were tracked (or from seeded data), so they are looked up once more.
+    """
     rows = await session.scalars(
-        select(Product.id).where(Product.category.is_(None)).order_by(Product.id)
+        select(Product.id).where(Product.category_id.is_(None)).order_by(Product.id)
     )
     return list(rows)
 
 
+async def get_category_names(session: AsyncSession) -> dict[int, str]:
+    """``{l3_id: name}`` for every stored category."""
+    rows = await session.execute(select(Category.id, Category.name))
+    return {row.id: row.name for row in rows}
+
+
 async def get_categories(session: AsyncSession) -> list[dict]:
-    """The categories of the stored products, each with its product count."""
+    """The categories of the stored products, each with its product count.
+
+    Grouped by category id, so two categories with the same name (under
+    different L2 parents) stay apart.  ``category_id`` is ``None`` for
+    products whose category is known only by name.
+    """
     stmt = (
-        select(Product.category.label("name"), func.count().label("product_count"))
+        select(
+            Product.category.label("name"),
+            Product.category_id,
+            Category.l2_id,
+            func.count().label("product_count"),
+        )
+        .outerjoin(Category, Product.category_id == Category.id)
         .where(Product.category.is_not(None))
-        .group_by(Product.category)
-        .order_by(Product.category)
+        .group_by(Product.category_id, Product.category, Category.l2_id)
+        .order_by(Product.category, Product.category_id)
     )
     return [row._asdict() for row in (await session.execute(stmt)).all()]
 
 
-async def get_products_in_category(session: AsyncSession, category: str) -> list[dict]:
-    """The stored products in *category* (exact name, as :func:`get_categories` lists it)."""
+async def get_products_in_category(
+    session: AsyncSession, category: str | None = None, category_id: int | None = None
+) -> list[dict]:
+    """The stored products in a category, by id or by exact name.
+
+    *category_id* wins when both are given; a name matches every category of
+    that name, as :func:`get_categories` lists it.
+    """
+    if category_id is not None:
+        condition = Product.category_id == category_id
+    elif category is not None:
+        condition = Product.category == category
+    else:
+        raise ValueError("Give a category name or a category_id.")
     stmt = (
         select(Product.id, Product.name, Product.unit_quantity, Product.unit_price)
-        .where(Product.category == category)
+        .where(condition)
         .order_by(Product.name)
     )
     return [row._asdict() for row in (await session.execute(stmt)).all()]
 
 
-async def set_product_category(session: AsyncSession, product_id: str, category: str) -> None:
+async def set_product_category(session: AsyncSession, product_id: str, category: dict) -> None:
+    """Record *category* (``l1_id``, ``l2_id``, ``l3_id``, ``name``) for a product.
+
+    Upserts the ``categories`` row, then points the product at it.
+    """
+    insert = sqlite_insert(Category)
     await session.execute(
-        update(Product).where(Product.id == product_id).values(category=category)
+        insert.values(
+            id=category["l3_id"],
+            l2_id=category["l2_id"],
+            l1_id=category.get("l1_id"),
+            name=category["name"],
+        ).on_conflict_do_update(
+            index_elements=["id"],
+            set_=dict(
+                l2_id=insert.excluded.l2_id,
+                l1_id=func.coalesce(insert.excluded.l1_id, Category.l1_id),
+                name=insert.excluded.name,
+            ),
+        )
+    )
+    await session.execute(
+        update(Product)
+        .where(Product.id == product_id)
+        .values(category=category["name"], category_id=category["l3_id"])
     )
 
 

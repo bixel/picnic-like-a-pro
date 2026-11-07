@@ -3,6 +3,7 @@
 from .engine import get_db, get_engine, init_db
 from .models import (
     Base,
+    Category,
     ChatSettings,
     ConversationMessage,
     ImportCheckpoint,
@@ -14,6 +15,7 @@ from .models import (
 
 __all__ = [
     "Base",
+    "Category",
     "ChatSettings",
     "ConversationMessage",
     "ImportCheckpoint",
