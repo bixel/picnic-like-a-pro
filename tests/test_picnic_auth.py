@@ -125,6 +125,14 @@ class TestClientConstruction:
         assert client.logins == 1
         assert await _stored_token() == "password-token"
 
+    async def test_password_login_is_logged_once_without_the_password(self):
+        await picnic.get_client()
+        async with db.get_db() as session:
+            rows = await db.list_api_requests(session, provider="picnic")
+        assert [r["operation"] for r in rows] == ["login"]
+        assert "right" not in (rows[0]["request_body"] or "")
+        assert "kim@example.com" in rows[0]["request_body"]
+
     async def test_2fa_demand_raises_and_sends_no_code(self):
         FakePicnicAPI.needs_2fa = True
         with pytest.raises(picnic.PicnicLoginRequired, match="/picnic_login"):

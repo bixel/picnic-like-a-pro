@@ -82,18 +82,8 @@ async def get_client():
         username, password = auth.credentials()
         api = auth.new_api()
         try:
-            # The session capture records the real request/response.  The
-            # fallback is used only if no HTTP request was made.
-            async with api_log.capture_http_requests(
-                api_log.PROVIDER_PICNIC,
-                "login",
-                fallback_request_body={
-                    "key": username,
-                    "secret": api_log.REDACTED,
-                    "client_id": 30100,
-                },
-            ):
-                await _run(api.login, username, password)
+            # Logged like every other login step; see auth.login_step().
+            await auth.login_step(api.login, username, password)
         except Picnic2FARequired:
             _needs_login = True
             raise PicnicLoginRequired(
@@ -124,7 +114,10 @@ def reset_client() -> None:
 
 
 async def _run(func, *args, **kwargs) -> Any:
-    """Run the blocking Picnic library in a worker thread.
+    """Run the blocking Picnic library in a worker thread, without logging.
+
+    The caller logs: :func:`_call` wraps it in a capture block, and login steps
+    go through ``auth.login_step()`` instead.
 
     ``asyncio.to_thread`` (unlike ``run_in_executor``) copies the current
     context, which is how the HTTP capture list reaches the session wrapper.
