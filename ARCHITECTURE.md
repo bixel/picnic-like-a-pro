@@ -210,12 +210,12 @@ Cached product catalog. Populated on first search/add, updated on use.
 | unit_price   | INTEGER | cents                          |
 | unit_quantity | TEXT   | e.g. "1 kg", "6 stuks"        |
 | image_id     | TEXT    | for display                    |
-| category     | TEXT    | L3 category name               |
 | category_id  | INTEGER | FK → categories.id (L3 id); NULL = not looked up yet |
 | last_seen_at | TEXT    | ISO datetime                   |
 
 ### `categories`
 Picnic's leaf (L3) categories, filled by the import script's category backfill.
+The only place a category name is stored; `products` refers to it by id.
 A product page's category button links to
 `app.picnic://categories/{l1}/l2/{l2}/l3/{l3}`; the name is the L3 sub-header
 on the L2 category page. L3 names repeat under different parents, so the id is
@@ -225,7 +225,7 @@ the key.
 |--------|------------|---------------------------|
 | id     | INTEGER PK | L3 category id            |
 | l2_id  | INTEGER    | parent L2 category id     |
-| l1_id  | INTEGER    | top-level L1 category id  |
+| l1_id  | INTEGER    | top-level L1 category id; NULL if not seen yet |
 | name   | TEXT       | L3 name                   |
 
 ### `orders`

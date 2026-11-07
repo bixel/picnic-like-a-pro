@@ -49,8 +49,10 @@ async def seed_database(session, reference_time: datetime | None = None) -> None
     from picnic_meal_planner.db.queries import (
         insert_order,
         insert_order_item,
+        set_product_category,
         upsert_product,
     )
+    from picnic_meal_planner.picnic.mock_client import _CATEGORY_IDS
 
     now = reference_time or datetime.now(timezone.utc)
     price_lookup = {p["id"]: p["price"] for p in CATALOG}
@@ -63,7 +65,10 @@ async def seed_database(session, reference_time: datetime | None = None) -> None
             "unit_price": product["price"],
             "unit_quantity": product["unit_quantity"],
             "image_id": product.get("image_id"),
-            "category": product.get("category"),
+        })
+        l1_id, l2_id, l3_id = _CATEGORY_IDS[product["category"]]
+        await set_product_category(session, product["id"], {
+            "l1_id": l1_id, "l2_id": l2_id, "l3_id": l3_id, "name": product["category"],
         })
 
     for i in range(25):

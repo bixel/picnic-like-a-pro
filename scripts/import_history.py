@@ -20,10 +20,12 @@ unusable) is deferred: it has no row in ``orders``, so a later run finds it
 again, and the run's checkpoint is not marked finished.
 
 Every run then looks up the category (its L1/L2/L3 ids and L3 name) of each
-stored product whose category id is not known yet (delivery data carries no
+stored product whose category is not known yet (delivery data carries no
 categories), including runs that find no new deliveries.  That costs one
-request per product, plus one per L2 category page whose L3 names are not
-known yet.  A product Picnic no longer lists is retried on the next run.
+request per product for its ids, plus one per L2 category page needed for a
+name not stored yet.  Every L3 named on a fetched page is stored, so sibling
+categories cost nothing later.  A product Picnic no longer lists, or whose
+name is not on its page, is retried on the next run.
 
 Every Picnic HTTP request is recorded in the ``api_requests`` table by
 ``picnic/client.py`` (best-effort; method, full URL, headers and the full
@@ -86,7 +88,7 @@ async def main() -> None:
 
 
 async def backfill_categories() -> None:
-    """Fill in the category of every stored product without a category id."""
+    """Fill in the category of every stored product without one."""
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
@@ -94,32 +96,47 @@ async def backfill_categories() -> None:
         product_ids = await db.products_without_category(conn)
         # {l3_id: name}; grows with every L2 page fetched, so a product whose
         # L3 is already named costs one request instead of two.
-        known_names = await db.get_category_names(conn)
+        names = await db.get_category_names(conn)
     if not product_ids:
         return
     print(f"\nLooking up categories for {len(product_ids)} product(s)...")
 
+    # L2 pages already fetched this run, keyed with the L3 in their URL: it is
+    # not known yet whether a page lists every L3 whichever one is asked for.
+    fetched: set[tuple[int, int]] = set()
     found = 0
     login_error = None
     for i in range(0, len(product_ids), batch_size):
         categories: dict[str, dict] = {}
+        siblings: dict[int, tuple[int, str]] = {}  # l3_id -> (l2_id, name)
         for product_id in product_ids[i : i + batch_size]:
             try:
-                category = await picnic.get_product_category(product_id, known_names)
+                ids = await picnic.get_category_ids(product_id)
+                if ids is None:
+                    continue
+                l1_id, l2_id, l3_id = ids
+                if l3_id not in names and (l2_id, l3_id) not in fetched:
+                    fetched.add((l2_id, l3_id))
+                    on_page = await picnic.get_l3_names(l2_id, l3_id)
+                    names.update(on_page)
+                    siblings.update({l3: (l2_id, name) for l3, name in on_page.items()})
             except (picnic.PicnicLoginRequired, picnic.PicnicLoginPending) as exc:
                 login_error = exc
                 break
             except Exception as exc:  # noqa: BLE001 — retried by the next run
                 print(f"  Warning: could not look up category of {product_id}: {exc}")
                 continue
-            if category:
-                categories[product_id] = category
+            if names.get(l3_id):
+                categories[product_id] = {
+                    "l1_id": l1_id, "l2_id": l2_id, "l3_id": l3_id, "name": names[l3_id],
+                }
 
         async with db.get_db() as conn:
+            for l3_id, (l2_id, name) in siblings.items():
+                await db.upsert_category(conn, l3_id, l2_id, name)
             for product_id, category in categories.items():
-                await db.set_product_category(conn, product_id, category)
+                found += await db.set_product_category(conn, product_id, category)
             await conn.commit()
-        found += len(categories)
         if login_error:
             print(f"  Stopped: {login_error}", file=sys.stderr)
             break

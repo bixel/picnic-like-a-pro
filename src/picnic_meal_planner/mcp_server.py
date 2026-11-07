@@ -62,9 +62,9 @@ async def get_categories(
 
     Picnic no longer offers its own category listing, so this covers only
     products known locally (order history and earlier searches).  Each entry
-    has the category ``name``, its ``category_id`` and parent ``l2_id`` (both
-    ``None`` if not looked up yet), and a ``product_count``.  Names can repeat
-    under different parents; the id tells them apart.
+    has the category ``name``, its ``category_id`` and a ``product_count``.
+    Products whose category is not looked up yet are not counted.  Names can
+    repeat under different parents; the id tells them apart.
 
     Args:
         category: A category name as listed by this tool.  If given, return

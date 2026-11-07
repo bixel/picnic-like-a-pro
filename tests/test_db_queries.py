@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.models import Order, Product
+from picnic_meal_planner.db.models import Category, Order, Product
 
 
 def _now_iso() -> str:
@@ -21,7 +21,6 @@ SAMPLE_PRODUCT = {
     "unit_price": 119,
     "unit_quantity": "1 liter",
     "image_id": "img_test_milk",
-    "category": "Dairy",
 }
 
 
@@ -49,22 +48,10 @@ class TestUpsertProduct:
 
     async def test_upsert_product_with_none_fields(self, db_session):
         await db.upsert_product(
-            db_session, {**SAMPLE_PRODUCT, "unit_price": None, "image_id": None, "category": None}
+            db_session, {**SAMPLE_PRODUCT, "unit_price": None, "image_id": None}
         )
         await db_session.commit()
         assert (await db.get_product(db_session, "p_test_milk"))["unit_price"] is None
-
-    async def test_upsert_without_category_keeps_the_stored_one(self, db_session):
-        await db.upsert_product(db_session, SAMPLE_PRODUCT)
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": None})
-        await db_session.commit()
-        assert (await db.get_product(db_session, "p_test_milk"))["category"] == "Dairy"
-
-    async def test_upsert_with_category_replaces_it(self, db_session):
-        await db.upsert_product(db_session, SAMPLE_PRODUCT)
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": "Milk"})
-        await db_session.commit()
-        assert (await db.get_product(db_session, "p_test_milk"))["category"] == "Milk"
 
     async def test_upsert_sets_last_seen_at(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)
@@ -84,8 +71,8 @@ class TestGetProduct:
 
 class TestProductCategories:
     async def test_lists_and_fills_missing_categories(self, db_session):
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_b", "category": None})
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_a", "category": None})
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_b"})
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_a"})
         await db_session.commit()
         assert await db.products_without_category(db_session) == ["p_a", "p_b"]
 
@@ -98,33 +85,68 @@ class TestProductCategories:
         assert (row["category"], row["category_id"]) == ("Bread", 3)
         assert await db.get_category_names(db_session) == {3: "Bread"}
 
-    async def test_a_name_without_an_id_is_looked_up_again(self, db_session):
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": "Dairy"})
-        assert await db.products_without_category(db_session) == ["p_test_milk"]
-
     async def test_upsert_keeps_the_category_id(self, db_session):
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": None})
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
         await db.set_product_category(
             db_session, "p_test_milk", {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": "Milk"}
         )
-        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "category": None})
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
         row = await db.get_product(db_session, "p_test_milk")
         assert (row["category"], row["category_id"]) == ("Milk", 3)
 
     async def test_same_name_under_different_parents_stays_apart(self, db_session):
         for pid, l2, l3 in (("p_beer", 20, 30), ("p_wine", 21, 31)):
-            await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": pid, "category": None})
+            await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": pid})
             await db.set_product_category(
                 db_session, pid, {"l1_id": 1, "l2_id": l2, "l3_id": l3, "name": "Alkoholfrei"}
             )
         listed = [c for c in await db.get_categories(db_session) if c["name"] == "Alkoholfrei"]
-        assert [(c["category_id"], c["l2_id"], c["product_count"]) for c in listed] == [
-            (30, 20, 1), (31, 21, 1),
-        ]
+        assert [(c["category_id"], c["product_count"]) for c in listed] == [(30, 1), (31, 1)]
         products = await db.get_products_in_category(db_session, category_id=31)
         assert [p["id"] for p in products] == ["p_wine"]
         by_name = await db.get_products_in_category(db_session, "Alkoholfrei")
         assert {p["id"] for p in by_name} == {"p_beer", "p_wine"}
+
+
+    async def test_renaming_a_category_renames_it_for_every_product(self, db_session):
+        for pid in ("p_a", "p_b"):
+            await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": pid})
+        await db.set_product_category(
+            db_session, "p_a", {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": "Milk"}
+        )
+        await db.set_product_category(
+            db_session, "p_b", {"l1_id": None, "l2_id": 2, "l3_id": 3, "name": "Milch"}
+        )
+        assert await db.get_categories(db_session) == [
+            {"name": "Milch", "category_id": 3, "product_count": 2},
+        ]
+        assert (await db.get_product(db_session, "p_a"))["category"] == "Milch"
+        assert {p["id"] for p in await db.get_products_in_category(db_session, "Milch")} == {
+            "p_a", "p_b",
+        }
+        assert await db.get_products_in_category(db_session, "Milk") == []
+        # A missing L1 id keeps the stored one.
+        assert (await db_session.get(Category, 3)).l1_id == 1
+
+    async def test_a_category_under_another_parent_is_not_overwritten(self, db_session, caplog):
+        for pid in ("p_a", "p_b"):
+            await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": pid})
+        assert await db.set_product_category(
+            db_session, "p_a", {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": "Milk"}
+        )
+        assert not await db.set_product_category(
+            db_session, "p_b", {"l1_id": 1, "l2_id": 9, "l3_id": 3, "name": "Wine"}
+        )
+        assert "Category 3 is stored under L2 2" in caplog.text
+        stored = await db_session.get(Category, 3)
+        assert (stored.l2_id, stored.name) == (2, "Milk")
+        assert (await db.get_product(db_session, "p_b"))["category_id"] is None
+        assert await db.products_without_category(db_session) == ["p_b"]
+
+    async def test_products_without_a_category_are_not_listed(self, db_session):
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
+        assert await db.get_categories(db_session) == []
+        assert (await db.get_product(db_session, "p_test_milk"))["category"] is None
 
 
 class TestInsertOrder:

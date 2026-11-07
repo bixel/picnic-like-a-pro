@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import MutableMapping
 from typing import Any
 
 from .. import api_log
@@ -272,6 +271,11 @@ def _category_ids(article) -> tuple[int | None, int, int] | None:
 
 _L3_HEADER_PREFIX = "vertical-article-tiles-sub-header-"
 
+# The library's own L2 page path (``PicnicAPI.get_category_by_ids``).  That
+# method raises when the requested L3 is missing from the page and throws the
+# page away, so the page is fetched here directly and every L3 on it is kept.
+L2_PAGE_PATH = "/pages/L2-category-page-root?category_id={l2_id}&l3_category_id={l3_id}"
+
 
 def l3_names_on_page(page) -> dict[int, str]:
     """``{l3_id: name}`` for every L3 sub-header on an L2 category page.
@@ -292,20 +296,11 @@ def l3_names_on_page(page) -> dict[int, str]:
     return names
 
 
-async def get_product_category(
-    product_id: str, known_names: MutableMapping[int, str] | None = None
-) -> dict | None:
-    """Return a product's (L3) category, or ``None`` if unknown.
+async def get_category_ids(product_id: str) -> tuple[int | None, int, int] | None:
+    """A product's ``(l1_id, l2_id, l3_id)``, read from its product page.
 
-    The result is ``{"l1_id", "l2_id", "l3_id", "name"}``.  Neither search
-    tiles nor delivery articles carry a category, and the per-article
-    category endpoint is gone, so this loads the product page, whose category
-    button holds the three ids.  The name is the L3 sub-header on the L2
-    category page — a second request, skipped when *known_names* (``{l3_id:
-    name}``) already has it.  Every L3 named on that L2 page is added to
-    *known_names*, so products in sibling categories skip it.  ``None`` means Picnic has no page for the
-    product any more, the page has no category button, or the L2 page lacks
-    the L3.  Login errors propagate.
+    One request.  ``None`` means Picnic has no page for the product any more,
+    or the page has no category button.  Login errors propagate.
     """
     from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
 
@@ -313,32 +308,18 @@ async def get_product_category(
         article = await _call("get_article", product_id)
     except PicnicParseError:
         return None
-    if article is None:
-        return None
-    ids = _category_ids(article)
-    if ids is None:
-        return None
-    l1_id, l2_id, l3_id = ids
+    return None if article is None else _category_ids(article)
 
-    name = (known_names or {}).get(l3_id)
-    if not name:
-        try:
-            category = await _call("get_category_by_ids", l2_id, l3_id)
-        except PicnicParseError:
-            return None
-        if isinstance(category, dict):  # the mock client
-            name = category.get("name")
-            page = category.get("page")
-        else:
-            name = getattr(category, "name", None)
-            page = getattr(category, "raw", None)
-        if known_names is not None:
-            known_names.update(l3_names_on_page(page))
-            if name:
-                known_names[l3_id] = name
-    if not name:
-        return None
-    return {"l1_id": l1_id, "l2_id": l2_id, "l3_id": l3_id, "name": name}
+
+async def get_l3_names(l2_id: int, l3_id: int) -> dict[int, str]:
+    """``{l3_id: name}`` for every L3 category on an L2 category page.
+
+    One request.  *l3_id* is only part of the page's URL; the result is
+    whatever the page lists, which may or may not include it.  Login errors
+    propagate.
+    """
+    page = await _call("_get", L2_PAGE_PATH.format(l2_id=l2_id, l3_id=l3_id), add_picnic_headers=True)
+    return l3_names_on_page(page)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +394,6 @@ def _normalise_product(raw: dict) -> dict:
         "unit_price": int(price) if price else None,
         "unit_quantity": raw.get("unit_quantity") or raw.get("quantity"),
         "image_id": raw.get("image_id"),
-        "category": None,  # filled in from search context where available
     }
 
 
@@ -481,7 +461,6 @@ def delivery_line_items(detail: dict) -> list[dict]:
                         "unit_price": unit_price,
                         "unit_quantity": article.get("unit_quantity"),
                         "image_id": article.get("image_id") or (image_ids[0] if image_ids else None),
-                        "category": None,
                     },
                     "quantity": quantity,
                     "unit_price": unit_price,

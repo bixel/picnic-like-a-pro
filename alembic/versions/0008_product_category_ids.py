@@ -9,10 +9,14 @@ A product page links to its category as
 was kept, which merges same-named categories under different parents (e.g.
 "Alkoholfrei" beer and wine).
 
-Purely additive: ``products.category`` (the name) is kept, and existing rows
-get ``category_id`` NULL, so the next ``scripts/import_history.py`` run looks
-their category up again and fills in the ids.  Rolling back drops only the
-new table and column.
+The name moves to ``categories``: ``products.category`` is dropped, so a
+category's name is stored exactly once.  Existing names cannot be kept —
+they have no ids — so every product starts with ``category_id`` NULL and the
+next ``scripts/import_history.py`` run looks its category up again.  Products
+Picnic no longer lists lose their category name for good.
+
+Rolling back restores ``products.category`` from ``categories`` (so nothing
+looked up since is lost) and drops the new table and column.
 
 Revision ID: 0008
 Revises: 0007
@@ -46,9 +50,16 @@ def upgrade() -> None:
     with op.batch_alter_table("products") as batch_op:
         batch_op.add_column(sa.Column("category_id", sa.Integer(), nullable=True))
         batch_op.create_foreign_key(_FK, "categories", ["category_id"], ["id"])
+        batch_op.drop_column("category")
 
 
 def downgrade() -> None:
+    with op.batch_alter_table("products") as batch_op:
+        batch_op.add_column(sa.Column("category", sa.String(), nullable=True))
+    op.execute(
+        "UPDATE products SET category = "
+        "(SELECT name FROM categories WHERE categories.id = products.category_id)"
+    )
     with op.batch_alter_table("products") as batch_op:
         batch_op.drop_constraint(_FK, type_="foreignkey")
         batch_op.drop_column("category_id")
