@@ -13,8 +13,10 @@ History policy — truncation, serialization, storage, opt-out — lives in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -436,10 +438,9 @@ async def _chat(
     chat_id = update.effective_chat.id
     message_text = text or update.message.text or ""
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
     try:
-        reply = await _run_llm(chat_id, message_text)
+        async with _keep_typing(context.bot, chat_id):
+            reply = await _run_llm(chat_id, message_text)
     except Exception:  # noqa: BLE001
         logger.exception("Error running the LLM for chat %d", chat_id)
         reply = "Sorry, something went wrong. Please try again."
@@ -447,6 +448,38 @@ async def _chat(
     # Telegram messages have a 4096 character limit
     for chunk in _split_message(reply):
         await update.message.reply_text(chunk)
+
+
+# Telegram shows a chat action for about 5 seconds, or until the bot sends a
+# message, so it has to be re-sent for as long as the reply is being worked on
+# (LLM requests and tool calls alike).
+TYPING_REFRESH_SECONDS = 4.0
+
+
+async def _send_typing(bot, chat_id: int) -> None:
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:  # noqa: BLE001 — cosmetic; never break the reply
+        logger.debug("Could not send typing action to chat %d", chat_id, exc_info=True)
+
+
+async def _refresh_typing(bot, chat_id: int) -> None:
+    while True:
+        await asyncio.sleep(TYPING_REFRESH_SECONDS)
+        await _send_typing(bot, chat_id)
+
+
+@contextlib.asynccontextmanager
+async def _keep_typing(bot, chat_id: int) -> AsyncIterator[None]:
+    """Show "typing…" in *chat_id* until the block exits."""
+    await _send_typing(bot, chat_id)
+    task = asyncio.create_task(_refresh_typing(bot, chat_id))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def _split_message(text: str, max_len: int = 4096) -> list[str]:
