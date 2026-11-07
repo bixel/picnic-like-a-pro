@@ -344,38 +344,22 @@ async def create_message(
     # reply are kept so the call can be replayed (the table is sensitive).
     client = get_client()
     url, headers = _request_details(client)
-    timer = api_log.Timer.start()
-    try:
-        completion = await client.chat.completions.create(**kwargs)
-        response = from_openai_completion(completion)
-    except Exception as exc:
-        await api_log.record(
-            api_log.PROVIDER_OPENROUTER,
-            "chat.completions.create",
-            timer,
-            target=model,
-            http_method="POST",
-            url=url,
-            request_headers=headers,
-            request_body=kwargs,
-            response_body=api_log.error_response_body(exc),
-            error=exc,
-        )
-        raise
-
-    usage = getattr(completion, "usage", None)
-    await api_log.record(
+    async with api_log.capture_http_requests(
         api_log.PROVIDER_OPENROUTER,
         "chat.completions.create",
-        timer,
         target=model,
         http_method="POST",
         url=url,
         request_headers=headers,
-        http_status=200,  # the SDK raises on any non-2xx
-        input_tokens=getattr(usage, "prompt_tokens", None),
-        output_tokens=getattr(usage, "completion_tokens", None),
         request_body=kwargs,
-        response_body=completion,
-    )
-    return response
+    ) as entry:
+        completion = await client.chat.completions.create(**kwargs)
+        # Recorded before parsing, so a completion we cannot use (e.g. no
+        # choices, which raises LLMError) is still logged in full.  The SDK
+        # raises on any non-2xx, so 200 stays even if parsing then fails.
+        usage = getattr(completion, "usage", None)
+        entry.http_status = 200
+        entry.response_body = completion
+        entry.input_tokens = getattr(usage, "prompt_tokens", None)
+        entry.output_tokens = getattr(usage, "completion_tokens", None)
+        return from_openai_completion(completion)

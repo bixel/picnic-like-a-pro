@@ -299,11 +299,12 @@ class TestCreateMessage:
             usage={"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
         )
         monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completion))
-        await llm.create_message(
-            model="openai/gpt-5",
-            system=None,
-            messages=[{"role": "user", "content": "hello"}],
-        )
+        async with api_log.request_context("bot", chat_id=7):
+            await llm.create_message(
+                model="openai/gpt-5",
+                system=None,
+                messages=[{"role": "user", "content": "hello"}],
+            )
 
         async with get_db() as session:
             [row] = await list_api_requests(session, provider="openrouter")
@@ -339,7 +340,10 @@ class TestCreateMessage:
         monkeypatch.setattr(llm, "get_client", lambda: client)
 
         with pytest.raises(RuntimeError, match="unauthorized"):
-            await llm.create_message(model="openai/gpt-5", system=None, messages=[])
+            async with api_log.request_context("bot", chat_id=7):
+                await llm.create_message(
+                    model="openai/gpt-5", system=None, messages=[]
+                )
 
         async with get_db() as session:
             [row] = await list_api_requests(session, provider="openrouter")
@@ -356,12 +360,42 @@ class TestCreateMessage:
         monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completion))
 
         with pytest.raises(llm.LLMError):
-            await llm.create_message(model="m", system=None, messages=[])
+            async with api_log.request_context("bot", chat_id=7):
+                await llm.create_message(model="m", system=None, messages=[])
 
         async with get_db() as session:
             [row] = await list_api_requests(session, provider="openrouter")
         assert row["status"] == "error"
         assert row["error_type"] == "LLMError"
+        # The unusable completion itself is kept: it is what needs debugging.
+        assert row["http_status"] == 200
+        assert json.loads(row["response_body"])["choices"] == []
+
+    async def test_no_bodies_without_consent(self, monkeypatch):
+        """A chat that opted out of history leaves only metadata in the log."""
+        monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(_completion("hi")))
+        async with api_log.request_context("bot", chat_id=7, store_bodies=False):
+            await llm.create_message(
+                model="m", system=None, messages=[{"role": "user", "content": "diary"}]
+            )
+
+        async with get_db() as session:
+            [row] = await list_api_requests(session, provider="openrouter")
+        assert row["chat_id"] == 7
+        assert row["request_body"] is None and row["response_body"] is None
+        assert row["status"] == "success"
+
+    async def test_no_bodies_outside_a_chat_context(self, monkeypatch):
+        """Nothing confirmed consent, so an OpenRouter body is not stored."""
+        monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(_completion("hi")))
+        await llm.create_message(
+            model="m", system=None, messages=[{"role": "user", "content": "diary"}]
+        )
+
+        async with get_db() as session:
+            [row] = await list_api_requests(session, provider="openrouter")
+        assert row["chat_id"] is None
+        assert row["request_body"] is None and row["response_body"] is None
 
 
 class TestLlmClient:

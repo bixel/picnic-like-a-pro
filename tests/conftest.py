@@ -62,10 +62,7 @@ async def _reset_engine() -> None:
     this a second test would silently reuse the first test's engine (pointing
     at an already-deleted temp file).
     """
-    if engine_mod._engine is not None:
-        await engine_mod._engine.dispose()
-    engine_mod._engine = None
-    engine_mod._session_factory = None
+    await engine_mod.dispose_engines()
 
 
 @pytest_asyncio.fixture(autouse=True)

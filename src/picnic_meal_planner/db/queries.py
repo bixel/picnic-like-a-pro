@@ -627,17 +627,17 @@ async def delete_turns(
     return result.rowcount
 
 
-async def delete_turns_in_range(
+async def turn_ids_in_range(
     session: AsyncSession,
     chat_id: int,
     *,
     since: str | None = None,
     until: str | None = None,
-) -> int:
-    """Delete every turn that *started* within ``[since, until)`` (ISO datetimes).
+) -> list[int]:
+    """The turns that *started* within ``[since, until)`` (ISO datetimes).
 
-    The range is resolved to a set of whole turns first, rather than deleting
-    rows by timestamp — that is what stops a turn straddling the boundary from
+    The range is resolved to a set of whole turns, rather than deleting rows
+    by timestamp — that is what stops a turn straddling the boundary from
     being split in half.
     """
     stmt = (
@@ -649,9 +649,37 @@ async def delete_turns_in_range(
         stmt = stmt.having(func.min(ConversationMessage.created_at) >= since)
     if until is not None:
         stmt = stmt.having(func.min(ConversationMessage.created_at) < until)
+    return list((await session.scalars(stmt)).all())
 
-    turn_ids = (await session.scalars(stmt)).all()
-    return await delete_turns(session, chat_id, turn_ids)
+
+async def turn_time_windows(
+    session: AsyncSession, chat_id: int, turn_ids: Iterable[int]
+) -> list[tuple[str | None, str]]:
+    """``(after, until]`` time windows covering each named turn's API requests.
+
+    A turn's messages are all stamped when the turn is *committed*, after
+    every request it made, so the turn itself spans no time.  Its requests
+    lie between the previous turn's commit (exclusive; ``None`` for the
+    chat's first turn) and its own (inclusive).  A turn that was discarded
+    rather than committed falls into the next turn's window — deleting more,
+    never less.
+    """
+    wanted = set(turn_ids)
+    if not wanted:
+        return []
+    stmt = (
+        select(ConversationMessage.turn_id, func.max(ConversationMessage.created_at))
+        .where(ConversationMessage.chat_id == chat_id)
+        .group_by(ConversationMessage.turn_id)
+        .order_by(func.max(ConversationMessage.created_at))
+    )
+    windows = []
+    previous: str | None = None
+    for turn_id, committed_at in (await session.execute(stmt)).all():
+        if turn_id in wanted:
+            windows.append((previous, committed_at))
+        previous = committed_at
+    return windows
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +792,7 @@ async def delete_picnic_token(
 #
 # Append-only observability data, written best-effort by ``api_log.py``.  A
 # failure to write a row must never affect the request being logged, which is
-# why the provider wrappers swallow it rather than propagating.  As elsewhere
+# why ``api_log`` swallows it rather than propagating.  As elsewhere
 # in this module, the helpers are commit-neutral: the caller commits.
 # ---------------------------------------------------------------------------
 
@@ -788,6 +816,7 @@ def _api_request_dict(row: ApiRequest) -> dict:
         "response_body": row.response_body,
         "source": row.source,
         "run_id": row.run_id,
+        "chat_id": row.chat_id,
         "input_tokens": row.input_tokens,
         "output_tokens": row.output_tokens,
         "requested_at": row.requested_at,
@@ -814,6 +843,7 @@ async def insert_api_request(
     response_body: str | None = None,
     source: str | None = None,
     run_id: str | None = None,
+    chat_id: int | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
 ) -> None:
@@ -836,11 +866,33 @@ async def insert_api_request(
             response_body=response_body,
             source=source,
             run_id=run_id,
+            chat_id=chat_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             requested_at=requested_at,
         )
     )
+
+
+async def delete_api_requests(
+    session: AsyncSession,
+    chat_id: int,
+    *,
+    after: str | None = None,
+    until: str | None = None,
+) -> int:
+    """Delete a chat's logged requests, optionally within ``(after, until]``.
+
+    Returns how many rows were removed; the caller commits.  The bounds match
+    :func:`turn_time_windows`.
+    """
+    stmt = delete(ApiRequest).where(ApiRequest.chat_id == chat_id)
+    if after is not None:
+        stmt = stmt.where(ApiRequest.requested_at > after)
+    if until is not None:
+        stmt = stmt.where(ApiRequest.requested_at <= until)
+    result = await session.execute(stmt)
+    return result.rowcount
 
 
 async def list_api_requests(
