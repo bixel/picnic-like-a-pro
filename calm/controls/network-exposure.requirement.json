@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/network-exposure.requirement.json",
+  "title": "Network exposure control requirement",
+  "description": "Which inbound ports a component listens on.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://calm.finos.org/release/1.2/meta/control-requirement.json"
+    }
+  ],
+  "properties": {
+    "control-id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "documented-in": {
+      "type": "string",
+      "description": "Where the rule is written down"
+    },
+    "enforced-in": {
+      "type": "string",
+      "description": "Code location that enforces the control"
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment variables that configure it"
+    },
+    "inbound-ports": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    }
+  },
+  "required": [
+    "control-id",
+    "name",
+    "description",
+    "documented-in",
+    "enforced-in",
+    "inbound-ports"
+  ]
+}

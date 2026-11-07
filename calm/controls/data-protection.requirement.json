@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
+  "title": "Data protection control requirement",
+  "description": "How stored personal data or credentials are classified, erased, and what happens on failure.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://calm.finos.org/release/1.2/meta/control-requirement.json"
+    }
+  ],
+  "properties": {
+    "control-id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "documented-in": {
+      "type": "string",
+      "description": "Where the rule is written down"
+    },
+    "enforced-in": {
+      "type": "string",
+      "description": "Code location that enforces the control"
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment variables that configure it"
+    },
+    "data-classification": {
+      "enum": [
+        "personal",
+        "credential",
+        "business"
+      ]
+    },
+    "erasure": {
+      "type": "string"
+    },
+    "failure-mode": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "control-id",
+    "name",
+    "description",
+    "documented-in",
+    "enforced-in",
+    "data-classification",
+    "erasure",
+    "failure-mode"
+  ]
+}
