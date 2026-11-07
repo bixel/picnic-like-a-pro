@@ -20,7 +20,7 @@ import json
 import logging
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .engine import get_session_factory
 from .models import (
+    ApiRequest,
     ChatSettings,
     ConversationMessage,
     ImportCheckpoint,
@@ -755,4 +756,126 @@ async def delete_picnic_token(
     if only_if is not None:
         stmt = stmt.where(PicnicAuth.auth_token == only_if)
     result = await session.execute(stmt)
+    return result.rowcount
+
+
+# ---------------------------------------------------------------------------
+# API request log
+#
+# Append-only observability data, written best-effort by ``api_log.py``.  A
+# failure to write a row must never affect the request being logged, which is
+# why the provider wrappers swallow it rather than propagating.  As elsewhere
+# in this module, the helpers are commit-neutral: the caller commits.
+# ---------------------------------------------------------------------------
+
+
+def _api_request_dict(row: ApiRequest) -> dict:
+    return {
+        "id": row.id,
+        "provider": row.provider,
+        "operation": row.operation,
+        "target": row.target,
+        "http_method": row.http_method,
+        "url": row.url,
+        "request_headers": row.request_headers,
+        "response_headers": row.response_headers,
+        "status": row.status,
+        "http_status": row.http_status,
+        "duration_ms": row.duration_ms,
+        "error_type": row.error_type,
+        "error_message": row.error_message,
+        "request_body": row.request_body,
+        "response_body": row.response_body,
+        "source": row.source,
+        "run_id": row.run_id,
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "requested_at": row.requested_at,
+    }
+
+
+async def insert_api_request(
+    session: AsyncSession,
+    *,
+    provider: str,
+    operation: str,
+    status: str,
+    duration_ms: int,
+    requested_at: str,
+    target: str | None = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: str | None = None,
+    response_headers: str | None = None,
+    http_status: int | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    request_body: str | None = None,
+    response_body: str | None = None,
+    source: str | None = None,
+    run_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> None:
+    """Append one request-log row; the caller commits."""
+    session.add(
+        ApiRequest(
+            provider=provider,
+            operation=operation,
+            target=target,
+            http_method=http_method,
+            url=url,
+            request_headers=request_headers,
+            response_headers=response_headers,
+            status=status,
+            http_status=http_status,
+            duration_ms=duration_ms,
+            error_type=error_type,
+            error_message=error_message,
+            request_body=request_body,
+            response_body=response_body,
+            source=source,
+            run_id=run_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            requested_at=requested_at,
+        )
+    )
+
+
+async def list_api_requests(
+    session: AsyncSession,
+    *,
+    provider: str | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Return logged requests, newest first, optionally filtered.
+
+    A convenience for operators and scripts; the bot itself never reads it.
+    """
+    stmt = select(ApiRequest).order_by(ApiRequest.id.desc()).limit(limit)
+    if provider is not None:
+        stmt = stmt.where(ApiRequest.provider == provider)
+    if source is not None:
+        stmt = stmt.where(ApiRequest.source == source)
+    if status is not None:
+        stmt = stmt.where(ApiRequest.status == status)
+    rows = (await session.scalars(stmt)).all()
+    return [_api_request_dict(row) for row in rows]
+
+
+async def prune_api_requests(session: AsyncSession, *, keep_days: int) -> int:
+    """Delete log rows older than *keep_days*; return how many were removed.
+
+    The log is otherwise unbounded.  Intended for a periodic operator task
+    (cron, or before a backup), not for the request path.
+    """
+    if keep_days < 0:
+        raise ValueError("keep_days must be >= 0")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+    result = await session.execute(
+        delete(ApiRequest).where(ApiRequest.requested_at < cutoff)
+    )
     return result.rowcount

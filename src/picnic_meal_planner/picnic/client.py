@@ -21,9 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from functools import partial
 from typing import Any
 
+from .. import api_log
 from . import auth
 from .auth import PicnicLoginPending, PicnicLoginRequired
 
@@ -79,9 +79,21 @@ async def get_client():
 
         from python_picnic_api2 import Picnic2FARequired  # noqa: PLC0415
 
+        username, password = auth.credentials()
         api = auth.new_api()
         try:
-            await _run(api.login, *auth.credentials())
+            # The session capture records the real request/response.  The
+            # fallback is used only if no HTTP request was made.
+            async with api_log.capture_http_requests(
+                api_log.PROVIDER_PICNIC,
+                "login",
+                fallback_request_body={
+                    "key": username,
+                    "secret": api_log.REDACTED,
+                    "client_id": 30100,
+                },
+            ):
+                await _run(api.login, username, password)
         except Picnic2FARequired:
             _needs_login = True
             raise PicnicLoginRequired(
@@ -112,8 +124,26 @@ def reset_client() -> None:
 
 
 async def _run(func, *args, **kwargs) -> Any:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+    """Run the blocking Picnic library in a worker thread.
+
+    ``asyncio.to_thread`` (unlike ``run_in_executor``) copies the current
+    context, which is how the HTTP capture list reaches the session wrapper.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+# Methods whose first argument identifies the resource, and so is useful as
+# the indexed ``target``.  The argument is also visible in the request body;
+# this only decides what is easy to filter on.
+_LOGGED_TARGET_METHODS = frozenset(
+    {"get_article", "get_delivery", "add_product", "remove_product"}
+)
+
+
+def _log_target(method: str, args: tuple) -> str | None:
+    if args and method in _LOGGED_TARGET_METHODS:
+        return str(args[0])
+    return None
 
 
 async def _call(method: str, *args, **kwargs) -> Any:
@@ -122,11 +152,25 @@ async def _call(method: str, *args, **kwargs) -> Any:
     Picnic may hand out a new token on any response, and the session adopts
     it; storing it keeps a restart from resuming with a stale one.  A
     rejected token is cleared and turned into :class:`PicnicLoginRequired`.
+
+    The call is logged to ``api_requests`` (best-effort) at this single choke
+    point, so every caller gets it.  The session wrapper captures the actual
+    HTTP method, URL, headers and bodies; the fallback covers the mock client
+    and failures that happen before a request is sent.
     """
     global _client, _saved_token
     client = await get_client()
     try:
-        result = await _run(getattr(client, method), *args, **kwargs)
+        async with api_log.capture_http_requests(
+            api_log.PROVIDER_PICNIC,
+            method,
+            target=_log_target(method, args),
+            fallback_request_body=api_log.call_body(*args, **kwargs),
+        ) as session:
+            session.fallback_response_body = await _run(
+                getattr(client, method), *args, **kwargs
+            )
+            result = session.fallback_response_body
     except Exception as exc:
         from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
 

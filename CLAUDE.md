@@ -51,6 +51,7 @@ columns:
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
 | `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
 | `PicnicAuth` | `picnic_auth` | The Picnic session token (one row); a credential — never log it |
+| `ApiRequest` | `api_requests` | Append-only log of Picnic/OpenRouter HTTP calls; URLs, headers and bodies are sensitive |
 
 Datetime values are stored as **ISO-8601 strings** (`String` column type,
 not `DateTime`) to avoid SQLite timezone edge-cases and to keep the existing
@@ -74,6 +75,8 @@ Alembic manages all schema changes.
 | `alembic/versions/0002_*.py` | Conversation history (`conversation_messages`, `chat_settings`) — purely additive |
 | `alembic/versions/0003_*.py` | Per-chat LLM model (`chat_settings.model`, nullable) — purely additive |
 | `alembic/versions/0004_*.py` | Picnic session token (`picnic_auth`) — purely additive |
+| `alembic/versions/0005_*.py` | API request log (`api_requests`) — purely additive |
+| `alembic/versions/0006_*.py` | HTTP method, URL and headers on `api_requests` — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -154,6 +157,7 @@ src/picnic_meal_planner/
 │                     #   per-chat model selection
 ├── history.py        # Conversation history policy: serialization, truncation,
 │                     #   caching, persistence, opt-out, deletion
+├── api_log.py        # Best-effort Picnic/OpenRouter request logging (URLs, headers, bodies)
 ├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting
 ├── db/
 │   ├── __init__.py   # Re-exports: Base, models, get_db, init_db
@@ -316,6 +320,45 @@ in `picnic/auth.py`, and `client.py` applies it.
 
 ---
 
+## API Request Log
+
+`api_requests` records HTTP calls to the two external APIs, written by
+`api_log.py`.  Instrumentation is at each provider's single choke point, not at
+call sites: Picnic's `requests.Session` is wrapped at creation (so every normal
+operation, login and 2FA call is captured), and `llm.create_message` records
+its OpenRouter call.
+
+- **Requests are replayable.** A row stores `http_method`, the full `url`
+  (including query string), `request_headers`/`response_headers` and the
+  complete `request_body`/`response_body`.  Bodies are **not truncated**.  For
+  OpenRouter, response headers are not exposed by the SDK, so that field is
+  NULL; request headers, URL and body are complete.
+- **Credentials are masked, not omitted.** Header values for
+  `Authorization`, `x-picnic-auth`, cookies and any name containing `token`,
+  `secret`, `api-key`/`apikey` or ending in `-auth` become `[REDACTED]` (a
+  `Bearer`/`Basic` scheme is preserved).  Body keys such as `password`,
+  `secret`, `otp`, `token` and `api_key` are redacted recursively.  To replay
+  a call, substitute the real credential back into the stored curl command.
+- **The table is sensitive.** It contains chat prompts, tool results and
+  order details.  Protect the database file, and prune the log with
+  `db.queries.prune_api_requests(session, keep_days=N)` from an operator task
+  (cron, pre-backup).  `API_LOG_BODIES=false` disables body capture; URLs and
+  headers are still stored.
+- **Other fields:** `provider`, `operation`, `target` (delivery/product id or
+  model id), `status`, `http_status`, `duration_ms`, `error_type`,
+  `error_message` (truncated), `source`, `run_id`, token counts and
+  `requested_at`.  `db.queries.list_api_requests()` filters by provider,
+  source and status.
+- **Best effort.** A failed log write is a warning and never changes the
+  outcome of the request being logged — the opposite default from `history.py`
+  deletion.  The insert is awaited, so a row is committed before the caller
+  returns.
+- **Run grouping.** `api_log.request_context(source)` uses a contextvar;
+  `scripts/import_history.py` wraps its whole run, so all rows share a
+  `source` (`import_history`) and one `run_id`.  Bot/MCP calls have NULL there.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -332,6 +375,7 @@ in `picnic/auth.py`, and `client.py` applies it.
 | `LLM_ALLOWED_MODELS` | — | Comma-separated allowlist for per-chat models; empty = any |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Override only for a proxy/gateway |
 | `OPENROUTER_APP_NAME` / `OPENROUTER_APP_URL` | `Picnic Like a Pro` / — | Optional attribution headers |
+| `API_LOG_BODIES` | `true` | Store full request/response bodies in `api_requests`; `false` = no bodies (URLs/headers still stored) |
 | `ALLOWED_TELEGRAM_USER_IDS` | — | Comma-separated list of allowed user IDs |
 | `ALLOW_ALL_USERS` | `false` | Set to `true` for local dev (bypasses auth) |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `http` |

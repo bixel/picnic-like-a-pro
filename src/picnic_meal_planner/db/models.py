@@ -138,3 +138,54 @@ class PicnicAuth(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     auth_token: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime
+
+
+class ApiRequest(Base):
+    """One logged call to an external API (Picnic or OpenRouter).
+
+    Append-only observability data: ``api_log.py`` writes rows best-effort and
+    nothing ever updates them.  A row records the HTTP method, full URL,
+    request/response headers and the complete request/response bodies, so a
+    logged call can be replayed with curl after substituting the real
+    credentials.
+
+    **This table contains sensitive data** (chat prompts, tool results, order
+    details).  Credential values — the Picnic password/2FA code/session token
+    and the OpenRouter API key — are replaced with ``[REDACTED]``, but the rest
+    of the headers and bodies is verbatim and is **not truncated**.  Treat the
+    database file accordingly and prune the log with
+    ``db.queries.prune_api_requests()``.
+
+    ``source`` and ``run_id`` attribute a request to the process or script run
+    that made it; ``scripts/import_history.py`` sets both for a whole run.
+    ``input_tokens``/``output_tokens`` are only populated for OpenRouter.
+    """
+
+    __tablename__ = "api_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)   # 'picnic' | 'openrouter'
+    operation: Mapped[str] = mapped_column(String, nullable=False)  # client method / endpoint
+    target: Mapped[str | None] = mapped_column(String, nullable=True)  # model id / resource id
+    http_method: Mapped[str | None] = mapped_column(String, nullable=True)  # GET / POST / ...
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)  # full URL, incl. query string
+    request_headers: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON, redacted
+    response_headers: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON, redacted
+    status: Mapped[str] = mapped_column(String, nullable=False)     # 'success' | 'error'
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_body: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON
+    response_body: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    source: Mapped[str | None] = mapped_column(String, nullable=True)  # 'import_history' | ...
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime, start
+
+    __table_args__ = (
+        Index("idx_api_requests_time", "requested_at"),
+        Index("idx_api_requests_provider_time", "provider", "requested_at"),
+        Index("idx_api_requests_run", "run_id"),
+    )
