@@ -15,6 +15,7 @@ from picnic_meal_planner import llm
 from picnic_meal_planner.db.queries import (
     get_chat_settings,
     get_db,
+    list_api_requests,
     list_chat_models,
     set_chat_persist_history,
 )
@@ -24,6 +25,7 @@ def _completion(
     content: str | None = None,
     tool_calls: list[dict] | None = None,
     finish_reason: str = "stop",
+    usage: dict | None = None,
 ) -> ChatCompletion:
     message: dict = {"role": "assistant", "content": content}
     if tool_calls:
@@ -38,17 +40,18 @@ def _completion(
             }
             for tc in tool_calls
         ]
-    return ChatCompletion.model_validate(
-        {
-            "id": "gen-1",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "openai/gpt-5",
-            "choices": [
-                {"index": 0, "message": message, "finish_reason": finish_reason}
-            ],
-        }
-    )
+    payload = {
+        "id": "gen-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "openai/gpt-5",
+        "choices": [
+            {"index": 0, "message": message, "finish_reason": finish_reason}
+        ],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return ChatCompletion.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +286,66 @@ class TestCreateMessage:
         monkeypatch.setattr(llm, "get_client", lambda: client)
         await llm.create_message(model="m", system=None, messages=[], tools=[])
         assert "tools" not in client.chat.completions.kwargs
+
+    async def test_successful_request_is_logged_with_token_usage(self, monkeypatch):
+        completion = _completion(
+            "hi",
+            usage={"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        )
+        monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completion))
+        await llm.create_message(
+            model="openai/gpt-5",
+            system=None,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        async with get_db() as session:
+            [row] = await list_api_requests(session, provider="openrouter")
+        assert row["operation"] == "chat.completions.create"
+        assert row["target"] == "openai/gpt-5"
+        assert row["status"] == "success"
+        assert row["http_status"] == 200
+        assert (row["input_tokens"], row["output_tokens"]) == (11, 7)
+        assert json.loads(row["request_body"])["messages"] == [
+            {"role": "user", "content": "hello"}
+        ]
+        response = json.loads(row["response_body"])
+        assert response["choices"][0]["message"]["content"] == "hi"
+
+    async def test_transport_failure_is_logged_and_reraised(self, monkeypatch):
+        class _Failing:
+            async def create(self, **_kwargs):
+                error = RuntimeError("unauthorized")
+                error.status_code = 401
+                raise error
+
+        client = type("Client", (), {})()
+        client.chat = type("Chat", (), {})()
+        client.chat.completions = _Failing()
+        monkeypatch.setattr(llm, "get_client", lambda: client)
+
+        with pytest.raises(RuntimeError, match="unauthorized"):
+            await llm.create_message(model="openai/gpt-5", system=None, messages=[])
+
+        async with get_db() as session:
+            [row] = await list_api_requests(session, provider="openrouter")
+        assert row["status"] == "error"
+        assert row["http_status"] == 401
+        assert row["error_type"] == "RuntimeError"
+        assert json.loads(row["request_body"])["model"] == "openai/gpt-5"
+
+    async def test_an_empty_completion_is_logged_as_an_error(self, monkeypatch):
+        completion = _completion("x")
+        completion.choices = []
+        monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completion))
+
+        with pytest.raises(llm.LLMError):
+            await llm.create_message(model="m", system=None, messages=[])
+
+        async with get_db() as session:
+            [row] = await list_api_requests(session, provider="openrouter")
+        assert row["status"] == "error"
+        assert row["error_type"] == "LLMError"
 
 
 class TestLlmClient:

@@ -6,8 +6,11 @@ MockPicnicAPI, so no test here touches the network.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.picnic import client as picnic
 
 
@@ -429,3 +432,52 @@ class TestDeliveryUnusableReason:
     ])
     def test_unusable_payloads(self, detail):
         assert picnic.delivery_unusable_reason(detail)
+
+
+# ---------------------------------------------------------------------------
+# Request logging (api_log)
+# ---------------------------------------------------------------------------
+
+async def _rows() -> list[dict]:
+    async with db.get_db() as session:
+        return await db.list_api_requests(session, provider="picnic")
+
+
+class TestRequestLogging:
+    async def test_successful_call_is_logged_with_its_target(self):
+        deliveries = await picnic.get_deliveries()
+        delivery_id = deliveries[0]["id"]
+        await picnic.get_delivery(delivery_id)
+
+        row = next(r for r in await _rows() if r["operation"] == "get_delivery")
+        assert row["target"] == delivery_id
+        assert row["status"] == "success"
+        assert row["error_type"] is None
+        assert json.loads(row["request_body"]) == {
+            "args": [delivery_id],
+            "kwargs": {},
+        }
+        assert json.loads(row["response_body"])["id"] == delivery_id
+
+    async def test_search_query_is_not_recorded_as_a_target(self):
+        await picnic.search_products("milk")
+
+        row = next(r for r in await _rows() if r["operation"] == "search")
+        assert row["target"] is None
+        # The query is not an indexed target, but it is in the body.
+        assert json.loads(row["request_body"]) == {"args": ["milk"], "kwargs": {}}
+
+    async def test_failed_call_is_logged_and_reraised(self, monkeypatch):
+        def boom(_query):
+            raise RuntimeError("picnic down")
+
+        monkeypatch.setattr(picnic._client, "search", boom)
+        with pytest.raises(RuntimeError, match="picnic down"):
+            await picnic.search_products("milk")
+
+        [row] = await _rows()
+        assert row["operation"] == "search"
+        assert row["status"] == "error"
+        assert row["error_type"] == "RuntimeError"
+        assert row["error_message"] == "picnic down"
+        assert json.loads(row["request_body"]) == {"args": ["milk"], "kwargs": {}}

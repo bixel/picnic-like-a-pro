@@ -19,6 +19,11 @@ Every run then looks up the category of each stored product that has none
 yet (delivery data carries no categories), including runs that find no new
 deliveries.  A product Picnic no longer lists is retried on the next run.
 
+Every Picnic request is recorded in the ``api_requests`` table by
+``picnic/client.py`` (best-effort, including the JSON request/response
+bodies).  The run opens a logging context, so all of its rows share one
+``source`` and ``run_id`` and can be inspected as a single batch.
+
 Usage:
     uv run python scripts/import_history.py
 
@@ -41,6 +46,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from picnic_meal_planner import api_log
 from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.db.engine import SCHEMA_REVISION, init_db, pending_migration
 from picnic_meal_planner.picnic import client as picnic
@@ -60,8 +66,11 @@ async def main() -> None:
             "Run `uv run alembic upgrade head` first."
         )
     await init_db()
-    await import_deliveries()
-    await backfill_categories()
+    # Group every request this run makes under one source/run_id in
+    # `api_requests`, so an import can be inspected as a single batch.
+    async with api_log.request_context("import_history"):
+        await import_deliveries()
+        await backfill_categories()
 
 
 async def backfill_categories() -> None:

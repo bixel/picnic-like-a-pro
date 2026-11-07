@@ -36,6 +36,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from . import api_log
 from .db.queries import get_chat_settings, get_db, upsert_chat_model
 
 logger = logging.getLogger(__name__)
@@ -319,5 +320,37 @@ async def create_message(
     }
     if tools:
         kwargs["tools"] = to_openai_tools(tools)
-    completion = await get_client().chat.completions.create(**kwargs)
-    return from_openai_completion(completion)
+
+    # Every OpenRouter call goes through here, so this is the single place
+    # the request log needs to hook in.  The full request and reply are kept
+    # for debugging (the table is sensitive); the API key lives in a header
+    # and is never part of either body.
+    timer = api_log.Timer.start()
+    try:
+        completion = await get_client().chat.completions.create(**kwargs)
+        response = from_openai_completion(completion)
+    except Exception as exc:
+        await api_log.record(
+            api_log.PROVIDER_OPENROUTER,
+            "chat.completions.create",
+            timer,
+            target=model,
+            request_body=kwargs,
+            response_body=api_log.error_response_body(exc),
+            error=exc,
+        )
+        raise
+
+    usage = getattr(completion, "usage", None)
+    await api_log.record(
+        api_log.PROVIDER_OPENROUTER,
+        "chat.completions.create",
+        timer,
+        target=model,
+        http_status=200,  # the SDK raises on any non-2xx
+        input_tokens=getattr(usage, "prompt_tokens", None),
+        output_tokens=getattr(usage, "completion_tokens", None),
+        request_body=kwargs,
+        response_body=completion,
+    )
+    return response

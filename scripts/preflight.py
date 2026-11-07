@@ -210,7 +210,7 @@ async def check_database() -> None:
         record(FAIL, "database", f"cannot open: {type(exc).__name__}")
         return
 
-    needed = {"conversation_messages", "chat_settings", "picnic_auth"}
+    needed = {"conversation_messages", "chat_settings", "picnic_auth", "api_requests"}
     missing = needed - tables
     if missing:
         record(

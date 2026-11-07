@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
+from .. import api_log
 from ..db import queries as db
 
 logger = logging.getLogger(__name__)
@@ -62,9 +63,37 @@ HOW_TO_LOGIN = (
 )
 
 
+def _login_body(operation: str, args: tuple) -> dict:
+    """The request body for one login step, with credentials removed."""
+    if operation == "login":
+        return {
+            "username": args[0] if args else None,
+            "password": api_log.REDACTED,
+        }
+    if operation == "verify_2fa_code":
+        return {"code": api_log.REDACTED}
+    if operation == "generate_2fa_code":
+        return {"channel": args[0] if args else None}
+    return {"args": api_log.REDACTED}
+
+
 async def _run(func, *args, **kwargs) -> Any:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+    """Run one blocking login step in the executor, logging it.
+
+    Login is the only Picnic traffic that does not go through
+    ``client._call()``, so it is logged here.  Request bodies are redacted
+    (:func:`_login_body`) and responses are deliberately not captured: a
+    successful login response carries the session token.
+    """
+    operation = getattr(func, "__name__", "picnic_login")
+    async with api_log.api_request(
+        api_log.PROVIDER_PICNIC,
+        operation,
+        request_body=_login_body(operation, args),
+        capture_response=False,
+    ):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 
 def credentials() -> tuple[str, str]:

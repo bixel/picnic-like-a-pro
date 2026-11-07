@@ -24,6 +24,7 @@ import os
 from functools import partial
 from typing import Any
 
+from .. import api_log
 from . import auth
 from .auth import PicnicLoginPending, PicnicLoginRequired
 
@@ -79,9 +80,18 @@ async def get_client():
 
         from python_picnic_api2 import Picnic2FARequired  # noqa: PLC0415
 
+        username, password = auth.credentials()
         api = auth.new_api()
         try:
-            await _run(api.login, *auth.credentials())
+            # The response contains the session token, so it is deliberately
+            # not captured; the password is redacted in the request body.
+            async with api_log.api_request(
+                api_log.PROVIDER_PICNIC,
+                "login",
+                request_body={"username": username, "password": api_log.REDACTED},
+                capture_response=False,
+            ):
+                await _run(api.login, username, password)
         except Picnic2FARequired:
             _needs_login = True
             raise PicnicLoginRequired(
@@ -116,17 +126,41 @@ async def _run(func, *args, **kwargs) -> Any:
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 
+# Methods whose first argument identifies the resource, and so is useful as
+# the indexed ``target``.  The argument is also visible in the request body;
+# this only decides what is easy to filter on.
+_LOGGED_TARGET_METHODS = frozenset(
+    {"get_article", "get_delivery", "add_product", "remove_product"}
+)
+
+
+def _log_target(method: str, args: tuple) -> str | None:
+    if args and method in _LOGGED_TARGET_METHODS:
+        return str(args[0])
+    return None
+
+
 async def _call(method: str, *args, **kwargs) -> Any:
     """Call a client method, keeping the stored token in step with the session.
 
     Picnic may hand out a new token on any response, and the session adopts
     it; storing it keeps a restart from resuming with a stale one.  A
     rejected token is cleared and turned into :class:`PicnicLoginRequired`.
+
+    The call is logged to ``api_requests`` (best-effort) at this single choke
+    point, so every caller gets it.
     """
     global _client, _saved_token
     client = await get_client()
     try:
-        result = await _run(getattr(client, method), *args, **kwargs)
+        async with api_log.api_request(
+            api_log.PROVIDER_PICNIC,
+            method,
+            target=_log_target(method, args),
+            request_body=api_log.call_body(*args, **kwargs),
+        ) as entry:
+            entry.response_body = await _run(getattr(client, method), *args, **kwargs)
+            result = entry.response_body
     except Exception as exc:
         from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
 

@@ -107,6 +107,7 @@ picnic-like-a-pro/
 │       ├── bot.py              # Telegram bot entry point
 │       ├── history.py          # Conversation history policy & persistence
 │       ├── llm.py              # OpenRouter client, message translation, per-chat model
+│       ├── api_log.py          # Best-effort Picnic/OpenRouter request logging
 │       ├── mcp_server.py       # FastMCP server (all tools)
 │       │
 │       ├── db/
@@ -285,6 +286,37 @@ The Picnic session token, shared by every process using the account (migration
 | id         | INTEGER PK | Always 1                                |
 | auth_token | TEXT       | Session token — a credential, never logged |
 | updated_at | TEXT       | ISO datetime                            |
+
+### `api_requests`
+Append-only log of calls to Picnic and OpenRouter (migration 0005), written
+best-effort by `api_log.py`. It keeps the JSON request/response bodies for
+debugging. Headers are never stored, and credential fields (password, 2FA
+code, token, API key, secret) are redacted before a body is written; login
+responses are not captured because they contain the session token. The table
+still contains prompt, tool-result and order data, so treat the database file
+as sensitive and prune the log.
+
+| Column        | Type    | Notes                                      |
+|---------------|---------|--------------------------------------------|
+| id            | INTEGER PK AUTOINCREMENT |                    |
+| provider      | TEXT    | `picnic` or `openrouter`                   |
+| operation     | TEXT    | client method / endpoint                   |
+| target        | TEXT    | model id or delivery/product id (nullable) |
+| status        | TEXT    | `success` or `error`                       |
+| http_status   | INTEGER | when the transport exposes one             |
+| duration_ms   | INTEGER | wall-clock time of the call                |
+| error_type    | TEXT    | exception class name on failure            |
+| error_message | TEXT    | truncated exception message                |
+| request_body  | TEXT    | JSON call args / OpenRouter request        |
+| response_body | TEXT    | JSON result / OpenRouter completion        |
+| source        | TEXT    | `import_history`, or NULL for bot/MCP      |
+| run_id        | TEXT    | groups one script run                      |
+| input_tokens  | INTEGER | OpenRouter prompt tokens                   |
+| output_tokens | INTEGER | OpenRouter completion tokens               |
+| requested_at  | TEXT    | ISO datetime the request started           |
+
+Indexed on `requested_at`, `(provider, requested_at)` and `run_id`. Prune old
+rows with `db.queries.prune_api_requests()`.
 
 ### `meal_plans`
 Optional: track planned meals to drive shopping list generation.

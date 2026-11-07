@@ -116,6 +116,7 @@ class TestMigrationRuns:
             "conversation_messages",
             "chat_settings",
             "picnic_auth",
+            "api_requests",
         }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):
@@ -145,7 +146,8 @@ class TestMigrationMatchesModels:
         assert set(_schema_snapshot(migrated_db)) == set(_schema_snapshot(orm_db))
 
     @pytest.mark.parametrize(
-        "table", ["products", "orders", "order_items", "import_checkpoints"]
+        "table",
+        ["products", "orders", "order_items", "import_checkpoints", "api_requests"],
     )
     def test_same_columns(self, migrated_db, orm_db, table):
         migrated = _schema_snapshot(migrated_db)[table]["columns"]
@@ -156,7 +158,8 @@ class TestMigrationMatchesModels:
         )
 
     @pytest.mark.parametrize(
-        "table", ["products", "orders", "order_items", "import_checkpoints"]
+        "table",
+        ["products", "orders", "order_items", "import_checkpoints", "api_requests"],
     )
     def test_same_primary_keys(self, migrated_db, orm_db, table):
         assert (
