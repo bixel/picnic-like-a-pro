@@ -3,10 +3,10 @@
 Adds ``api_requests``: an append-only log of calls to Picnic and OpenRouter,
 written best-effort by ``api_log.py``.  A row holds provider, operation,
 target, timing, outcome, error type/message, source/run id, token counts, and
-the JSON request/response bodies.  Headers are never stored; credentials
-(password, 2FA codes, session tokens) are redacted before a body is written,
-but the table still contains prompt and order data and should be treated as
-sensitive and pruned with ``db.queries.prune_api_requests()``.
+the JSON request/response bodies.  Migration 0006 adds the HTTP method, full
+URL and (redacted) headers.  The table contains prompt and order data and
+should be treated as sensitive and pruned with
+``db.queries.prune_api_requests()``.
 
 Purely additive (one new table plus its indexes), so it is safe to apply to a
 populated database and safe to roll back — rolling back only discards

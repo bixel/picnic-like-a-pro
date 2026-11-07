@@ -11,7 +11,7 @@ import json
 import pytest
 from openai.types.chat import ChatCompletion
 
-from picnic_meal_planner import llm
+from picnic_meal_planner import api_log, llm
 from picnic_meal_planner.db.queries import (
     get_chat_settings,
     get_db,
@@ -257,6 +257,12 @@ class _FakeCompletions:
 
 
 class _FakeClient:
+    base_url = "https://openrouter.ai/api/v1/"
+    default_headers = {
+        "Authorization": "Bearer sk-or-test",
+        "X-Title": "test",
+    }
+
     def __init__(self, completion):
         self.chat = type("Chat", (), {})()
         self.chat.completions = _FakeCompletions(completion)
@@ -306,6 +312,12 @@ class TestCreateMessage:
         assert row["status"] == "success"
         assert row["http_status"] == 200
         assert (row["input_tokens"], row["output_tokens"]) == (11, 7)
+        assert row["http_method"] == "POST"
+        assert row["url"] == "https://openrouter.ai/api/v1/chat/completions"
+        headers = json.loads(row["request_headers"])
+        assert headers["Authorization"] == f"Bearer {api_log.REDACTED}"
+        assert headers["X-Title"] == "test"
+        assert headers["Content-Type"] == "application/json"
         assert json.loads(row["request_body"])["messages"] == [
             {"role": "user", "content": "hello"}
         ]
@@ -320,6 +332,8 @@ class TestCreateMessage:
                 raise error
 
         client = type("Client", (), {})()
+        client.base_url = "https://openrouter.ai/api/v1/"
+        client.default_headers = {"Authorization": "Bearer sk-or-test"}
         client.chat = type("Chat", (), {})()
         client.chat.completions = _Failing()
         monkeypatch.setattr(llm, "get_client", lambda: client)
@@ -332,6 +346,8 @@ class TestCreateMessage:
         assert row["status"] == "error"
         assert row["http_status"] == 401
         assert row["error_type"] == "RuntimeError"
+        assert row["http_method"] == "POST"
+        assert row["url"] == "https://openrouter.ai/api/v1/chat/completions"
         assert json.loads(row["request_body"])["model"] == "openai/gpt-5"
 
     async def test_an_empty_completion_is_logged_as_an_error(self, monkeypatch):

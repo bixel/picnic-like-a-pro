@@ -6,12 +6,15 @@ The per-test SQLite database from conftest is already initialised with the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from datetime import UTC, datetime
 
 import pytest
+import requests
+from requests.adapters import BaseAdapter
 
 from picnic_meal_planner import api_log
 from picnic_meal_planner.db import queries as db
@@ -34,12 +37,22 @@ class _ApiError(Exception):
 
 
 class TestRecord:
-    async def test_success_row_records_metadata_and_bodies(self):
+    async def test_success_row_records_http_details_and_bodies(self):
         await api_log.record(
             api_log.PROVIDER_PICNIC,
             "get_delivery",
             _timer(),
             target="d1",
+            http_method="GET",
+            url="https://storefront.example/api/15/delivery/d1",
+            request_headers={
+                "Authorization": "Bearer secret",
+                "X-Title": "test",
+            },
+            response_headers={
+                "x-picnic-auth": "new-token",
+                "Content-Type": "application/json",
+            },
             request_body={"args": ["d1"]},
             response_body={"id": "d1", "items": []},
         )
@@ -47,11 +60,21 @@ class TestRecord:
         assert row["provider"] == "picnic"
         assert row["operation"] == "get_delivery"
         assert row["target"] == "d1"
+        assert row["http_method"] == "GET"
+        assert row["url"] == "https://storefront.example/api/15/delivery/d1"
         assert row["status"] == "success"
         assert row["http_status"] is None
         assert row["duration_ms"] >= 0
         assert row["error_type"] is None
         assert row["error_message"] is None
+        assert json.loads(row["request_headers"]) == {
+            "Authorization": f"Bearer {api_log.REDACTED}",
+            "X-Title": "test",
+        }
+        assert json.loads(row["response_headers"]) == {
+            "x-picnic-auth": api_log.REDACTED,
+            "Content-Type": "application/json",
+        }
         assert json.loads(row["request_body"]) == {"args": ["d1"]}
         assert json.loads(row["response_body"]) == {"id": "d1", "items": []}
         assert row["requested_at"] == "2026-01-01T00:00:00+00:00"
@@ -92,17 +115,32 @@ class TestRecord:
         assert row["request_body"] is None
         assert row["response_body"] is None
 
-    async def test_bodies_are_truncated(self, monkeypatch):
-        monkeypatch.setattr(api_log, "MAX_BODY_CHARS", 20)
+    async def test_bodies_are_not_truncated(self):
+        value = "x" * 5000
         await api_log.record(
             api_log.PROVIDER_PICNIC,
             "op",
             _timer(),
-            request_body={"a": "x" * 100},
+            request_body={"a": value},
+            response_body={"b": value},
         )
         [row] = await _rows()
-        assert row["request_body"].startswith('{"a": "xxxxxxxx')
-        assert "[truncated " in row["request_body"]
+        assert json.loads(row["request_body"])["a"] == value
+        assert json.loads(row["response_body"])["b"] == value
+
+    async def test_json_string_bodies_are_redacted(self):
+        await api_log.record(
+            api_log.PROVIDER_PICNIC,
+            "login",
+            _timer(),
+            request_body='{"key": "me@example.test", "secret": "abc", "otp": "123"}',
+        )
+        [row] = await _rows()
+        assert json.loads(row["request_body"]) == {
+            "key": "me@example.test",
+            "secret": api_log.REDACTED,
+            "otp": api_log.REDACTED,
+        }
 
     async def test_error_row_records_type_and_http_status(self):
         await api_log.record(
@@ -229,21 +267,25 @@ class TestRequestContext:
         assert (row["source"], row["run_id"]) == (None, None)
 
 
-class TestApiRequestContextManager:
-    async def test_success_is_logged_with_the_response_body(self):
-        async with api_log.api_request(
-            api_log.PROVIDER_PICNIC, "get_cart", request_body={"args": []}
-        ) as entry:
-            entry.response_body = {"items": [{"id": "p1"}]}
+class TestCaptureHttpRequests:
+    async def test_fallback_success_is_logged(self):
+        async with api_log.capture_http_requests(
+            api_log.PROVIDER_PICNIC,
+            "get_cart",
+            fallback_request_body={"args": []},
+        ) as session:
+            session.fallback_response_body = {"items": [{"id": "p1"}]}
 
         [row] = await _rows()
         assert row["status"] == "success"
+        assert row["http_method"] is None
+        assert row["url"] is None
         assert json.loads(row["request_body"]) == {"args": []}
         assert json.loads(row["response_body"]) == {"items": [{"id": "p1"}]}
 
-    async def test_error_is_logged_and_reraised(self):
+    async def test_fallback_error_is_logged_and_reraised(self):
         with pytest.raises(_ApiError, match="boom"):
-            async with api_log.api_request(
+            async with api_log.capture_http_requests(
                 api_log.PROVIDER_PICNIC, "get_delivery", target="d1"
             ):
                 raise _ApiError("boom")
@@ -254,22 +296,172 @@ class TestApiRequestContextManager:
         assert row["target"] == "d1"
         assert row["error_type"] == "_ApiError"
 
-    async def test_response_capture_can_be_disabled_for_credentials(self):
-        class _CredentialBearingError(_ApiError):
-            def __init__(self, message: str):
-                super().__init__(message)
-                self.body = {"auth_token": "secret"}
+    async def test_captured_requests_become_rows(self):
+        async with api_log.capture_http_requests(
+            api_log.PROVIDER_PICNIC, "get_delivery", target="d1"
+        ) as session:
+            session.captures.append(
+                api_log.HttpCapture(
+                    method="GET",
+                    url="https://storefront.example/api/15/delivery/d1",
+                    request_headers={"x-picnic-auth": "old-token"},
+                    response_headers={"x-picnic-auth": "new-token"},
+                    response_body={"id": "d1"},
+                    status_code=200,
+                )
+            )
 
-        with pytest.raises(_CredentialBearingError):
-            async with api_log.api_request(
-                api_log.PROVIDER_PICNIC, "login", capture_response=False
-            ) as entry:
-                entry.response_body = {"auth_token": "secret"}
-                raise _CredentialBearingError("2fa")
+        [row] = await _rows()
+        assert row["http_method"] == "GET"
+        assert row["url"] == "https://storefront.example/api/15/delivery/d1"
+        assert json.loads(row["request_headers"]) == {
+            "x-picnic-auth": api_log.REDACTED
+        }
+        assert json.loads(row["response_headers"]) == {
+            "x-picnic-auth": api_log.REDACTED
+        }
+        assert json.loads(row["response_body"]) == {"id": "d1"}
+
+
+class _Prepared:
+    method = "POST"
+    url = "https://storefront.example/api/15/user/login?x=1"
+    headers = {
+        "x-picnic-auth": "old-token",
+        "User-Agent": "okhttp/4.9.0",
+        "Content-Type": "application/json",
+    }
+    body = '{"key": "me@example.test", "secret": "md5", "client_id": 30100}'
+
+
+class _Response:
+    status_code = 200
+    headers = {
+        "content-type": "application/json",
+        "x-picnic-auth": "new-token",
+    }
+    text = '{"user_id": "u1", "token": "body-token"}'
+    request = _Prepared()
+
+
+class _Session:
+    headers = {"User-Agent": "okhttp/4.9.0", "x-picnic-auth": "old-token"}
+
+    def request(self, method, url, **kwargs):
+        return _Response()
+
+
+class _Api:
+    session = _Session()
+
+
+class TestPicnicCapture:
+    async def test_captures_prepared_request_and_response(self):
+        api = _Api()
+        assert api_log.install_picnic_capture(api) is True
+        assert api_log.install_picnic_capture(api) is True  # idempotent
+
+        async with api_log.capture_http_requests(
+            api_log.PROVIDER_PICNIC, "login"
+        ):
+            await asyncio.to_thread(
+                api.session.request,
+                "POST",
+                "https://storefront.example/api/15/user/login",
+                json={"key": "me@example.test", "secret": "md5"},
+            )
+
+        [row] = await _rows()
+        assert row["http_method"] == "POST"
+        assert row["url"] == "https://storefront.example/api/15/user/login?x=1"
+        assert row["status"] == "success"
+        assert json.loads(row["request_headers"]) == {
+            "x-picnic-auth": api_log.REDACTED,
+            "User-Agent": "okhttp/4.9.0",
+            "Content-Type": "application/json",
+        }
+        assert json.loads(row["request_body"]) == {
+            "key": "me@example.test",
+            "secret": api_log.REDACTED,
+            "client_id": 30100,
+        }
+        assert json.loads(row["response_headers"]) == {
+            "content-type": "application/json",
+            "x-picnic-auth": api_log.REDACTED,
+        }
+        assert json.loads(row["response_body"]) == {
+            "user_id": "u1",
+            "token": api_log.REDACTED,
+        }
+
+    async def test_works_through_a_real_requests_session(self):
+        class _Adapter(BaseAdapter):
+            def send(self, request, **kwargs):
+                response = requests.Response()
+                response.status_code = 200
+                response._content = b'{"ok": true}'
+                response.headers["Content-Type"] = "application/json"
+                response.headers["x-picnic-auth"] = "new-token"
+                response.request = request
+                response.url = request.url
+                return response
+
+            def close(self):
+                pass
+
+        session = requests.Session()
+        session.headers.update(
+            {"x-picnic-auth": "old-token", "Content-Type": "application/json"}
+        )
+        session.mount("https://", _Adapter())
+        api = type("Api", (), {"session": session})()
+        api_log.install_picnic_capture(api)
+
+        async with api_log.capture_http_requests(
+            api_log.PROVIDER_PICNIC, "login"
+        ):
+            await asyncio.to_thread(
+                session.post,
+                "https://storefront.example/api/15/user/login?x=1",
+                json={"key": "me@example.test", "secret": "md5"},
+            )
+
+        [row] = await _rows()
+        assert row["http_method"] == "POST"
+        assert row["url"] == "https://storefront.example/api/15/user/login?x=1"
+        assert json.loads(row["request_headers"])["x-picnic-auth"] == api_log.REDACTED
+        assert json.loads(row["request_body"]) == {
+            "key": "me@example.test",
+            "secret": api_log.REDACTED,
+        }
+        assert json.loads(row["response_body"]) == {"ok": True}
+        assert json.loads(row["response_headers"])["x-picnic-auth"] == api_log.REDACTED
+
+    async def test_transport_failure_is_captured(self):
+        class _FailingSession:
+            headers = {}
+
+            def request(self, method, url, **kwargs):
+                raise ConnectionError("down")
+
+        class _FailingApi:
+            session = _FailingSession()
+
+        api = _FailingApi()
+        api_log.install_picnic_capture(api)
+
+        with pytest.raises(ConnectionError, match="down"):
+            async with api_log.capture_http_requests(
+                api_log.PROVIDER_PICNIC, "get_cart"
+            ):
+                await asyncio.to_thread(
+                    api.session.request, "GET", "https://x.test/cart"
+                )
 
         [row] = await _rows()
         assert row["status"] == "error"
-        assert row["response_body"] is None
+        assert row["error_type"] == "ConnectionError"
+        assert row["url"] == "https://x.test/cart"
 
 
 class TestBodyHelpers:

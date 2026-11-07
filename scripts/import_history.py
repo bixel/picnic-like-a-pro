@@ -22,10 +22,10 @@ Every run then looks up the category of each stored product that has none
 yet (delivery data carries no categories), including runs that find no new
 deliveries.  A product Picnic no longer lists is retried on the next run.
 
-Every Picnic request is recorded in the ``api_requests`` table by
-``picnic/client.py`` (best-effort, including the JSON request/response
-bodies).  The run opens a logging context, so all of its rows share one
-``source`` and ``run_id`` and can be inspected as a single batch.
+Every Picnic HTTP request is recorded in the ``api_requests`` table by
+``picnic/client.py`` (best-effort; method, full URL, headers and the full
+request/response bodies).  The run opens a logging context, so all of its rows
+share one ``source`` and ``run_id`` and can be inspected as a single batch.
 
 Usage:
     uv run python scripts/import_history.py

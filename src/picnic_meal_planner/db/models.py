@@ -144,16 +144,17 @@ class ApiRequest(Base):
     """One logged call to an external API (Picnic or OpenRouter).
 
     Append-only observability data: ``api_log.py`` writes rows best-effort and
-    nothing ever updates them.  A row records what was called, how long it
-    took, whether it worked, and the JSON request/response bodies so a failed
-    or surprising call can be reproduced.
+    nothing ever updates them.  A row records the HTTP method, full URL,
+    request/response headers and the complete request/response bodies, so a
+    logged call can be replayed with curl after substituting the real
+    credentials.
 
-    **This table can contain sensitive data** (chat prompts, tool results,
-    order details).  Headers are never stored, and credentials — the Picnic
-    password, 2FA codes and session tokens — are redacted before the body is
-    written, but the rest is verbatim and truncated only by
-    ``API_LOG_MAX_BODY_CHARS``.  Treat the database file accordingly and
-    prune the log with ``db.queries.prune_api_requests()``.
+    **This table contains sensitive data** (chat prompts, tool results, order
+    details).  Credential values — the Picnic password/2FA code/session token
+    and the OpenRouter API key — are replaced with ``[REDACTED]``, but the rest
+    of the headers and bodies is verbatim and is **not truncated**.  Treat the
+    database file accordingly and prune the log with
+    ``db.queries.prune_api_requests()``.
 
     ``source`` and ``run_id`` attribute a request to the process or script run
     that made it; ``scripts/import_history.py`` sets both for a whole run.
@@ -166,6 +167,10 @@ class ApiRequest(Base):
     provider: Mapped[str] = mapped_column(String, nullable=False)   # 'picnic' | 'openrouter'
     operation: Mapped[str] = mapped_column(String, nullable=False)  # client method / endpoint
     target: Mapped[str | None] = mapped_column(String, nullable=True)  # model id / resource id
+    http_method: Mapped[str | None] = mapped_column(String, nullable=True)  # GET / POST / ...
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)  # full URL, incl. query string
+    request_headers: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON, redacted
+    response_headers: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON, redacted
     status: Mapped[str] = mapped_column(String, nullable=False)     # 'success' | 'error'
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)

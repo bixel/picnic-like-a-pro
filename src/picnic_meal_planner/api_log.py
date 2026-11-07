@@ -1,41 +1,54 @@
 """Best-effort logging of calls to external APIs.
 
 Two providers are logged: Picnic (``picnic/client.py`` and ``picnic/auth.py``)
-and OpenRouter (``llm.create_message``).  Instrumentation sits at each
-provider's single choke point rather than at every call site, so the bot, the
-MCP server, the import script and preflight are all covered without touching
-them.
+and OpenRouter (``llm.create_message``).  The log is built to make a request
+replayable: each row stores the HTTP method, full URL, request/response headers
+and the complete request/response bodies.  Bodies are not truncated.
 
 What is stored
 --------------
-A row holds the operation, target, timing, outcome, error, token counts and
-the **JSON request and response bodies**, so a surprising call can be
-reproduced.  Headers are never stored (they carry the OpenRouter API key and
-the Picnic session token), and credential fields inside a body — password,
-2FA code, token, API key, secret — are replaced with ``[REDACTED]`` before the
-body is written.  Everything else is verbatim.
+- ``http_method`` and the full ``url``, including the query string.
+- ``request_headers`` and ``response_headers`` as JSON.
+- The full request and response bodies as JSON where they are JSON, or verbatim
+  when they are not.
 
-The table therefore contains prompt, tool-result and order data.  Treat the
-database file as sensitive, and prune the log with
-``db.queries.prune_api_requests()``.  Bodies are capped by
-``API_LOG_MAX_BODY_CHARS`` (default 200 000 chars per body) and can be turned
-off entirely with ``API_LOG_BODIES=false``; when off, only metadata is kept.
+Credential values are masked, not removed:
+
+- Header values for ``Authorization``, ``Proxy-Authorization``,
+  ``x-picnic-auth``, cookies, and any header whose name contains ``token``,
+  ``secret``, ``api-key``/``apikey`` or ends in ``-auth`` become
+  ``[REDACTED]``.  A ``Bearer``/``Basic`` scheme is preserved, e.g.
+  ``Authorization: Bearer [REDACTED]``.
+- Body fields named ``password``, ``secret``, ``otp``, ``token``, ``api_key``,
+  etc. become ``[REDACTED]`` anywhere in the JSON structure.
+
+Everything else is verbatim, however large.  The table contains prompt,
+tool-result and order data, so treat the database file as sensitive and prune
+the log with ``db.queries.prune_api_requests()``.  ``API_LOG_BODIES=false``
+disables body capture; URLs and headers are still recorded.
+
+Instrumentation
+---------------
+- Picnic: :func:`install_picnic_capture` wraps the ``requests.Session`` used by
+  python-picnic-api2.  Every HTTP call — normal operations, login and 2FA —
+  is captured with the *prepared* method, URL, headers and wire body.
+- OpenRouter: ``llm.create_message`` records the URL, request headers and body
+  it sends, plus the raw completion.
+
+Picnic captures are collected in a contextvar and persisted by
+:func:`capture_http_requests` after the synchronous library call returns.  The
+wrappers therefore run the blocking client through ``asyncio.to_thread``, which
+copies the contextvar into the worker thread.
 
 Policy
 ------
 - **Best effort.**  Persisting the log must never change the outcome of the
   request being logged: every failure here is a warning, never an exception.
-  This follows ``history.py``'s read/write degradation, not its deletion
-  behaviour — a log is not something a user asked to be durable.
 - **Await, do not detach.**  The insert is awaited so the row is committed
-  before the caller returns (and before a script claims its run succeeded).
-  Losing rows to a fire-and-forget task would be worse than one small INSERT.
-- **Bounded.**  Bodies are truncated and ``error_message`` is capped;
-  ``prune_api_requests()`` provides retention.
-
-``request_context()`` adds ambient attribution: everything logged inside the
-block shares a ``source`` and ``run_id``, which is how one
-``scripts/import_history.py`` run is grouped in the table.
+  before the caller returns.  Losing rows to a fire-and-forget task would be
+  worse than one INSERT.
+- **Retention is explicit.**  Rows are not truncated; use
+  ``db.queries.prune_api_requests()`` from an operator task.
 """
 
 from __future__ import annotations
@@ -48,7 +61,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -61,30 +74,44 @@ PROVIDER_OPENROUTER = "openrouter"
 
 REDACTED = "[REDACTED]"
 
-# Per-body cap: a request log must not let one large call balloon the DB.
-# Applied after JSON encoding, before the insert.
-MAX_BODY_CHARS = int(os.getenv("API_LOG_MAX_BODY_CHARS", "200000"))
 BODIES_ENABLED = os.getenv("API_LOG_BODIES", "true").strip().lower() != "false"
 
 _MAX_OPERATION = 200
 _MAX_TARGET = 500
 _MAX_ERROR = 500
 
-# Exact key names that hold credentials.  Matched case-insensitively.  This is
-# deliberately a short, exact list: a broad match on "code" or "token" would
-# hide ordinary payload fields that are useful for debugging.
+# Exact body keys that hold credentials.  This is deliberately a short list:
+# matching broadly on "code" or "token" would hide ordinary payload fields.
 _SENSITIVE_KEYS = frozenset(
     {
         "password",
         "passwd",
+        "secret",
+        "otp",
         "auth_token",
         "access_token",
         "refresh_token",
         "token",
         "api_key",
         "apikey",
-        "secret",
         "authorization",
+    }
+)
+
+# Header names that always carry a credential.  Names containing "token",
+# "secret", "api-key"/"apikey" or ending in "-auth" are also masked, which
+# covers x-picnic-auth and x-csrf-token.
+_SENSITIVE_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-picnic-auth",
+        "x-api-key",
+        "x-auth-token",
+        "x-csrf-token",
+        "x-xsrf-token",
     }
 )
 
@@ -97,6 +124,12 @@ class _Context:
 
 _context: contextvars.ContextVar[_Context | None] = contextvars.ContextVar(
     "api_log_context", default=None
+)
+
+# The list a Picnic session wrapper appends to.  It is set by
+# capture_http_requests() and reaches the worker thread via asyncio.to_thread.
+_captures: contextvars.ContextVar[list[HttpCapture] | None] = contextvars.ContextVar(
+    "api_log_captures", default=None
 )
 
 
@@ -120,20 +153,45 @@ class Timer:
 
 
 @dataclass
-class Pending:
-    """The bodies of a request in progress, filled in by the caller.
+class HttpCapture:
+    """One HTTP request made inside a :func:`capture_http_requests` block."""
 
-    ``api_request()`` yields one of these.  Set ``response_body`` after a
-    successful call; the context manager records whatever is present, whether
-    the block returns or raises.
+    method: str
+    url: str
+    request_headers: dict[str, str] = field(default_factory=dict)
+    request_body: Any = None
+    response_headers: dict[str, str] | None = None
+    response_body: Any = None
+    status_code: int | None = None
+    error: BaseException | None = None
+    started_perf: float = field(default_factory=time.perf_counter)
+    requested_at: str = field(
+        default_factory=lambda: datetime.now(UTC).isoformat()
+    )
+
+
+@dataclass
+class CaptureSession:
+    """State shared with the caller while a sync Picnic call is in flight.
+
+    Set ``fallback_response_body`` on the object yielded by
+    :func:`capture_http_requests`; it is used when the client made no HTTP
+    request at all (for example the in-process mock client, or a call that
+    failed before sending).
     """
 
-    request_body: Any = None
-    response_body: Any = None
+    provider: str
+    operation: str
+    target: str | None = None
+    fallback_request_body: Any = None
+    fallback_response_body: Any = None
+    error: BaseException | None = None
+    timer: Timer = field(default_factory=Timer.start)
+    captures: list[HttpCapture] = field(default_factory=list)
 
 
 def call_body(*args: Any, **kwargs: Any) -> dict:
-    """The request payload of a wrapper call, ready for the log."""
+    """The request payload of a wrapper call, used only as a fallback."""
     return {"args": list(args), "kwargs": kwargs}
 
 
@@ -172,53 +230,105 @@ async def request_context(
 
 
 @asynccontextmanager
-async def api_request(
+async def capture_http_requests(
     provider: str,
     operation: str,
     *,
     target: str | None = None,
-    request_body: Any = None,
-    capture_response: bool = True,
-) -> AsyncIterator[Pending]:
-    """Log one request, whether it succeeds or raises.
+    fallback_request_body: Any = None,
+) -> AsyncIterator[CaptureSession]:
+    """Collect and log the HTTP requests made inside the block.
 
-    The caller may set ``response_body`` on the yielded :class:`Pending`
-    before the block exits.  Pass ``capture_response=False`` for a call whose
-    response carries a credential (the Picnic login), so no response body is
-    recorded even on failure.  Exceptions are re-raised unchanged; the log
-    entry is written before they propagate.
+    The blocking Picnic call must run through ``asyncio.to_thread`` so this
+    contextvar reaches the worker thread.  Every captured request becomes its
+    own row.  If the call made no HTTP request, one fallback row is written
+    with *fallback_request_body* (this covers the in-process mock client and
+    failures that happen before sending).
     """
-    timer = Timer.start()
-    entry = Pending(request_body=request_body)
+    session = CaptureSession(
+        provider=provider,
+        operation=operation,
+        target=target,
+        fallback_request_body=fallback_request_body,
+    )
+    token = _captures.set(session.captures)
     try:
-        yield entry
-    except Exception as exc:  # logged, then re-raised unchanged
-        response = None
-        if capture_response:
-            response = (
-                entry.response_body
-                if entry.response_body is not None
-                else error_response_body(exc)
-            )
-        await record(
-            provider,
-            operation,
-            timer,
-            target=target,
-            request_body=entry.request_body,
-            response_body=response,
-            error=exc,
-        )
+        yield session
+    except BaseException as exc:  # logged below, then re-raised unchanged
+        session.error = exc
         raise
-    else:
-        await record(
-            provider,
-            operation,
-            timer,
-            target=target,
-            request_body=entry.request_body,
-            response_body=entry.response_body if capture_response else None,
+    finally:
+        _captures.reset(token)
+        if session.captures:
+            for capture in session.captures:
+                await _record_capture(session, capture)
+        else:
+            await record(
+                session.provider,
+                session.operation,
+                session.timer,
+                target=session.target,
+                error=session.error,
+                request_body=session.fallback_request_body,
+                response_body=session.fallback_response_body,
+            )
+
+
+def install_picnic_capture(api: Any) -> bool:
+    """Wrap a PicnicAPI session so every HTTP call is captured.
+
+    Returns ``True`` when the client has a ``requests``-style session.  The
+    wrapper records the prepared request (method, full URL, headers, wire
+    body) and the response, including failures raised by ``requests`` itself.
+    """
+    session = getattr(api, "session", None)
+    if session is None or not hasattr(session, "request"):
+        return False
+    if getattr(session, "_api_log_capture_installed", False):
+        return True
+
+    original_request = session.request
+
+    def request(method: str, url: str, **kwargs: Any):
+        capture = HttpCapture(
+            method=str(method).upper(),
+            url=str(url),
+            request_headers=_headers_dict(
+                getattr(session, "headers", None), kwargs.get("headers")
+            ),
+            request_body=_request_body(kwargs),
         )
+        captures = _captures.get()
+        if captures is not None:
+            captures.append(capture)
+
+        try:
+            response = original_request(method, url, **kwargs)
+        except BaseException as exc:  # transport failure, re-raised unchanged
+            capture.error = exc
+            raise
+
+        capture.status_code = getattr(response, "status_code", None)
+        capture.response_headers = _headers_dict(getattr(response, "headers", None))
+        capture.response_body = _response_text(response)
+
+        # Prefer the prepared request: it has the final merged headers and the
+        # actual wire body (e.g. JSON already encoded).
+        prepared = getattr(response, "request", None)
+        if prepared is not None:
+            capture.method = str(getattr(prepared, "method", capture.method)).upper()
+            capture.url = str(getattr(prepared, "url", capture.url))
+            prepared_headers = _headers_dict(getattr(prepared, "headers", None))
+            if prepared_headers:
+                capture.request_headers = prepared_headers
+            body = getattr(prepared, "body", None)
+            if body is not None:
+                capture.request_body = body
+        return response
+
+    session.request = request
+    session._api_log_capture_installed = True
+    return True
 
 
 async def record(
@@ -229,6 +339,10 @@ async def record(
     target: str | None = None,
     error: BaseException | None = None,
     http_status: int | None = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: Any = None,
+    response_headers: Any = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     request_body: Any = None,
@@ -238,7 +352,7 @@ async def record(
 
     Callers that need a request's *usage* (OpenRouter token counts) or its raw
     completion call this directly; everything else should use
-    :func:`api_request`.
+    :func:`capture_http_requests`.
     """
     ctx = _context.get()
     try:
@@ -248,6 +362,10 @@ async def record(
                 provider=provider,
                 operation=operation[:_MAX_OPERATION],
                 target=target[:_MAX_TARGET] if target else None,
+                http_method=http_method[:20] if http_method else None,
+                url=url,
+                request_headers=_headers_text(request_headers),
+                response_headers=_headers_text(response_headers),
                 status="error" if error is not None else "success",
                 http_status=(
                     http_status if http_status is not None else _http_status_of(error)
@@ -270,6 +388,23 @@ async def record(
         )
 
 
+async def _record_capture(session: CaptureSession, capture: HttpCapture) -> None:
+    await record(
+        session.provider,
+        session.operation,
+        Timer(capture.started_perf, capture.requested_at),
+        target=session.target,
+        error=capture.error,
+        http_status=capture.status_code,
+        http_method=capture.method,
+        url=capture.url,
+        request_headers=capture.request_headers,
+        response_headers=capture.response_headers,
+        request_body=capture.request_body,
+        response_body=capture.response_body,
+    )
+
+
 def _http_status_of(error: BaseException | None) -> int | None:
     """The HTTP status an SDK exception carries, if it exposes one."""
     if error is None:
@@ -287,6 +422,70 @@ def _error_message(error: BaseException | None) -> str | None:
         return None
     message = str(error).strip()
     return message[:_MAX_ERROR] if message else None
+
+
+def _headers_dict(*sources: Any) -> dict[str, str]:
+    """Merge header mappings (session headers first, per-request last)."""
+    merged: dict[str, str] = {}
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            items = source.items()
+        except AttributeError:
+            continue
+        for name, value in items:
+            if value is None:
+                continue
+            merged[str(name)] = str(value)
+    return merged
+
+
+def _request_body(kwargs: dict) -> Any:
+    if kwargs.get("json") is not None:
+        return kwargs["json"]
+    return kwargs.get("data")
+
+
+def _response_text(response: Any) -> Any:
+    try:
+        return response.text
+    except Exception:  # noqa: BLE001 — a body we cannot decode is not fatal
+        return None
+
+
+def _is_sensitive_header(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered in _SENSITIVE_HEADERS
+        or "authorization" in lowered
+        or "token" in lowered
+        or "secret" in lowered
+        or "api-key" in lowered
+        or "apikey" in lowered
+        or lowered.endswith("-auth")
+    )
+
+
+def _redact_header(name: str, value: Any) -> str:
+    text = "" if value is None else str(value)
+    if not _is_sensitive_header(name):
+        return text
+    scheme, separator, _ = text.partition(" ")
+    if separator and scheme.lower() in {"bearer", "basic", "token"}:
+        return f"{scheme} {REDACTED}"
+    return REDACTED
+
+
+def _headers_text(headers: Any) -> str | None:
+    if not headers:
+        return None
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    redacted = {str(name): _redact_header(str(name), value) for name, value in items}
+    return json.dumps(redacted, ensure_ascii=False)
 
 
 def _jsonable(value: Any) -> Any:
@@ -320,22 +519,29 @@ def _redact(value: Any) -> Any:
     return value
 
 
-def _body_text(value: Any) -> str | None:
-    """JSON-encode a body, redact credentials, and apply the size cap."""
-    if value is None or not BODIES_ENABLED:
+def _decode_json(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in '{["':
         return None
     try:
-        if isinstance(value, str):
-            # Raw response text (e.g. an error page) is kept as-is; there is
-            # no structure to redact, and it is never a login response.
-            text = value
-        else:
-            text = json.dumps(
-                _redact(_jsonable(value)), ensure_ascii=False, default=str
-            )
+        return json.loads(stripped)
     except (TypeError, ValueError):
-        text = repr(value)
-    if len(text) > MAX_BODY_CHARS:
-        omitted = len(text) - MAX_BODY_CHARS
-        text = f"{text[:MAX_BODY_CHARS]}... [truncated {omitted} chars]"
-    return text
+        return None
+
+
+def _body_text(value: Any) -> str | None:
+    """JSON-encode a body, redact credentials, and keep the whole thing."""
+    if value is None or not BODIES_ENABLED:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", "replace")
+    if isinstance(value, str):
+        parsed = _decode_json(value)
+        if parsed is None:
+            # Not JSON (e.g. an HTML error page): keep it verbatim.
+            return value
+        return json.dumps(_redact(_jsonable(parsed)), ensure_ascii=False, default=str)
+    try:
+        return json.dumps(_redact(_jsonable(value)), ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(value)

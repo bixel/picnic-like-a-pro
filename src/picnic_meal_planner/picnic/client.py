@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from functools import partial
 from typing import Any
 
 from .. import api_log
@@ -83,13 +82,16 @@ async def get_client():
         username, password = auth.credentials()
         api = auth.new_api()
         try:
-            # The response contains the session token, so it is deliberately
-            # not captured; the password is redacted in the request body.
-            async with api_log.api_request(
+            # The session capture records the real request/response.  The
+            # fallback is used only if no HTTP request was made.
+            async with api_log.capture_http_requests(
                 api_log.PROVIDER_PICNIC,
                 "login",
-                request_body={"username": username, "password": api_log.REDACTED},
-                capture_response=False,
+                fallback_request_body={
+                    "key": username,
+                    "secret": api_log.REDACTED,
+                    "client_id": 30100,
+                },
             ):
                 await _run(api.login, username, password)
         except Picnic2FARequired:
@@ -122,8 +124,12 @@ def reset_client() -> None:
 
 
 async def _run(func, *args, **kwargs) -> Any:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+    """Run the blocking Picnic library in a worker thread.
+
+    ``asyncio.to_thread`` (unlike ``run_in_executor``) copies the current
+    context, which is how the HTTP capture list reaches the session wrapper.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 # Methods whose first argument identifies the resource, and so is useful as
@@ -148,19 +154,23 @@ async def _call(method: str, *args, **kwargs) -> Any:
     rejected token is cleared and turned into :class:`PicnicLoginRequired`.
 
     The call is logged to ``api_requests`` (best-effort) at this single choke
-    point, so every caller gets it.
+    point, so every caller gets it.  The session wrapper captures the actual
+    HTTP method, URL, headers and bodies; the fallback covers the mock client
+    and failures that happen before a request is sent.
     """
     global _client, _saved_token
     client = await get_client()
     try:
-        async with api_log.api_request(
+        async with api_log.capture_http_requests(
             api_log.PROVIDER_PICNIC,
             method,
             target=_log_target(method, args),
-            request_body=api_log.call_body(*args, **kwargs),
-        ) as entry:
-            entry.response_body = await _run(getattr(client, method), *args, **kwargs)
-            result = entry.response_body
+            fallback_request_body=api_log.call_body(*args, **kwargs),
+        ) as session:
+            session.fallback_response_body = await _run(
+                getattr(client, method), *args, **kwargs
+            )
+            result = session.fallback_response_body
     except Exception as exc:
         from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
 

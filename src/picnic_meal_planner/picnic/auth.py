@@ -30,7 +30,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 
 from .. import api_log
@@ -64,36 +63,39 @@ HOW_TO_LOGIN = (
 
 
 def _login_body(operation: str, args: tuple) -> dict:
-    """The request body for one login step, with credentials removed."""
+    """The request body for one login step, with credentials removed.
+
+    This is only the fallback: the session capture records the real body, and
+    ``api_log`` redacts ``secret``/``otp`` inside it.
+    """
     if operation == "login":
         return {
-            "username": args[0] if args else None,
-            "password": api_log.REDACTED,
+            "key": args[0] if args else None,
+            "secret": api_log.REDACTED,
+            "client_id": 30100,
         }
     if operation == "verify_2fa_code":
-        return {"code": api_log.REDACTED}
+        return {"otp": api_log.REDACTED}
     if operation == "generate_2fa_code":
         return {"channel": args[0] if args else None}
     return {"args": api_log.REDACTED}
 
 
 async def _run(func, *args, **kwargs) -> Any:
-    """Run one blocking login step in the executor, logging it.
+    """Run one blocking login step in a worker thread, logging it.
 
     Login is the only Picnic traffic that does not go through
-    ``client._call()``, so it is logged here.  Request bodies are redacted
-    (:func:`_login_body`) and responses are deliberately not captured: a
-    successful login response carries the session token.
+    ``client._call()``, so it is logged here.  The session capture records the
+    real HTTP request; credentials are redacted by ``api_log``.  The fallback
+    body is used only if no HTTP request was made.
     """
     operation = getattr(func, "__name__", "picnic_login")
-    async with api_log.api_request(
+    async with api_log.capture_http_requests(
         api_log.PROVIDER_PICNIC,
         operation,
-        request_body=_login_body(operation, args),
-        capture_response=False,
+        fallback_request_body=_login_body(operation, args),
     ):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def credentials() -> tuple[str, str]:
@@ -111,12 +113,16 @@ def new_api(auth_token: str | None = None):
     """Build a ``PicnicAPI`` without logging in; that is always explicit here."""
     from python_picnic_api2 import PicnicAPI  # noqa: PLC0415
 
-    return PicnicAPI(
+    api = PicnicAPI(
         # The library lowercases the code itself, but stray whitespace
         # would end up in the storefront host name.
         country_code=os.getenv("PICNIC_COUNTRY_CODE", "NL").strip(),
         auth_token=auth_token,
     )
+    # Capture the exact method/URL/headers/body of every HTTP call the library
+    # makes, including login and 2FA.
+    api_log.install_picnic_capture(api)
+    return api
 
 
 def token_of(api) -> str | None:
