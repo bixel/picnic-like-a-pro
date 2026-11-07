@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .engine import get_session_factory
 from .models import (
+    Category,
     ChatSettings,
     ConversationMessage,
     ImportCheckpoint,
@@ -62,9 +63,7 @@ def _now() -> str:
 async def upsert_product(session: AsyncSession, product: dict) -> None:
     """Insert or update a product row (keyed on ``product["id"]``).
 
-    A ``None`` category keeps the stored one: delivery and search data never
-    carry a category, so overwriting would erase what
-    :func:`set_product_category` filled in.
+    The category is not touched: only :func:`set_product_category` sets it.
     """
     insert = sqlite_insert(Product)
     stmt = (
@@ -75,7 +74,6 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
             unit_price=product.get("unit_price"),
             unit_quantity=product.get("unit_quantity"),
             image_id=product.get("image_id"),
-            category=product.get("category"),
             last_seen_at=_now(),
         )
         .on_conflict_do_update(
@@ -85,7 +83,6 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
                 unit_price=product.get("unit_price"),
                 unit_quantity=product.get("unit_quantity"),
                 image_id=product.get("image_id"),
-                category=func.coalesce(insert.excluded.category, Product.category),
                 last_seen_at=_now(),
             ),
         )
@@ -94,53 +91,129 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
 
 
 async def get_product(session: AsyncSession, product_id: str) -> dict | None:
-    row = await session.get(Product, product_id)
+    """The product, with its category's name as ``category`` (``None`` if unknown)."""
+    row = (await session.execute(
+        select(Product, Category.name)
+        .outerjoin(Category, Product.category_id == Category.id)
+        .where(Product.id == product_id)
+    )).one_or_none()
     if row is None:
         return None
+    product, category = row
     return {
-        "id": row.id,
-        "name": row.name,
-        "unit_price": row.unit_price,
-        "unit_quantity": row.unit_quantity,
-        "image_id": row.image_id,
-        "category": row.category,
-        "last_seen_at": row.last_seen_at,
+        "id": product.id,
+        "name": product.name,
+        "unit_price": product.unit_price,
+        "unit_quantity": product.unit_quantity,
+        "image_id": product.image_id,
+        "category": category,
+        "category_id": product.category_id,
+        "last_seen_at": product.last_seen_at,
     }
 
 
 async def products_without_category(session: AsyncSession) -> list[str]:
     """Ids of the stored products whose category is not known yet."""
     rows = await session.scalars(
-        select(Product.id).where(Product.category.is_(None)).order_by(Product.id)
+        select(Product.id).where(Product.category_id.is_(None)).order_by(Product.id)
     )
     return list(rows)
 
 
+async def get_category_names(session: AsyncSession) -> dict[int, str]:
+    """``{l3_id: name}`` for every stored category."""
+    rows = await session.execute(select(Category.id, Category.name))
+    return {row.id: row.name for row in rows}
+
+
 async def get_categories(session: AsyncSession) -> list[dict]:
-    """The categories of the stored products, each with its product count."""
+    """The categories of the stored products, each with its product count.
+
+    Grouped by category id, so two categories with the same name (under
+    different L2 parents) stay apart.
+    """
     stmt = (
-        select(Product.category.label("name"), func.count().label("product_count"))
-        .where(Product.category.is_not(None))
-        .group_by(Product.category)
-        .order_by(Product.category)
+        select(
+            Category.name,
+            Category.id.label("category_id"),
+            func.count(Product.id).label("product_count"),
+        )
+        .join(Product, Product.category_id == Category.id)
+        .group_by(Category.id)
+        .order_by(Category.name, Category.id)
     )
     return [row._asdict() for row in (await session.execute(stmt)).all()]
 
 
-async def get_products_in_category(session: AsyncSession, category: str) -> list[dict]:
-    """The stored products in *category* (exact name, as :func:`get_categories` lists it)."""
+async def get_products_in_category(
+    session: AsyncSession, category: str | None = None, category_id: int | None = None
+) -> list[dict]:
+    """The stored products in a category, by id or by exact name.
+
+    *category_id* wins when both are given; a name matches every category of
+    that name, as :func:`get_categories` lists it.
+    """
+    if category_id is not None:
+        condition = Category.id == category_id
+    elif category is not None:
+        condition = Category.name == category
+    else:
+        raise ValueError("Give a category name or a category_id.")
     stmt = (
         select(Product.id, Product.name, Product.unit_quantity, Product.unit_price)
-        .where(Product.category == category)
+        .join(Category, Product.category_id == Category.id)
+        .where(condition)
         .order_by(Product.name)
     )
     return [row._asdict() for row in (await session.execute(stmt)).all()]
 
 
-async def set_product_category(session: AsyncSession, product_id: str, category: str) -> None:
+async def upsert_category(
+    session: AsyncSession, l3_id: int, l2_id: int, name: str, l1_id: int | None = None
+) -> bool:
+    """Insert or update an L3 category; ``False`` if it was left alone.
+
+    L3 ids are assumed to be unique across the whole catalogue.  Should a
+    stored category turn up under another L2 parent, that assumption is wrong
+    and overwriting would merge two categories, so the row is kept and a
+    warning logged.  A ``None`` *l1_id* keeps the stored one.
+    """
+    stored = await session.get(Category, l3_id)
+    if stored is None:
+        session.add(Category(id=l3_id, l2_id=l2_id, l1_id=l1_id, name=name))
+        await session.flush()
+        return True
+    if stored.l2_id != l2_id:
+        logger.warning(
+            "Category %s is stored under L2 %s but Picnic now lists it under L2 %s "
+            "(%r); keeping the stored one",
+            l3_id, stored.l2_id, l2_id, name,
+        )
+        return False
+    stored.name = name
+    if l1_id is not None:
+        stored.l1_id = l1_id
+    return True
+
+
+async def set_product_category(session: AsyncSession, product_id: str, category: dict) -> bool:
+    """Record *category* (``l1_id``, ``l2_id``, ``l3_id``, ``name``) for a product.
+
+    Upserts the ``categories`` row, then points the product at it.  When
+    :func:`upsert_category` refuses the row (its L2 parent differs), the
+    product is left without a category and ``False`` returned, so it is never
+    filed under another parent's category.
+    """
+    if not await upsert_category(
+        session, category["l3_id"], category["l2_id"], category["name"], category.get("l1_id")
+    ):
+        return False
     await session.execute(
-        update(Product).where(Product.id == product_id).values(category=category)
+        update(Product)
+        .where(Product.id == product_id)
+        .values(category_id=category["l3_id"])
     )
+    return True
 
 
 # ---------------------------------------------------------------------------

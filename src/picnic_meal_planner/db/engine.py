@@ -33,7 +33,7 @@ def _db_url() -> str:
 
 
 # The Alembic head this code expects; tests/test_migrations.py keeps it in step.
-SCHEMA_REVISION = "0004"
+SCHEMA_REVISION = "0005"
 
 # Module-level singletons; populated lazily.
 _engine: AsyncEngine | None = None

@@ -17,6 +17,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,14 @@ CATALOG: list[dict] = [
 ]
 
 _CATALOG_BY_ID: dict[str, dict] = {p["id"]: p for p in CATALOG}
+
+# Mock (l1_id, l2_id, l3_id) per category name, mirroring the deep link on a
+# real product page's category button.
+_CATEGORY_IDS: dict[str, tuple[int, int, int]] = {
+    name: (1000 + n, 2000 + n, 3000 + n)
+    for n, name in enumerate(dict.fromkeys(p["category"] for p in CATALOG))
+}
+_CATEGORY_BY_IDS = {(l2, l3): name for name, (_, l2, l3) in _CATEGORY_IDS.items()}
 
 CATEGORIES: list[dict] = [
     {"id": "cat_dairy",     "name": "Zuivel, Eieren & Boter",  "depth": 0},
@@ -235,14 +244,25 @@ class MockPicnicAPI:
     def get_categories(self) -> list[dict]:
         return list(CATEGORIES)
 
-    def get_article(self, article_id: str, add_category: bool = False) -> dict | None:
+    def get_article(self, article_id: str) -> dict | None:
         product = _CATALOG_BY_ID.get(article_id)
         if product is None:
             return None
         article = {k: v for k, v in product.items() if k != "category"}
-        if add_category:
-            article["category"] = {"name": product["category"]}
+        article["category_ids"] = list(_CATEGORY_IDS[product["category"]])
         return article
+
+    def _get(self, path: str, add_picnic_headers: bool = False) -> dict:
+        """Serve an L2 category page, shaped like Picnic's (L3 sub-headers)."""
+        url = urlsplit(path)
+        if url.path != "/pages/L2-category-page-root":
+            return {"error": {"code": "NOT_FOUND"}}
+        l2_id = int(parse_qs(url.query)["category_id"][0])
+        return {"id": "L2-category-page-root", "children": [
+            {"id": f"vertical-article-tiles-sub-header-{l3}",
+             "pml": {"component": {"accessibilityRole": "header", "accessibilityLabel": name}}}
+            for (l2, l3), name in _CATEGORY_BY_IDS.items() if l2 == l2_id
+        ]}
 
     # -- Cart ----------------------------------------------------------
 

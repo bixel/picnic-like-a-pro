@@ -34,7 +34,10 @@ def _detail(did: str) -> dict:
 def fake_picnic(monkeypatch):
     """Summaries and details the test can change between runs."""
     monkeypatch.setenv("IMPORT_DELAY_SECONDS", "0")
-    state = {"summaries": [], "details": {}, "categories": {}}
+    # categories: product id -> L3 name (ids 1/2/3), (l1, l2, l3) ids, or an
+    # exception.  pages: (l2, l3) -> {l3: name} on that L2 page, or an
+    # exception; unset pages name the L3 given as a string in categories.
+    state = {"summaries": [], "details": {}, "categories": {}, "pages": {}, "l2_requests": []}
 
     async def get_deliveries():
         return list(state["summaries"])
@@ -45,14 +48,25 @@ def fake_picnic(monkeypatch):
             raise detail
         return detail
 
-    async def get_product_category(product_id):
+    async def get_category_ids(product_id):
         category = state["categories"].get(product_id)
         if isinstance(category, Exception):
             raise category
+        if isinstance(category, str):
+            state["pages"].setdefault((2, 3), {3: category})
+            return (1, 2, 3)
         return category
 
+    async def get_l3_names(l2_id, l3_id):
+        state["l2_requests"].append((l2_id, l3_id))
+        page = state["pages"].get((l2_id, l3_id), {})
+        if isinstance(page, Exception):
+            raise page
+        return dict(page)
+
     monkeypatch.setattr(picnic, "get_deliveries", get_deliveries)
-    monkeypatch.setattr(picnic, "get_product_category", get_product_category)
+    monkeypatch.setattr(picnic, "get_category_ids", get_category_ids)
+    monkeypatch.setattr(picnic, "get_l3_names", get_l3_names)
     monkeypatch.setattr(picnic, "get_delivery", get_delivery)
     return state
 
@@ -227,6 +241,9 @@ async def test_categories_are_filled_in(fake_picnic):
     await import_history.main()
     assert await _orders() == {"d1": 1}
     assert await _category("p_milk") == "Milch"
+    async with db.get_db() as conn:
+        assert (await db.get_product(conn, "p_milk"))["category_id"] == 3
+        assert await db.get_category_names(conn) == {3: "Milch"}
 
 
 async def test_categories_are_backfilled_after_a_finished_import(fake_picnic):
@@ -249,3 +266,53 @@ async def test_login_error_stops_the_backfill(fake_picnic, capsys):
     await import_history.main()
     assert await _category("p_milk") is None
     assert "Stopped: log in" in capsys.readouterr().err
+
+
+async def _seed_products(*product_ids: str) -> None:
+    async with db.get_db() as conn:
+        for pid in product_ids:
+            await db.upsert_product(conn, {"id": pid, "name": pid})
+        await conn.commit()
+
+
+async def test_one_l2_page_names_its_siblings_across_runs(fake_picnic):
+    await _seed_products("p_beer", "p_beer2", "p_pils")
+    fake_picnic["categories"] = {
+        "p_beer": (1, 20, 30), "p_beer2": (1, 20, 30), "p_pils": (1, 20, 31),
+    }
+    fake_picnic["pages"] = {(20, 30): {30: "Alkoholfrei", 31: "Pils"}}
+    await import_history.backfill_categories()
+
+    assert fake_picnic["l2_requests"] == [(20, 30)]
+    assert await _category("p_beer2") == "Alkoholfrei"
+    assert await _category("p_pils") == "Pils"
+
+    # A later run finds the sibling names in the database.
+    await _seed_products("p_pils2")
+    fake_picnic["categories"]["p_pils2"] = (1, 20, 31)
+    fake_picnic["l2_requests"].clear()
+    await import_history.backfill_categories()
+    assert fake_picnic["l2_requests"] == []
+    assert await _category("p_pils2") == "Pils"
+
+
+async def test_an_l3_missing_from_its_page_is_fetched_once_per_run(fake_picnic):
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {31: "Pils"}}
+    await import_history.backfill_categories()
+
+    assert fake_picnic["l2_requests"] == [(20, 30)]
+    assert await _category("p_a") is None
+    async with db.get_db() as conn:
+        assert await db.products_without_category(conn) == ["p_a", "p_b"]
+        assert await db.get_category_names(conn) == {31: "Pils"}
+
+
+async def test_an_l2_page_error_skips_only_that_product(fake_picnic):
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": (1, 21, 32)}
+    fake_picnic["pages"] = {(20, 30): ConnectionError("boom"), (21, 32): {32: "Wein"}}
+    await import_history.backfill_categories()
+    assert await _category("p_a") is None
+    assert await _category("p_b") == "Wein"
