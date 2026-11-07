@@ -47,7 +47,7 @@ columns:
 | `Product` | `products` | Picnic product catalogue cache |
 | `Order` | `orders` | Delivery records |
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
-| `ImportCheckpoint` | `import_checkpoints` | Import progress log (what to import is read from `orders`) |
+| `ImportCheckpoint` | `import_checkpoints` | Import progress log, written only by runs that import something (what to import is read from `orders`) |
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
 | `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
 | `PicnicAuth` | `picnic_auth` | The Picnic session token (one row); a credential — never log it |

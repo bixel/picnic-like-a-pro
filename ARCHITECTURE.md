@@ -238,16 +238,17 @@ Line items for each order. Core table for forecasting.
 | unit_price | INTEGER | price at time of order (cents) |
 
 ### `import_checkpoints`
-Tracks progress of the stepwise history import so it can be paused and resumed
-without re-fetching already-imported deliveries or hammering the Picnic API.
+A log of history-import progress: one row per batch that imported something,
+plus one when such a run ends.  Runs that import nothing write no row.  What to
+import is read from `orders`, not from here.
 
 | Column        | Type    | Notes                                   |
 |---------------|---------|-----------------------------------------|
 | id            | INTEGER PK AUTOINCREMENT |                        |
-| last_delivery_id | TEXT | Picnic delivery ID the last import run settled |
+| last_delivery_id | TEXT | Newest Picnic delivery ID that run imported (a log, never a resume position) |
 | imported_at   | TEXT    | ISO datetime of the import run          |
 | total_imported | INTEGER | Number of deliveries stored locally after that run |
-| finished      | INTEGER | 0 = something was deferred, 1 = nothing left to import |
+| finished      | INTEGER | 0 = something was deferred by that run, 1 = nothing left to import |
 
 ### `conversation_messages`
 Per-chat conversation history with Claude. Messages are grouped into **turns**
@@ -512,15 +513,20 @@ last one.
 2. The deliveries with no row in `orders` are the work list — **not** the ones
    after the checkpoint's `last_delivery_id`. Picnic returns the list
    newest-first, so a new delivery appears *above* everything an earlier run
-   imported and a positional resume would never see it.
+   imported and a positional resume would never see it. Cancelled and
+   still-`CURRENT` deliveries are counted and left out of the work list up
+   front; a cancelled one never gets a row, so otherwise it would be "new" on
+   every run.
 3. Iterates the work list in batches of `IMPORT_BATCH_SIZE` (default 10), fetching
    line items for each delivery and inserting into `orders` + `order_items`.
-4. After each batch it writes a checkpoint (`import_checkpoints` table) with the
-   last delivery it settled and sleeps `IMPORT_DELAY_SECONDS` (default 2 s). The
-   checkpoint is a progress log: what to import is read from `orders`.
-5. Duplicate prevention: a delivery whose `picnic_order_id` is already in `orders`
-   is skipped before its items are written, so a run interrupted between a commit
-   and its batch checkpoint does not double those items on resume. The UNIQUE
+4. After each batch that imported something it writes a checkpoint
+   (`import_checkpoints` table) with the newest delivery it imported, and sleeps
+   `IMPORT_DELAY_SECONDS` (default 2 s) between batches. The checkpoint is a
+   progress log: what to import is read from `orders`.
+5. Duplicate prevention: the work list excludes everything already in `orders`,
+   which covers a run interrupted between a commit and its batch checkpoint.
+   Inside the insert's session the script checks `orders` once more, against an
+   overlapping run that imported the same delivery meanwhile. The UNIQUE
    constraint on `picnic_order_id` remains the backstop.
 6. Cancelled deliveries are skipped for good. A delivery that cannot be imported
    *yet* — still `CURRENT`, a failed fetch, or a detail that
@@ -531,21 +537,23 @@ last one.
    real API's `orders → ORDER_LINE → ORDER_ARTICLE` nesting (count from the
    `QUANTITY` decorator, unit price from the line price) as well as the mock's
    flat shape.
-8. Prints a progress summary after each batch and a final total on completion.
-9. When nothing is new it prints "Nothing new to import.", records a finished
-   checkpoint and moves on to the category backfill.
+8. Prints a progress summary after each batch and, at the end, how many
+   deliveries this run imported and how many the database now holds.
+9. When nothing is new it prints "Nothing new to import.", writes **no**
+   checkpoint (so a scheduled run leaves the database untouched) and moves on to
+   the category backfill.
 
 ```
 $ uv run import-history
 Fetching delivery list from Picnic...
-Found 47 deliveries. 0 already imported, 47 not imported yet.
+Found 47 deliveries: 0 already imported, 47 to import, 0 cancelled, 0 still in progress.
 
 Batch 1/5 (deliveries 1–10 of 47)...  imported 10  [sleeping 2s]
 Batch 2/5 (deliveries 11–20 of 47)... imported 10  [sleeping 2s]
 ^C   ← safe to interrupt here
 
 $ uv run import-history      ← resumes with the 27 that still have no row
-Found 47 deliveries. 20 already imported, 27 not imported yet.
+Found 47 deliveries: 20 already imported, 27 to import, 0 cancelled, 0 still in progress.
 
 Batch 1/3 (deliveries 1–10 of 27)... imported 10  [sleeping 2s]
 ...
