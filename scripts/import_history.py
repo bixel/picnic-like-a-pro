@@ -11,7 +11,8 @@ Picnic returns the whole delivery list with the newest first, so a new delivery
 arrives *above* everything already imported — which is why the checkpoint's
 ``last_delivery_id`` (the newest delivery a run imported) is a progress log
 only and never a resume position.  A checkpoint row is written only by runs
-that import something; an idle run writes nothing.
+that import something; an idle run writes no checkpoint (it still logs its
+API requests, and fills in categories, as described below).
 
 Cancelled deliveries are left out of the work list.  A delivery that cannot be
 imported yet (still CURRENT, or its detail could not be fetched or was
@@ -26,6 +27,8 @@ Every Picnic HTTP request is recorded in the ``api_requests`` table by
 ``picnic/client.py`` (best-effort; method, full URL, headers and the full
 request/response bodies).  The run opens a logging context, so all of its rows
 share one ``source`` and ``run_id`` and can be inspected as a single batch.
+At the end, rows older than ``API_LOG_RETENTION_DAYS`` (default 30, ``0`` =
+keep everything) are pruned.
 
 Usage:
     uv run python scripts/import_history.py
@@ -74,6 +77,10 @@ async def main() -> None:
     async with api_log.request_context("import_history"):
         await import_deliveries()
         await backfill_categories()
+    # The scheduled import is the log's retention owner (API_LOG_RETENTION_DAYS).
+    removed = await api_log.prune_expired()
+    if removed:
+        print(f"Pruned {removed} API request log row(s).")
 
 
 async def backfill_categories() -> None:

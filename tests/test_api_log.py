@@ -630,3 +630,50 @@ class TestConsent:
         )
         [row] = await _rows()
         assert row["response_body"] is not None and row["chat_id"] is None
+
+
+class TestRetention:
+    async def _insert(self, requested_at: str) -> None:
+        async with db.get_db() as session:
+            await db.insert_api_request(
+                session,
+                provider="picnic",
+                operation="op",
+                status="success",
+                duration_ms=1,
+                requested_at=requested_at,
+            )
+            await session.commit()
+
+    @pytest.mark.parametrize(
+        ("value", "days"),
+        [(None, 30), ("", 30), ("7", 7), ("0", 0), ("-3", 30), ("week", 30)],
+    )
+    def test_retention_days(self, monkeypatch, value, days):
+        if value is None:
+            monkeypatch.delenv("API_LOG_RETENTION_DAYS", raising=False)
+        else:
+            monkeypatch.setenv("API_LOG_RETENTION_DAYS", value)
+        assert api_log.retention_days() == days
+
+    async def test_prune_expired_uses_the_configured_window(self, monkeypatch):
+        monkeypatch.setenv("API_LOG_RETENTION_DAYS", "30")
+        await self._insert("2020-01-01T00:00:00+00:00")
+        await self._insert(datetime.now(UTC).isoformat())
+        assert await api_log.prune_expired() == 1
+        assert len(await _rows()) == 1
+
+    async def test_zero_keeps_everything(self, monkeypatch):
+        monkeypatch.setenv("API_LOG_RETENTION_DAYS", "0")
+        await self._insert("2020-01-01T00:00:00+00:00")
+        assert await api_log.prune_expired() is None
+        assert len(await _rows()) == 1
+
+    async def test_a_failed_prune_never_raises(self, monkeypatch, caplog):
+        def broken():
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(api_log, "get_log_db", broken)
+        with caplog.at_level(logging.WARNING):
+            assert await api_log.prune_expired() is None
+        assert "Could not prune" in caplog.text

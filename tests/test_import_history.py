@@ -279,3 +279,23 @@ async def test_all_picnic_requests_of_a_run_share_one_log_batch(monkeypatch):
     assert all(r["request_body"] and r["response_body"] for r in rows)
     assert len({r["run_id"] for r in rows}) == 1
     assert all(r["run_id"] for r in rows)
+
+
+async def test_a_run_prunes_expired_log_rows(fake_picnic, monkeypatch):
+    monkeypatch.setenv("API_LOG_RETENTION_DAYS", "30")
+    async with db.get_db() as conn:
+        await db.insert_api_request(
+            conn,
+            provider="picnic",
+            operation="ancient",
+            status="success",
+            duration_ms=1,
+            requested_at="2020-01-01T00:00:00+00:00",
+        )
+        await conn.commit()
+
+    await import_history.main()
+
+    async with db.get_db() as conn:
+        rows = await db.list_api_requests(conn)
+    assert "ancient" not in {r["operation"] for r in rows}

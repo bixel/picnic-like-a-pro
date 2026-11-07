@@ -59,8 +59,11 @@ Policy
   ``engine.LOG_LOCK_TIMEOUT_SECONDS``, so a database locked by another
   connection costs a lost row, not a 5 s stall per call.  All rows of one
   wrapped call are written in one transaction.
-- **Retention is explicit.**  Rows are not truncated; use
-  ``db.queries.prune_api_requests()`` from an operator task.
+- **Retention is explicit.**  Rows are not truncated.
+  :func:`prune_expired` deletes rows older than ``API_LOG_RETENTION_DAYS``
+  (default 30, ``0`` keeps everything); ``scripts/import_history.py`` calls it
+  at the end of every run, which is what bounds the table on a scheduled
+  deployment.
 """
 
 from __future__ import annotations
@@ -88,6 +91,8 @@ PROVIDER_OPENROUTER = "openrouter"
 REDACTED = "[REDACTED]"
 
 BODIES_ENABLED = os.getenv("API_LOG_BODIES", "true").strip().lower() != "false"
+
+DEFAULT_RETENTION_DAYS = 30
 
 _MAX_OPERATION = 200
 _MAX_TARGET = 500
@@ -517,6 +522,48 @@ def _row(
         output_tokens=output_tokens,
         requested_at=timer.requested_at,
     )
+
+
+def retention_days() -> int:
+    """``API_LOG_RETENTION_DAYS``, read on each call; ``0`` means keep all.
+
+    An unusable value falls back to the default with a warning rather than
+    failing the run that prunes.
+    """
+    raw = os.getenv("API_LOG_RETENTION_DAYS", "").strip()
+    if not raw:
+        return DEFAULT_RETENTION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        days = -1
+    if days < 0:
+        logger.warning(
+            "Ignoring API_LOG_RETENTION_DAYS=%r; using %d",
+            raw,
+            DEFAULT_RETENTION_DAYS,
+        )
+        return DEFAULT_RETENTION_DAYS
+    return days
+
+
+async def prune_expired() -> int | None:
+    """Delete log rows older than :func:`retention_days`; never raises.
+
+    Returns how many rows were removed, or ``None`` when pruning is disabled
+    or failed (logged).  A failed prune must not fail the import that runs it.
+    """
+    days = retention_days()
+    if days == 0:
+        return None
+    try:
+        async with get_log_db() as session:
+            removed = await db.prune_api_requests(session, keep_days=days)
+            await session.commit()
+    except Exception:  # noqa: BLE001 — retention is housekeeping
+        logger.warning("Could not prune the API request log", exc_info=True)
+        return None
+    return removed
 
 
 def _may_store_bodies(provider: str, ctx: _Context | None) -> bool:
