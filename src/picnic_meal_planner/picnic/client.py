@@ -158,12 +158,12 @@ async def _call(method: str, *args, **kwargs) -> Any:
             api_log.PROVIDER_PICNIC,
             method,
             target=_log_target(method, args),
-            fallback_request_body=api_log.call_body(*args, **kwargs),
+            request_body=api_log.call_body(*args, **kwargs),
         ) as session:
-            session.fallback_response_body = await _run(
+            session.response_body = await _run(
                 getattr(client, method), *args, **kwargs
             )
-            result = session.fallback_response_body
+            result = session.response_body
     except Exception as exc:
         from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
 

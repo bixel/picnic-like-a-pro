@@ -32,8 +32,9 @@ Instrumentation
 - Picnic: :func:`install_picnic_capture` wraps the ``requests.Session`` used by
   python-picnic-api2.  Every HTTP call — normal operations, login and 2FA —
   is captured with the *prepared* method, URL, headers and wire body.
-- OpenRouter: ``llm.create_message`` records the URL, request headers and body
-  it sends, plus the raw completion.
+- OpenRouter: ``llm.create_message`` wraps its call in the same
+  :func:`capture_http_requests` block and fills in the URL, request headers,
+  body, raw completion and token counts itself.
 
 Picnic captures are collected in a contextvar and persisted by
 :func:`capture_http_requests` after the synchronous library call returns.  The
@@ -176,19 +177,29 @@ class HttpCapture:
 
 @dataclass
 class CaptureSession:
-    """State shared with the caller while a sync Picnic call is in flight.
+    """One logged call, shared with the caller while it is in flight.
 
-    Set ``fallback_response_body`` on the object yielded by
-    :func:`capture_http_requests`; it is used when the client made no HTTP
-    request at all (for example the in-process mock client, or a call that
-    failed before sending).
+    The fields below describe the call as a whole.  They become the row when
+    no HTTP request was captured: the in-process mock client, a Picnic call
+    that failed before sending, or an OpenRouter call (the openai SDK uses
+    httpx, which is not wrapped, so ``llm.py`` fills them in itself).  When
+    HTTP requests were captured, each becomes its own row instead.
+
+    If the call raises and no ``response_body`` was set, the payload carried
+    by the exception (``error_response_body``) is stored.
     """
 
     provider: str
     operation: str
     target: str | None = None
-    fallback_request_body: Any = None
-    fallback_response_body: Any = None
+    http_method: str | None = None
+    url: str | None = None
+    request_headers: Any = None
+    request_body: Any = None
+    response_body: Any = None
+    http_status: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     error: BaseException | None = None
     timer: Timer = field(default_factory=Timer.start)
     captures: list[HttpCapture] = field(default_factory=list)
@@ -239,21 +250,27 @@ async def capture_http_requests(
     operation: str,
     *,
     target: str | None = None,
-    fallback_request_body: Any = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: Any = None,
+    request_body: Any = None,
 ) -> AsyncIterator[CaptureSession]:
-    """Collect and log the HTTP requests made inside the block.
+    """Log the call made inside the block; the one wrapper for both providers.
 
-    The blocking Picnic call must run through ``asyncio.to_thread`` so this
-    contextvar reaches the worker thread.  Every captured request becomes its
-    own row.  If the call made no HTTP request, one fallback row is written
-    with *fallback_request_body* (this covers the in-process mock client and
-    failures that happen before sending).
+    A blocking Picnic call must run through ``asyncio.to_thread`` so the
+    capture list reaches the worker thread.  Every captured HTTP request
+    becomes its own row.  If none was captured, one row is written from the
+    yielded :class:`CaptureSession` (see there).  The block's outcome is never
+    changed: an exception is logged and re-raised unchanged.
     """
     session = CaptureSession(
         provider=provider,
         operation=operation,
         target=target,
-        fallback_request_body=fallback_request_body,
+        http_method=http_method,
+        url=url,
+        request_headers=request_headers,
+        request_body=request_body,
     )
     token = _captures.set(session.captures)
     try:
@@ -276,8 +293,18 @@ def _session_rows(session: CaptureSession) -> list[dict]:
                 session.timer,
                 target=session.target,
                 error=session.error,
-                request_body=session.fallback_request_body,
-                response_body=session.fallback_response_body,
+                http_status=session.http_status,
+                http_method=session.http_method,
+                url=session.url,
+                request_headers=session.request_headers,
+                input_tokens=session.input_tokens,
+                output_tokens=session.output_tokens,
+                request_body=session.request_body,
+                response_body=(
+                    session.response_body
+                    if session.response_body is not None
+                    else error_response_body(session.error)
+                ),
             )
         ]
     return [

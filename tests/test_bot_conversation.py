@@ -652,9 +652,7 @@ class TestPostInit:
         # Point at a database that has never been initialised.
         fresh = tmp_path / "fresh.db"
         monkeypatch.setenv("DB_PATH", str(fresh))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
 
         await bot._post_init(MagicMock())
 
@@ -684,9 +682,7 @@ class TestPostInit:
         cfg.set_main_option("script_location", str(root / "alembic"))
         db_file = tmp_path / "at_0002.db"
         monkeypatch.setenv("DB_PATH", str(db_file))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
         # env.py calls asyncio.run(), which cannot nest in the running loop.
         await asyncio.to_thread(command.upgrade, cfg, "0002")
 
@@ -708,9 +704,7 @@ class TestPostInit:
         cfg = Config(str(root / "alembic.ini"))
         cfg.set_main_option("script_location", str(root / "alembic"))
         monkeypatch.setenv("DB_PATH", str(tmp_path / "at_0003.db"))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
         await asyncio.to_thread(command.upgrade, cfg, "0003")
 
         with pytest.raises(bot.SchemaOutOfDateError, match="0003"):

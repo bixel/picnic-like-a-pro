@@ -94,7 +94,7 @@ async def login_step(func, *args, **kwargs) -> Any:
     async with api_log.capture_http_requests(
         api_log.PROVIDER_PICNIC,
         operation,
-        fallback_request_body=_login_body(operation, args),
+        request_body=_login_body(operation, args),
     ):
         return await asyncio.to_thread(func, *args, **kwargs)
 

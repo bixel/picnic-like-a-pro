@@ -272,9 +272,9 @@ class TestCaptureHttpRequests:
         async with api_log.capture_http_requests(
             api_log.PROVIDER_PICNIC,
             "get_cart",
-            fallback_request_body={"args": []},
+            request_body={"args": []},
         ) as session:
-            session.fallback_response_body = {"items": [{"id": "p1"}]}
+            session.response_body = {"items": [{"id": "p1"}]}
 
         [row] = await _rows()
         assert row["status"] == "success"

@@ -362,6 +362,9 @@ class TestCreateMessage:
             [row] = await list_api_requests(session, provider="openrouter")
         assert row["status"] == "error"
         assert row["error_type"] == "LLMError"
+        # The unusable completion itself is kept: it is what needs debugging.
+        assert row["http_status"] == 200
+        assert json.loads(row["response_body"])["choices"] == []
 
 
 class TestLlmClient:
