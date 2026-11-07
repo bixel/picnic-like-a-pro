@@ -167,6 +167,13 @@ src/picnic_meal_planner/
     └── engine.py     # Urgency-score model (pure Python, no DB access)
 ```
 
+`calm/picnic-like-a-pro.architecture.json` is a FINOS CALM model of this
+structure (nodes, relationships, flows, controls); `calm/README.md` maps it
+to the code.  When you add, remove or rewire a module, external service or
+guarantee, update it in the same change and run
+`calm validate -a picnic-like-a-pro.architecture.json -u url-mapping.json --strict`
+from `calm/`.
+
 Query helpers in `queries.py` return **plain dicts** (not ORM model
 instances).  This decouples callers from the ORM and makes the data
 JSON-serialisable without extra steps.

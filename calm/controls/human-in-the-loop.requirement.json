@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/human-in-the-loop.requirement.json",
+  "title": "Human in the loop control requirement",
+  "description": "How a state-changing action is confirmed by a person before an LLM performs it.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://calm.finos.org/release/1.2/meta/control-requirement.json"
+    }
+  ],
+  "properties": {
+    "control-id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "documented-in": {
+      "type": "string",
+      "description": "Where the rule is written down"
+    },
+    "enforced-in": {
+      "type": "string",
+      "description": "Code location that enforces the control"
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment variables that configure it"
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "tool-parameter",
+          "system-prompt",
+          "none"
+        ]
+      }
+    }
+  },
+  "required": [
+    "control-id",
+    "name",
+    "description",
+    "documented-in",
+    "enforced-in",
+    "confirmation"
+  ]
+}
