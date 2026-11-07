@@ -265,6 +265,61 @@ class TestChatModelMigration:
         assert row["persist_history"] == 0
 
 
+# ---------------------------------------------------------------------------
+# 0005: category ids replace the product's category name
+# ---------------------------------------------------------------------------
+
+class TestCategoryMigration:
+    def _sql(self, db_file: Path, *statements: str) -> list[dict]:
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            with engine.begin() as conn:
+                rows = []
+                for sql in statements:
+                    result = conn.exec_driver_sql(sql)
+                    if result.returns_rows:
+                        rows = [dict(r._mapping) for r in result]
+                return rows
+        finally:
+            engine.dispose()
+
+    def _seed_at_0004(self, tmp_path, monkeypatch) -> Path:
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0004")
+        self._sql(
+            db_file,
+            "INSERT INTO products (id, name, category) VALUES ('p_a', 'A', 'Milch'), ('p_b', 'B', NULL)",
+            "INSERT INTO orders (id, ordered_at) VALUES (1, '2026-01-01T00:00:00')",
+            "INSERT INTO order_items (order_id, product_id, quantity) VALUES (1, 'p_a', 2)",
+        )
+        return db_file
+
+    def test_upgrade_drops_the_name_and_keeps_the_rows(self, tmp_path, monkeypatch):
+        db_file = self._seed_at_0004(tmp_path, monkeypatch)
+        command.upgrade(_alembic_config(), "head")
+        rows = self._sql(db_file, "SELECT * FROM products ORDER BY id")
+        assert [(r["id"], r["category_id"]) for r in rows] == [("p_a", None), ("p_b", None)]
+        assert "category" not in rows[0]
+        assert self._sql(db_file, "SELECT product_id, quantity FROM order_items") == [
+            {"product_id": "p_a", "quantity": 2},
+        ]
+
+    def test_downgrade_restores_names_from_categories(self, tmp_path, monkeypatch):
+        db_file = self._seed_at_0004(tmp_path, monkeypatch)
+        command.upgrade(_alembic_config(), "head")
+        self._sql(
+            db_file,
+            "INSERT INTO categories (id, l2_id, l1_id, name) VALUES (3, 2, 1, 'Milch')",
+            "UPDATE products SET category_id = 3 WHERE id = 'p_a'",
+        )
+        command.downgrade(_alembic_config(), "0004")
+        rows = self._sql(db_file, "SELECT id, category FROM products ORDER BY id")
+        assert rows == [{"id": "p_a", "category": "Milch"}, {"id": "p_b", "category": None}]
+        tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "categories" not in tables
+
+
 def test_schema_revision_is_the_alembic_head():
     """engine.SCHEMA_REVISION gates startup; it must move with every migration."""
     from alembic.script import ScriptDirectory

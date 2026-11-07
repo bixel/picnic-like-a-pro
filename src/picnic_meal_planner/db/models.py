@@ -43,10 +43,7 @@ class Product(Base):
     unit_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     unit_quantity: Mapped[str | None] = mapped_column(String, nullable=True)
     image_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # The L3 category's name, kept on the row for name-based lookups; the
-    # category itself is ``category_id``.  Rows that predate category ids
-    # (or seeded mock data) may have a name and no id.
-    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The product's L3 category; its name lives only in ``categories``.
     category_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("categories.id"), nullable=True
     )

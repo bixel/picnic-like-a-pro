@@ -7,9 +7,9 @@ page keeps the L2 name, and whether an L1 page exists, is not known yet.  This
 script prints the outline of those pages so the parser can be written against
 a real payload.
 
-Read-only: it sends GET requests for public catalogue pages and writes
-nothing to the database.  The pages hold no account data, so the saved JSON
-is safe to share.
+Read-only as far as the catalogue goes: it sends GET requests for public
+catalogue pages, and the only database write is a refreshed Picnic session
+token.  The pages hold no account data, so the saved JSON is safe to share.
 
 Usage:
     uv run python scripts/inspect_category.py <product_id>
@@ -39,7 +39,7 @@ from picnic_meal_planner.picnic import client as picnic
 # answer too.
 PAGES = {
     "product": "/pages/product-details-page-root?id={product_id}&show_category_action=true",
-    "l2": "/pages/L2-category-page-root?category_id={l2}&l3_category_id={l3}",
+    "l2": picnic.L2_PAGE_PATH,
     "l1": "/pages/L1-category-page-root?category_id={l1}",
 }
 
@@ -51,9 +51,9 @@ def outline(page) -> list[str]:
         node_id = node.get("id") if isinstance(node.get("id"), str) else None
         component = node.get("pml", {}).get("component", {}) if isinstance(node.get("pml"), dict) else {}
         role = component.get("accessibilityRole")
-        label = component.get("accessibilityLabel")
+        label = pml.accessibility_label(node)
         text = pml.text_of(node)
-        target = (node.get("onPress") or {}).get("target") if isinstance(node.get("onPress"), dict) else None
+        target = pml.on_press_target(node)
         if node_id or role == "header" or text or target:
             parts = [f"id={node_id}" if node_id else "", f"role={role}" if role else "",
                      f"label={label!r}" if label else "", f"text={text!r}" if text else "",
@@ -65,6 +65,8 @@ def outline(page) -> list[str]:
 async def fetch(path: str):
     try:
         return await picnic._call("_get", path, add_picnic_headers=True)
+    except (picnic.PicnicLoginRequired, picnic.PicnicLoginPending):
+        raise
     except Exception as exc:  # noqa: BLE001 — a diagnostic: report and go on
         return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -79,12 +81,14 @@ async def main() -> None:
     ids = Article.category_ids_from_page(product) if isinstance(product, dict) else None
     pages = {"product": product}
     if ids is None:
-        print("No category button on the product page.")
+        error = product.get("error") if isinstance(product, dict) else None
+        print(f"Could not load the product page: {error}" if error
+              else "No category button on the product page.")
     else:
         l1, l2, l3 = ids
         print(f"Category ids: l1={l1} l2={l2} l3={l3}")
         print("L3 names on the L2 page:")
-        pages["l2"] = await fetch(PAGES["l2"].format(l2=l2, l3=l3))
+        pages["l2"] = await fetch(PAGES["l2"].format(l2_id=l2, l3_id=l3))
         for l3_id, name in picnic.l3_names_on_page(pages["l2"]).items():
             print(f"  {l3_id}: {name}")
         pages["l1"] = await fetch(PAGES["l1"].format(l1=l1))
