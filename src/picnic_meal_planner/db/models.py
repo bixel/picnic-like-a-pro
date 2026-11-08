@@ -158,6 +158,9 @@ class ApiRequest(Base):
 
     ``source`` and ``run_id`` attribute a request to the process or script run
     that made it; ``scripts/import_history.py`` sets both for a whole run.
+    ``chat_id`` is set for requests made during a chat's turn, so deleting
+    that chat's history (``history.py``) deletes them too.  When the chat has
+    opted out of history, its rows carry no bodies and no query string.
     ``input_tokens``/``output_tokens`` are only populated for OpenRouter.
     """
 
@@ -180,6 +183,7 @@ class ApiRequest(Base):
     response_body: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
     source: Mapped[str | None] = mapped_column(String, nullable=True)  # 'import_history' | ...
     run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    chat_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Telegram chat
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     requested_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime, start
@@ -188,4 +192,5 @@ class ApiRequest(Base):
         Index("idx_api_requests_time", "requested_at"),
         Index("idx_api_requests_provider_time", "provider", "requested_at"),
         Index("idx_api_requests_run", "run_id"),
+        Index("idx_api_requests_chat_time", "chat_id", "requested_at"),
     )

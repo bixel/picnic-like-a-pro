@@ -197,7 +197,7 @@ class TestRecord:
 
         error = _HttpError("boom")
         await api_log.record(
-            api_log.PROVIDER_OPENROUTER,
+            api_log.PROVIDER_PICNIC,
             "op",
             _timer(),
             error=error,
@@ -210,7 +210,7 @@ class TestRecord:
         def broken():
             raise RuntimeError("db down")
 
-        monkeypatch.setattr(api_log.db, "get_db", broken)
+        monkeypatch.setattr(api_log, "get_log_db", broken)
         with caplog.at_level(logging.WARNING):
             await api_log.record(api_log.PROVIDER_PICNIC, "get_deliveries", _timer())
         assert "Could not record API request" in caplog.text
@@ -272,9 +272,9 @@ class TestCaptureHttpRequests:
         async with api_log.capture_http_requests(
             api_log.PROVIDER_PICNIC,
             "get_cart",
-            fallback_request_body={"args": []},
+            request_body={"args": []},
         ) as session:
-            session.fallback_response_body = {"items": [{"id": "p1"}]}
+            session.response_body = {"items": [{"id": "p1"}]}
 
         [row] = await _rows()
         assert row["status"] == "success"
@@ -573,3 +573,107 @@ class TestQueryHelpers:
         async with db.get_db() as session:
             with pytest.raises(ValueError):
                 await db.prune_api_requests(session, keep_days=-1)
+
+
+class TestLockedDatabase:
+    """A lock held by another connection must not stall the logged request."""
+
+    async def test_a_held_lock_costs_a_row_not_a_stall(self, db_path, caplog):
+        import sqlite3
+        import time as _time
+
+        blocker = sqlite3.connect(db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            started = _time.perf_counter()
+            with caplog.at_level(logging.WARNING):
+                await api_log.record(api_log.PROVIDER_PICNIC, "get_cart", _timer())
+            elapsed = _time.perf_counter() - started
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert elapsed < 2, f"logging waited {elapsed:.1f}s on a held lock"
+        assert "Could not record API request" in caplog.text
+        assert await _rows() == []
+
+    async def test_the_short_timeout_is_confined_to_the_log_engine(self):
+        from picnic_meal_planner.db import engine as engine_mod
+
+        # History and order writes keep sqlite3's default wait.
+        assert engine_mod.get_log_engine() is not engine_mod.get_engine()
+        assert "timeout" not in engine_mod.get_engine().dialect.create_connect_args(
+            engine_mod.get_engine().url
+        )[1]
+
+
+class TestConsent:
+    async def test_without_consent_the_query_string_is_dropped(self):
+        async with api_log.request_context("bot", chat_id=3, store_bodies=False):
+            await api_log.record(
+                api_log.PROVIDER_PICNIC,
+                "search",
+                _timer(),
+                http_method="GET",
+                url="https://storefront/api/15/pages/search?search_term=pregnancy+test",
+                request_body={"q": "pregnancy test"},
+                response_body={"items": []},
+            )
+        [row] = await _rows()
+        assert row["url"] == "https://storefront/api/15/pages/search"
+        assert row["request_body"] is None and row["response_body"] is None
+        assert row["chat_id"] == 3
+
+    async def test_picnic_bodies_outside_a_context_are_kept(self):
+        await api_log.record(
+            api_log.PROVIDER_PICNIC, "get_cart", _timer(), response_body={"items": []}
+        )
+        [row] = await _rows()
+        assert row["response_body"] is not None and row["chat_id"] is None
+
+
+class TestRetention:
+    async def _insert(self, requested_at: str) -> None:
+        async with db.get_db() as session:
+            await db.insert_api_request(
+                session,
+                provider="picnic",
+                operation="op",
+                status="success",
+                duration_ms=1,
+                requested_at=requested_at,
+            )
+            await session.commit()
+
+    @pytest.mark.parametrize(
+        ("value", "days"),
+        [(None, 30), ("", 30), ("7", 7), ("0", 0), ("-3", 30), ("week", 30)],
+    )
+    def test_retention_days(self, monkeypatch, value, days):
+        if value is None:
+            monkeypatch.delenv("API_LOG_RETENTION_DAYS", raising=False)
+        else:
+            monkeypatch.setenv("API_LOG_RETENTION_DAYS", value)
+        assert api_log.retention_days() == days
+
+    async def test_prune_expired_uses_the_configured_window(self, monkeypatch):
+        monkeypatch.setenv("API_LOG_RETENTION_DAYS", "30")
+        await self._insert("2020-01-01T00:00:00+00:00")
+        await self._insert(datetime.now(UTC).isoformat())
+        assert await api_log.prune_expired() == 1
+        assert len(await _rows()) == 1
+
+    async def test_zero_keeps_everything(self, monkeypatch):
+        monkeypatch.setenv("API_LOG_RETENTION_DAYS", "0")
+        await self._insert("2020-01-01T00:00:00+00:00")
+        assert await api_log.prune_expired() is None
+        assert len(await _rows()) == 1
+
+    async def test_a_failed_prune_never_raises(self, monkeypatch, caplog):
+        def broken():
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(api_log, "get_log_db", broken)
+        with caplog.at_level(logging.WARNING):
+            assert await api_log.prune_expired() is None
+        assert "Could not prune" in caplog.text

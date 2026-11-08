@@ -269,6 +269,57 @@ class TestRunLlmThroughTheRealAdapter:
         assert len(await history.list_turns(1)) == 1
 
 
+class TestRunLlmRequestLog:
+    """The turn's API requests are tied to the chat and follow its consent."""
+
+    @pytest.fixture
+    def real_adapter(self, monkeypatch):
+        from openai.types.chat import ChatCompletion
+
+        class _Completions:
+            async def create(self, **_kwargs):
+                return ChatCompletion.model_validate({
+                    "id": "g", "object": "chat.completion", "created": 0,
+                    "model": "m",
+                    "choices": [{
+                        "index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Noted."},
+                    }],
+                })
+
+        client = MagicMock()
+        client.chat.completions = _Completions()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.default_headers = {}
+        monkeypatch.setattr(llm, "get_client", lambda: client)
+        monkeypatch.setattr(bot, "_mcp_tools", [])
+
+    async def _rows(self):
+        from picnic_meal_planner.db import queries as db
+
+        async with db.get_db() as session:
+            return await db.list_api_requests(session, provider="openrouter")
+
+    async def test_requests_carry_the_chat_id_and_bodies(self, real_adapter, db_path):
+        await bot._run_llm(55, "dear diary")
+        [row] = await self._rows()
+        assert row["chat_id"] == 55
+        assert row["source"] == "bot"
+        assert "dear diary" in row["request_body"]
+
+    async def test_an_opted_out_chat_logs_no_bodies(self, real_adapter, db_path):
+        await history.set_persistence(55, False)
+        await bot._run_llm(55, "dear diary")
+        [row] = await self._rows()
+        assert row["chat_id"] == 55
+        assert row["request_body"] is None and row["response_body"] is None
+
+    async def test_forget_deletes_the_turns_requests(self, real_adapter, db_path):
+        await bot._run_llm(55, "dear diary")
+        await history.clear_history(55)
+        assert await self._rows() == []
+
+
 class TestRunLlmToolUse:
     async def test_executes_tool_then_returns_final_text(self, fake_llm, db_path):
         fake_llm([
@@ -652,9 +703,7 @@ class TestPostInit:
         # Point at a database that has never been initialised.
         fresh = tmp_path / "fresh.db"
         monkeypatch.setenv("DB_PATH", str(fresh))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
 
         await bot._post_init(MagicMock())
 
@@ -684,9 +733,7 @@ class TestPostInit:
         cfg.set_main_option("script_location", str(root / "alembic"))
         db_file = tmp_path / "at_0002.db"
         monkeypatch.setenv("DB_PATH", str(db_file))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
         # env.py calls asyncio.run(), which cannot nest in the running loop.
         await asyncio.to_thread(command.upgrade, cfg, "0002")
 
@@ -708,9 +755,7 @@ class TestPostInit:
         cfg = Config(str(root / "alembic.ini"))
         cfg.set_main_option("script_location", str(root / "alembic"))
         monkeypatch.setenv("DB_PATH", str(tmp_path / "at_0003.db"))
-        await engine_mod._engine.dispose()
-        engine_mod._engine = None
-        engine_mod._session_factory = None
+        await engine_mod.dispose_engines()
         await asyncio.to_thread(command.upgrade, cfg, "0003")
 
         with pytest.raises(bot.SchemaOutOfDateError, match="0003"):

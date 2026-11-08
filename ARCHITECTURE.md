@@ -289,13 +289,14 @@ The Picnic session token, shared by every process using the account (migration
 | updated_at | TEXT       | ISO datetime                            |
 
 ### `api_requests`
-Append-only log of HTTP calls to Picnic and OpenRouter (migrations 0005 and
-0006), written best-effort by `api_log.py`. It stores the method, full URL,
+Append-only log of HTTP calls to Picnic and OpenRouter (migrations 0005–0007),
+written best-effort by `api_log.py`. It stores the method, full URL,
 headers and complete request/response bodies so a call can be replayed with
 curl. Bodies are not truncated. Credential values (passwords, 2FA codes,
 API keys, session tokens, cookies) are redacted; everything else is verbatim.
 The table still contains prompt, tool-result and order data, so treat the
-database file as sensitive and prune the log.
+database file as sensitive.  Rows from a chat that opted out of history carry
+no bodies, and deleting a chat's history deletes its rows.
 
 | Column           | Type    | Notes                                      |
 |------------------|---------|--------------------------------------------|
@@ -314,14 +315,16 @@ database file as sensitive and prune the log.
 | error_message    | TEXT    | truncated exception message                |
 | request_body     | TEXT    | full JSON call args / OpenRouter request   |
 | response_body    | TEXT    | full JSON result / OpenRouter completion   |
-| source           | TEXT    | `import_history`, or NULL for bot/MCP      |
-| run_id           | TEXT    | groups one script run                      |
+| source           | TEXT    | `import_history`, `bot`, or NULL (MCP)     |
+| run_id           | TEXT    | groups one script run or bot turn          |
+| chat_id          | INTEGER | Telegram chat of a bot turn (nullable)     |
 | input_tokens     | INTEGER | OpenRouter prompt tokens                   |
 | output_tokens    | INTEGER | OpenRouter completion tokens               |
 | requested_at     | TEXT    | ISO datetime the request started           |
 
-Indexed on `requested_at`, `(provider, requested_at)` and `run_id`. Prune old
-rows with `db.queries.prune_api_requests()`.
+Indexed on `requested_at`, `(provider, requested_at)`, `run_id` and
+`(chat_id, requested_at)`. `scripts/import_history.py` prunes rows older than
+`API_LOG_RETENTION_DAYS` (default 30).
 
 ### `meal_plans`
 Optional: track planned meals to drive shopping list generation.

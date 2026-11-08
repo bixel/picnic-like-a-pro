@@ -39,7 +39,7 @@ that the caller can batch multiple writes into one transaction.
 
 ### Models: `db/models.py`
 
-Seven ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
+Eight ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
 columns:
 
 | Model | Table | Notes |
@@ -77,6 +77,7 @@ Alembic manages all schema changes.
 | `alembic/versions/0004_*.py` | Picnic session token (`picnic_auth`) — purely additive |
 | `alembic/versions/0005_*.py` | API request log (`api_requests`) — purely additive |
 | `alembic/versions/0006_*.py` | HTTP method, URL and headers on `api_requests` — purely additive |
+| `alembic/versions/0007_*.py` | `api_requests.chat_id` for consent-aware deletion — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -326,7 +327,9 @@ in `picnic/auth.py`, and `client.py` applies it.
 `api_log.py`.  Instrumentation is at each provider's single choke point, not at
 call sites: Picnic's `requests.Session` is wrapped at creation (so every normal
 operation, login and 2FA call is captured), and `llm.create_message` records
-its OpenRouter call.
+its OpenRouter call.  Both go through one wrapper,
+`api_log.capture_http_requests()`; login steps go through
+`auth.login_step()`, whichever front end starts them.
 
 - **Requests are replayable.** A row stores `http_method`, the full `url`
   (including query string), `request_headers`/`response_headers` and the
@@ -340,10 +343,24 @@ its OpenRouter call.
   `secret`, `otp`, `token` and `api_key` are redacted recursively.  To replay
   a call, substitute the real credential back into the stored curl command.
 - **The table is sensitive.** It contains chat prompts, tool results and
-  order details.  Protect the database file, and prune the log with
-  `db.queries.prune_api_requests(session, keep_days=N)` from an operator task
-  (cron, pre-backup).  `API_LOG_BODIES=false` disables body capture; URLs and
-  headers are still stored.
+  order details.  Protect the database file.  `scripts/import_history.py`
+  prunes rows older than `API_LOG_RETENTION_DAYS` (default 30, `0` = keep)
+  at the end of every run via `api_log.prune_expired()`; without a scheduled
+  import, call it (or `db.queries.prune_api_requests`) from another task.
+  `API_LOG_BODIES=false` disables body capture; URLs and headers are still
+  stored.
+- **Consent follows history.** `bot._run_llm` opens
+  `api_log.request_context("bot", chat_id=…, store_bodies=…)` per turn, with
+  `store_bodies` from `history.is_persistence_enabled` (fail closed).  A chat
+  that opted out gets rows without bodies or URL query strings, and an
+  OpenRouter call outside any context stores no bodies.  `api_log` decides
+  nothing about consent itself.
+- **Deletion reaches the log.** Rows carry `chat_id`; `clear_history`
+  (`/forget`), `set_persistence(False)`, `delete_turns` and `delete_day`
+  delete the chat's rows in the same transaction.  A turn's messages are all
+  stamped at commit, after its requests, so a turn's requests are those in
+  `(previous turn's commit, its commit]` (`queries.turn_time_windows`); a
+  discarded turn's requests fall into the next turn's window.
 - **Other fields:** `provider`, `operation`, `target` (delivery/product id or
   model id), `status`, `http_status`, `duration_ms`, `error_type`,
   `error_message` (truncated), `source`, `run_id`, token counts and
@@ -352,10 +369,13 @@ its OpenRouter call.
 - **Best effort.** A failed log write is a warning and never changes the
   outcome of the request being logged — the opposite default from `history.py`
   deletion.  The insert is awaited, so a row is committed before the caller
-  returns.
+  returns.  It uses a separate engine (`engine.get_log_db()`) whose lock
+  timeout is `LOG_LOCK_TIMEOUT_SECONDS` (0.2 s): a database locked by another
+  connection costs a lost row, not a 5 s stall on every API call.
 - **Run grouping.** `api_log.request_context(source)` uses a contextvar;
   `scripts/import_history.py` wraps its whole run, so all rows share a
-  `source` (`import_history`) and one `run_id`.  Bot/MCP calls have NULL there.
+  `source` (`import_history`) and one `run_id`.  Bot turns use source `bot`
+  and a `run_id` per turn; MCP-server calls have NULL there.
 
 ---
 
@@ -376,6 +396,7 @@ its OpenRouter call.
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Override only for a proxy/gateway |
 | `OPENROUTER_APP_NAME` / `OPENROUTER_APP_URL` | `Picnic Like a Pro` / — | Optional attribution headers |
 | `API_LOG_BODIES` | `true` | Store full request/response bodies in `api_requests`; `false` = no bodies (URLs/headers still stored) |
+| `API_LOG_RETENTION_DAYS` | `30` | `import_history.py` prunes older `api_requests` rows; `0` = keep everything |
 | `ALLOWED_TELEGRAM_USER_IDS` | — | Comma-separated list of allowed user IDs |
 | `ALLOW_ALL_USERS` | `false` | Set to `true` for local dev (bypasses auth) |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `http` |

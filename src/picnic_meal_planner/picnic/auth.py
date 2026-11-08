@@ -81,11 +81,12 @@ def _login_body(operation: str, args: tuple) -> dict:
     return {"args": api_log.REDACTED}
 
 
-async def _run(func, *args, **kwargs) -> Any:
+async def login_step(func, *args, **kwargs) -> Any:
     """Run one blocking login step in a worker thread, logging it.
 
     Login is the only Picnic traffic that does not go through
-    ``client._call()``, so it is logged here.  The session capture records the
+    ``client._call()``, so it is logged here, for both front ends and for
+    ``client.get_client()``'s password login.  The session capture records the
     real HTTP request; credentials are redacted by ``api_log``.  The fallback
     body is used only if no HTTP request was made.
     """
@@ -93,7 +94,7 @@ async def _run(func, *args, **kwargs) -> Any:
     async with api_log.capture_http_requests(
         api_log.PROVIDER_PICNIC,
         operation,
-        fallback_request_body=_login_body(operation, args),
+        request_body=_login_body(operation, args),
     ):
         return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -230,9 +231,9 @@ class LoginFlow:
         api = new_api()
         self._pending = None
         try:
-            await _run(api.login, username, password)
+            await login_step(api.login, username, password)
         except Picnic2FARequired:
-            await _run(api.generate_2fa_code, channel)
+            await login_step(api.generate_2fa_code, channel)
             self._pending = _Pending(api=api, channel=channel, owner=owner)
             return None
         _require_token(api)
@@ -251,7 +252,7 @@ class LoginFlow:
                 "No Picnic login is waiting for a code (or it expired). "
                 "Start again with /picnic_login."
             )
-        await _run(pending.api.verify_2fa_code, code.strip())
+        await login_step(pending.api.verify_2fa_code, code.strip())
         self._pending = None
         _require_token(pending.api)
         return pending.api

@@ -27,13 +27,22 @@ tool-result and order data, so treat the database file as sensitive and prune
 the log with ``db.queries.prune_api_requests()``.  ``API_LOG_BODIES=false``
 disables body capture; URLs and headers are still recorded.
 
+Consent
+-------
+The bot opens a :func:`request_context` per chat turn with the chat's id and
+its history-persistence decision.  A chat that opted out of history (or
+``PERSIST_CONVERSATIONS=false``) gets rows without bodies or query strings;
+OpenRouter requests outside any context store no bodies either.  Rows with a
+``chat_id`` are deleted by ``history.py`` with the turns they belong to.
+
 Instrumentation
 ---------------
 - Picnic: :func:`install_picnic_capture` wraps the ``requests.Session`` used by
   python-picnic-api2.  Every HTTP call — normal operations, login and 2FA —
   is captured with the *prepared* method, URL, headers and wire body.
-- OpenRouter: ``llm.create_message`` records the URL, request headers and body
-  it sends, plus the raw completion.
+- OpenRouter: ``llm.create_message`` wraps its call in the same
+  :func:`capture_http_requests` block and fills in the URL, request headers,
+  body, raw completion and token counts itself.
 
 Picnic captures are collected in a contextvar and persisted by
 :func:`capture_http_requests` after the synchronous library call returns.  The
@@ -46,9 +55,15 @@ Policy
   request being logged: every failure here is a warning, never an exception.
 - **Await, do not detach.**  The insert is awaited so the row is committed
   before the caller returns.  Losing rows to a fire-and-forget task would be
-  worse than one INSERT.
-- **Retention is explicit.**  Rows are not truncated; use
-  ``db.queries.prune_api_requests()`` from an operator task.
+  worse than one INSERT.  It runs on a separate engine whose lock timeout is
+  ``engine.LOG_LOCK_TIMEOUT_SECONDS``, so a database locked by another
+  connection costs a lost row, not a 5 s stall per call.  All rows of one
+  wrapped call are written in one transaction.
+- **Retention is explicit.**  Rows are not truncated.
+  :func:`prune_expired` deletes rows older than ``API_LOG_RETENTION_DAYS``
+  (default 30, ``0`` keeps everything); ``scripts/import_history.py`` calls it
+  at the end of every run, which is what bounds the table on a scheduled
+  deployment.
 """
 
 from __future__ import annotations
@@ -66,6 +81,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .db import queries as db
+from .db.engine import get_log_db
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +91,8 @@ PROVIDER_OPENROUTER = "openrouter"
 REDACTED = "[REDACTED]"
 
 BODIES_ENABLED = os.getenv("API_LOG_BODIES", "true").strip().lower() != "false"
+
+DEFAULT_RETENTION_DAYS = 30
 
 _MAX_OPERATION = 200
 _MAX_TARGET = 500
@@ -120,6 +138,8 @@ _SENSITIVE_HEADERS = frozenset(
 class _Context:
     source: str
     run_id: str
+    chat_id: int | None = None
+    store_bodies: bool = True
 
 
 _context: contextvars.ContextVar[_Context | None] = contextvars.ContextVar(
@@ -172,19 +192,29 @@ class HttpCapture:
 
 @dataclass
 class CaptureSession:
-    """State shared with the caller while a sync Picnic call is in flight.
+    """One logged call, shared with the caller while it is in flight.
 
-    Set ``fallback_response_body`` on the object yielded by
-    :func:`capture_http_requests`; it is used when the client made no HTTP
-    request at all (for example the in-process mock client, or a call that
-    failed before sending).
+    The fields below describe the call as a whole.  They become the row when
+    no HTTP request was captured: the in-process mock client, a Picnic call
+    that failed before sending, or an OpenRouter call (the openai SDK uses
+    httpx, which is not wrapped, so ``llm.py`` fills them in itself).  When
+    HTTP requests were captured, each becomes its own row instead.
+
+    If the call raises and no ``response_body`` was set, the payload carried
+    by the exception (``error_response_body``) is stored.
     """
 
     provider: str
     operation: str
     target: str | None = None
-    fallback_request_body: Any = None
-    fallback_response_body: Any = None
+    http_method: str | None = None
+    url: str | None = None
+    request_headers: Any = None
+    request_body: Any = None
+    response_body: Any = None
+    http_status: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     error: BaseException | None = None
     timer: Timer = field(default_factory=Timer.start)
     captures: list[HttpCapture] = field(default_factory=list)
@@ -214,14 +244,29 @@ def error_response_body(error: BaseException | None) -> Any:
 
 @asynccontextmanager
 async def request_context(
-    source: str, *, run_id: str | None = None
+    source: str,
+    *,
+    run_id: str | None = None,
+    chat_id: int | None = None,
+    store_bodies: bool = True,
 ) -> AsyncIterator[str]:
     """Attribute every request logged inside the block to *source*/*run_id*.
+
+    *chat_id* ties the rows to a chat, so deleting its history deletes them.
+    *store_bodies* is the caller's consent decision (the bot passes
+    ``history.is_persistence_enabled``): when false, rows keep their metadata
+    but no bodies and no URL query string.  This module makes no consent
+    decision of its own; see :func:`_may_store_bodies` for the default.
 
     Yields the run id (generated when not given).  Contexts nest: the inner
     block wins, and the outer one resumes when it exits.
     """
-    ctx = _Context(source=source, run_id=run_id or uuid.uuid4().hex)
+    ctx = _Context(
+        source=source,
+        run_id=run_id or uuid.uuid4().hex,
+        chat_id=chat_id,
+        store_bodies=store_bodies,
+    )
     token = _context.set(ctx)
     try:
         yield ctx.run_id
@@ -235,21 +280,27 @@ async def capture_http_requests(
     operation: str,
     *,
     target: str | None = None,
-    fallback_request_body: Any = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: Any = None,
+    request_body: Any = None,
 ) -> AsyncIterator[CaptureSession]:
-    """Collect and log the HTTP requests made inside the block.
+    """Log the call made inside the block; the one wrapper for both providers.
 
-    The blocking Picnic call must run through ``asyncio.to_thread`` so this
-    contextvar reaches the worker thread.  Every captured request becomes its
-    own row.  If the call made no HTTP request, one fallback row is written
-    with *fallback_request_body* (this covers the in-process mock client and
-    failures that happen before sending).
+    A blocking Picnic call must run through ``asyncio.to_thread`` so the
+    capture list reaches the worker thread.  Every captured HTTP request
+    becomes its own row.  If none was captured, one row is written from the
+    yielded :class:`CaptureSession` (see there).  The block's outcome is never
+    changed: an exception is logged and re-raised unchanged.
     """
     session = CaptureSession(
         provider=provider,
         operation=operation,
         target=target,
-        fallback_request_body=fallback_request_body,
+        http_method=http_method,
+        url=url,
+        request_headers=request_headers,
+        request_body=request_body,
     )
     token = _captures.set(session.captures)
     try:
@@ -259,19 +310,50 @@ async def capture_http_requests(
         raise
     finally:
         _captures.reset(token)
-        if session.captures:
-            for capture in session.captures:
-                await _record_capture(session, capture)
-        else:
-            await record(
+        await _persist(provider, operation, _session_rows(session))
+
+
+def _session_rows(session: CaptureSession) -> list[dict]:
+    """One row per captured HTTP request, or one fallback row if there were none."""
+    if not session.captures:
+        return [
+            _row(
                 session.provider,
                 session.operation,
                 session.timer,
                 target=session.target,
                 error=session.error,
-                request_body=session.fallback_request_body,
-                response_body=session.fallback_response_body,
+                http_status=session.http_status,
+                http_method=session.http_method,
+                url=session.url,
+                request_headers=session.request_headers,
+                input_tokens=session.input_tokens,
+                output_tokens=session.output_tokens,
+                request_body=session.request_body,
+                response_body=(
+                    session.response_body
+                    if session.response_body is not None
+                    else error_response_body(session.error)
+                ),
             )
+        ]
+    return [
+        _row(
+            session.provider,
+            session.operation,
+            Timer(capture.started_perf, capture.requested_at),
+            target=session.target,
+            error=capture.error,
+            http_status=capture.status_code,
+            http_method=capture.method,
+            url=capture.url,
+            request_headers=capture.request_headers,
+            response_headers=capture.response_headers,
+            request_body=capture.request_body,
+            response_body=capture.response_body,
+        )
+        for capture in session.captures
+    ]
 
 
 def install_picnic_capture(api: Any) -> bool:
@@ -350,37 +432,43 @@ async def record(
 ) -> None:
     """Persist one log row; never raises.
 
-    Callers that need a request's *usage* (OpenRouter token counts) or its raw
-    completion call this directly; everything else should use
-    :func:`capture_http_requests`.
+    Prefer :func:`capture_http_requests`; this is the low-level writer.
     """
-    ctx = _context.get()
-    try:
-        async with db.get_db() as session:
-            await db.insert_api_request(
-                session,
-                provider=provider,
-                operation=operation[:_MAX_OPERATION],
-                target=target[:_MAX_TARGET] if target else None,
-                http_method=http_method[:20] if http_method else None,
+    await _persist(
+        provider,
+        operation,
+        [
+            _row(
+                provider,
+                operation,
+                timer,
+                target=target,
+                error=error,
+                http_status=http_status,
+                http_method=http_method,
                 url=url,
-                request_headers=_headers_text(request_headers),
-                response_headers=_headers_text(response_headers),
-                status="error" if error is not None else "success",
-                http_status=(
-                    http_status if http_status is not None else _http_status_of(error)
-                ),
-                duration_ms=timer.duration_ms,
-                error_type=type(error).__name__ if error is not None else None,
-                error_message=_error_message(error),
-                request_body=_body_text(request_body),
-                response_body=_body_text(response_body),
-                source=ctx.source if ctx else None,
-                run_id=ctx.run_id if ctx else None,
+                request_headers=request_headers,
+                response_headers=response_headers,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                requested_at=timer.requested_at,
+                request_body=request_body,
+                response_body=response_body,
             )
+        ],
+    )
+
+
+async def _persist(provider: str, operation: str, rows: list[dict]) -> None:
+    """Insert *rows* in one transaction on the log engine; never raises.
+
+    The log engine gives up on a held lock after
+    ``engine.LOG_LOCK_TIMEOUT_SECONDS``, so a busy database costs the request
+    a lost row, not a multi-second stall.
+    """
+    try:
+        async with get_log_db() as session:
+            for row in rows:
+                await db.insert_api_request(session, **row)
             await session.commit()
     except Exception:  # observability must not break the request
         logger.warning(
@@ -388,21 +476,116 @@ async def record(
         )
 
 
-async def _record_capture(session: CaptureSession, capture: HttpCapture) -> None:
-    await record(
-        session.provider,
-        session.operation,
-        Timer(capture.started_perf, capture.requested_at),
-        target=session.target,
-        error=capture.error,
-        http_status=capture.status_code,
-        http_method=capture.method,
-        url=capture.url,
-        request_headers=capture.request_headers,
-        response_headers=capture.response_headers,
-        request_body=capture.request_body,
-        response_body=capture.response_body,
+def _row(
+    provider: str,
+    operation: str,
+    timer: Timer,
+    *,
+    target: str | None = None,
+    error: BaseException | None = None,
+    http_status: int | None = None,
+    http_method: str | None = None,
+    url: str | None = None,
+    request_headers: Any = None,
+    response_headers: Any = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    request_body: Any = None,
+    response_body: Any = None,
+) -> dict:
+    """The column values for one row: truncated, redacted and encoded."""
+    ctx = _context.get()
+    if not _may_store_bodies(provider, ctx):
+        request_body = response_body = None
+        url = _without_query(url)
+    return dict(
+        provider=provider,
+        operation=operation[:_MAX_OPERATION],
+        target=target[:_MAX_TARGET] if target else None,
+        http_method=http_method[:20] if http_method else None,
+        url=url,
+        request_headers=_headers_text(request_headers),
+        response_headers=_headers_text(response_headers),
+        status="error" if error is not None else "success",
+        http_status=(
+            http_status if http_status is not None else _http_status_of(error)
+        ),
+        duration_ms=timer.duration_ms,
+        error_type=type(error).__name__ if error is not None else None,
+        error_message=_error_message(error),
+        request_body=_body_text(request_body),
+        response_body=_body_text(response_body),
+        source=ctx.source if ctx else None,
+        run_id=ctx.run_id if ctx else None,
+        chat_id=ctx.chat_id if ctx else None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        requested_at=timer.requested_at,
     )
+
+
+def retention_days() -> int:
+    """``API_LOG_RETENTION_DAYS``, read on each call; ``0`` means keep all.
+
+    An unusable value falls back to the default with a warning rather than
+    failing the run that prunes.
+    """
+    raw = os.getenv("API_LOG_RETENTION_DAYS", "").strip()
+    if not raw:
+        return DEFAULT_RETENTION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        days = -1
+    if days < 0:
+        logger.warning(
+            "Ignoring API_LOG_RETENTION_DAYS=%r; using %d",
+            raw,
+            DEFAULT_RETENTION_DAYS,
+        )
+        return DEFAULT_RETENTION_DAYS
+    return days
+
+
+async def prune_expired() -> int | None:
+    """Delete log rows older than :func:`retention_days`; never raises.
+
+    Returns how many rows were removed, or ``None`` when pruning is disabled
+    or failed (logged).  A failed prune must not fail the import that runs it.
+    """
+    days = retention_days()
+    if days == 0:
+        return None
+    try:
+        async with get_log_db() as session:
+            removed = await db.prune_api_requests(session, keep_days=days)
+            await session.commit()
+    except Exception:  # noqa: BLE001 — retention is housekeeping
+        logger.warning("Could not prune the API request log", exc_info=True)
+        return None
+    return removed
+
+
+def _may_store_bodies(provider: str, ctx: _Context | None) -> bool:
+    """Whether a row may carry bodies (and a URL query string).
+
+    Inside a :func:`request_context`, the caller decided.  Outside one, an
+    OpenRouter request fails closed: its body is a chat transcript, and
+    nothing has confirmed that chat's consent.  Picnic requests outside a
+    context (import script, MCP server, login) carry no chat content.
+    """
+    if not BODIES_ENABLED:
+        return False
+    if ctx is not None:
+        return ctx.store_bodies
+    return provider != PROVIDER_OPENROUTER
+
+
+def _without_query(url: str | None) -> str | None:
+    """*url* without its query string, which can carry a search term."""
+    if not url:
+        return url
+    return url.split("?", 1)[0]
 
 
 def _http_status_of(error: BaseException | None) -> int | None:
