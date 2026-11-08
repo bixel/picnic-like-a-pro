@@ -254,26 +254,72 @@ async def search_products(query: str, limit: int = 10) -> list[dict]:
     return items
 
 
-async def get_product_category(product_id: str) -> str | None:
-    """Return the name of a product's (L3) category, or ``None`` if unknown.
+def _category_ids(article) -> tuple[int | None, int, int] | None:
+    """``(l1_id, l2_id, l3_id)`` from a product page, or ``None``.
 
-    Neither search tiles nor delivery articles carry a category, and the
-    per-article category endpoint is gone, so this loads the product page and
-    then its category page: two requests per product.  ``None`` means Picnic
-    has no page for the product any more, or the page has no category button.
-    Login errors propagate.
+    The page's category button links to
+    ``app.picnic://categories/{l1}/l2/{l2}/l3/{l3}``.
+    """
+    if isinstance(article, dict):  # the mock client
+        ids = article.get("category_ids")
+        return tuple(ids) if ids else None
+    from python_picnic_api2.models import Article  # noqa: PLC0415
+
+    raw = getattr(article, "raw", None)
+    return Article.category_ids_from_page(raw) if isinstance(raw, dict) else None
+
+
+_L3_HEADER_PREFIX = "vertical-article-tiles-sub-header-"
+
+# The library's own L2 page path (``PicnicAPI.get_category_by_ids``).  That
+# method raises when the requested L3 is missing from the page and throws the
+# page away, so the page is fetched here directly and every L3 on it is kept.
+L2_PAGE_PATH = "/pages/L2-category-page-root?category_id={l2_id}&l3_category_id={l3_id}"
+
+
+def l3_names_on_page(page) -> dict[int, str]:
+    """``{l3_id: name}`` for every L3 sub-header on an L2 category page.
+
+    The page lists its L3 categories under headers with the id
+    ``vertical-article-tiles-sub-header-{l3_id}``, labelled with the name.
+    """
+    if not isinstance(page, dict):
+        return {}
+    from python_picnic_api2.models import pml  # noqa: PLC0415
+
+    names: dict[int, str] = {}
+    for node in pml.find_all(page, id_prefix=_L3_HEADER_PREFIX):
+        suffix = node["id"][len(_L3_HEADER_PREFIX):]
+        label = pml.accessibility_label(node)
+        if suffix.isdigit() and label:
+            names[int(suffix)] = label
+    return names
+
+
+async def get_category_ids(product_id: str) -> tuple[int | None, int, int] | None:
+    """A product's ``(l1_id, l2_id, l3_id)``, read from its product page.
+
+    One request.  ``None`` means Picnic has no page for the product any more,
+    or the page has no category button.  Login errors propagate.
     """
     from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
 
     try:
-        article = await _call("get_article", product_id, add_category=True)
+        article = await _call("get_article", product_id)
     except PicnicParseError:
         return None
-    category = getattr(article, "category", None)
-    if isinstance(article, dict):  # the mock client
-        category = article.get("category")
-    name = category.get("name") if isinstance(category, dict) else getattr(category, "name", None)
-    return name or None
+    return None if article is None else _category_ids(article)
+
+
+async def get_l3_names(l2_id: int, l3_id: int) -> dict[int, str]:
+    """``{l3_id: name}`` for every L3 category on an L2 category page.
+
+    One request.  *l3_id* is only part of the page's URL; the result is
+    whatever the page lists, which may or may not include it.  Login errors
+    propagate.
+    """
+    page = await _call("_get", L2_PAGE_PATH.format(l2_id=l2_id, l3_id=l3_id), add_picnic_headers=True)
+    return l3_names_on_page(page)
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +394,6 @@ def _normalise_product(raw: dict) -> dict:
         "unit_price": int(price) if price else None,
         "unit_quantity": raw.get("unit_quantity") or raw.get("quantity"),
         "image_id": raw.get("image_id"),
-        "category": None,  # filled in from search context where available
     }
 
 
@@ -416,7 +461,6 @@ def delivery_line_items(detail: dict) -> list[dict]:
                         "unit_price": unit_price,
                         "unit_quantity": article.get("unit_quantity"),
                         "image_id": article.get("image_id") or (image_ids[0] if image_ids else None),
-                        "category": None,
                     },
                     "quantity": quantity,
                     "unit_price": unit_price,

@@ -45,13 +45,9 @@ class TestNormaliseProduct:
         raw = {"id": "p1", "price": 100, "image_id": "img_abc"}
         assert picnic._normalise_product(raw)["image_id"] == "img_abc"
 
-    def test_category_always_none(self):
-        raw = {"id": "p1", "price": 100, "category": "Dairy"}
-        assert picnic._normalise_product(raw)["category"] is None
-
     def test_all_required_keys_present(self):
         result = picnic._normalise_product({"id": "p1", "price": 100})
-        assert {"id", "name", "unit_price", "unit_quantity", "image_id", "category"} <= result.keys()
+        assert {"id", "name", "unit_price", "unit_quantity", "image_id"} <= result.keys()
 
 
 class TestSearchProducts:
@@ -69,7 +65,6 @@ class TestSearchProducts:
     async def test_results_are_normalised(self):
         for r in await picnic.search_products("melk"):
             assert "unit_price" in r     # normalised key, not raw "price"
-            assert "category" in r
 
     async def test_empty_query_returns_empty(self):
         assert await picnic.search_products("") == []
@@ -78,33 +73,78 @@ class TestSearchProducts:
         assert await picnic.search_products("xyzzy_none") == []
 
 
-class TestGetProductCategory:
+class TestGetCategoryIds:
     async def test_mock_product(self):
-        assert await picnic.get_product_category("p_milk_whole") == "Zuivel, Eieren & Boter"
+        l1_id, l2_id, l3_id = await picnic.get_category_ids("p_milk_whole")
+        assert await picnic.get_l3_names(l2_id, l3_id) == {l3_id: "Zuivel, Eieren & Boter"}
 
     async def test_unknown_product_is_none(self):
-        assert await picnic.get_product_category("p_nonexistent") is None
+        assert await picnic.get_category_ids("p_nonexistent") is None
 
-    async def test_reads_the_typed_article(self, monkeypatch):
-        from python_picnic_api2.models import Article, Category
+    async def test_reads_the_ids_from_the_product_page(self, monkeypatch):
+        from python_picnic_api2.models import Article
+
+        product_page = {"children": [{"id": "category-button", "pml": {"component": {
+            "onPress": {"actionType": "OPEN", "target": "app.picnic://categories/10/l2/20/l3/30"},
+        }}}]}
 
         class Api:
-            def get_article(self, article_id, add_category=False):
-                assert add_category
-                return Article(id=article_id, category=Category(l2_id=1, l3_id=2, name="Koffiebonen"))
+            def get_article(self, article_id):
+                return Article(id=article_id, raw=product_page)
 
         monkeypatch.setattr(picnic, "_client", Api())
-        assert await picnic.get_product_category("s1") == "Koffiebonen"
+        assert await picnic.get_category_ids("s1") == (10, 20, 30)
 
-    async def test_page_without_category_is_none(self, monkeypatch):
+    async def test_page_without_category_button_is_none(self, monkeypatch):
+        from python_picnic_api2.models import Article
+
+        class Api:
+            def get_article(self, article_id):
+                return Article(id=article_id, raw={"children": []})
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_category_ids("s1") is None
+
+    async def test_unparseable_page_is_none(self, monkeypatch):
         from python_picnic_api2 import PicnicParseError
 
         class Api:
-            def get_article(self, article_id, add_category=False):
-                raise PicnicParseError("no category button", endpoint="product-details-page-root")
+            def get_article(self, article_id):
+                raise PicnicParseError("no page", endpoint="product-details-page-root")
 
         monkeypatch.setattr(picnic, "_client", Api())
-        assert await picnic.get_product_category("s1") is None
+        assert await picnic.get_category_ids("s1") is None
+
+
+class TestGetL3Names:
+    async def test_names_every_l3_on_the_l2_page(self, monkeypatch):
+        l2_page = {"children": [
+            {"id": f"vertical-article-tiles-sub-header-{l3}",
+             "pml": {"component": {"accessibilityLabel": name}}}
+            for l3, name in ((30, "Alkoholfrei"), (31, "Pils"))
+        ]}
+        paths = []
+
+        class Api:
+            def _get(self, path, add_picnic_headers=False):
+                paths.append(path)
+                return l2_page
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_l3_names(20, 30) == {30: "Alkoholfrei", 31: "Pils"}
+        assert paths == ["/pages/L2-category-page-root?category_id=20&l3_category_id=30"]
+
+    async def test_a_page_without_the_l3_still_names_the_others(self, monkeypatch):
+        class Api:
+            def _get(self, path, add_picnic_headers=False):
+                return {"children": [{"id": "vertical-article-tiles-sub-header-31",
+                                      "pml": {"component": {"accessibilityLabel": "Pils"}}}]}
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_l3_names(20, 30) == {31: "Pils"}
+
+    async def test_unknown_mock_page_is_empty(self):
+        assert await picnic.get_l3_names(99, 99) == {}
 
 
 class TestGetCart:

@@ -16,6 +16,25 @@ class Base(DeclarativeBase):
     pass
 
 
+class Category(Base):
+    """A leaf (L3) category of Picnic's three-level category tree.
+
+    A product page links to its category as
+    ``app.picnic://categories/{l1}/l2/{l2}/l3/{l3}``; the name is the L3
+    sub-header on the L2 category page.  L3 names are not unique (e.g.
+    "Alkoholfrei" can sit under more than one L2), so the id is the key.
+    """
+
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # L3 id
+    l2_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    l1_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+
+    products: Mapped[list[Product]] = relationship(back_populates="category_ref")
+
+
 class Product(Base):
     __tablename__ = "products"
 
@@ -24,10 +43,14 @@ class Product(Base):
     unit_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     unit_quantity: Mapped[str | None] = mapped_column(String, nullable=True)
     image_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The product's L3 category; its name lives only in ``categories``.
+    category_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("categories.id"), nullable=True
+    )
     last_seen_at: Mapped[str | None] = mapped_column(String, nullable=True)  # ISO datetime
 
     order_items: Mapped[list[OrderItem]] = relationship(back_populates="product")
+    category_ref: Mapped[Category | None] = relationship(back_populates="products")
 
 
 class Order(Base):
