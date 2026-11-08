@@ -6,7 +6,7 @@ flows and controls, validated against the CALM 1.2 schema.
 
 | File | What it is |
 |---|---|
-| `picnic-like-a-pro.architecture.json` | The architecture: 28 nodes, 33 relationships, 4 flows, 12 controls |
+| `picnic-like-a-pro.architecture.json` | The architecture: 31 nodes, 39 relationships, 4 flows, 15 controls |
 | `controls/*.requirement.json` | JSON Schemas for the 5 control kinds; every control's `config` is validated against one |
 | `url-mapping.json` | Maps the controls' published `requirement-url`s to the local files, so validation works offline and before merge |
 | `diagrams/` | PNGs rendered by `calm docify` (overview + one per flow) |
@@ -59,25 +59,28 @@ hops (`metadata.transport: "in-process call"`).
 | `picnic-like-a-pro` | system | `src/picnic_meal_planner/`, `scripts/` | the whole repository, via `composed-of` |
 | `telegram-bot` | service | `bot.py` | handlers, allowlist, the tool-use loop `_run_llm`, startup schema gate |
 | `llm-gateway` | service | `llm.py` | the only module that knows the OpenAI wire format, plus per-chat model choice |
+| `api-log` | service | `api_log.py` | best-effort, replayable log of every Picnic/OpenRouter HTTP call; credentials masked |
 | `conversation-history` | service | `history.py` | all history policy; `bot.py` calls only `get_context` / `commit_turn` |
 | `mcp-tool-server` | service | `mcp_server.py` | the 15 tools; in-process via `call_tool`, or standalone over stdio/SSE/HTTP |
-| `picnic-client` | service | `picnic/client.py`, `picnic/auth.py` | the only code that talks to Picnic; token-first login, 2FA `LoginFlow` |
+| `picnic-client` | service | `picnic/client.py`, `picnic/auth.py` | the only code that talks to Picnic; token-first login, 2FA `LoginFlow`, category lookups |
 | `mock-picnic-api` | service | `picnic/mock_client.py` | swapped in by `PICNIC_MOCK=true` |
 | `forecasting-engine` | service | `forecasting/engine.py` | pure functions, no I/O |
-| `db-access-layer` | service | `db/engine.py`, `db/models.py`, `db/queries.py`, `alembic/` | the only code that touches SQLAlchemy |
+| `db-access-layer` | service | `db/engine.py`, `db/models.py`, `db/queries.py`, `alembic/` | the only code that touches SQLAlchemy; two engines on one file (`get_db`, and `get_log_db` with a 0.2 s lock timeout) |
 | `sqlite-db` | database | the file at `DB_PATH` | shared by every process in the container |
-| `order-history` | data-asset | tables `products`, `orders`, `order_items`, `import_checkpoints` | |
+| `order-history` | data-asset | tables `products`, `categories`, `orders`, `order_items`, `import_checkpoints` | |
 | `conversation-transcripts` | data-asset | table `conversation_messages` | personal data |
+| `api-request-log` | data-asset | table `api_requests` | personal data (prompts, tool results, orders in bodies) |
 | `chat-settings` | data-asset | table `chat_settings` | |
 | `picnic-session-token` | data-asset | table `picnic_auth` | a credential |
 | `import-history-job` | service | `scripts/import_history.py` | |
 | `picnic-login-cli` | service | `scripts/picnic_login.py` | the shell front end to the same `LoginFlow` |
 | `chat-model-cli` | service | `scripts/chat_model.py` | |
 | `preflight-cli` | service | `scripts/preflight.py` | |
+| `inspect-category-cli` | service | `scripts/inspect_category.py` | diagnostic dump of a product's category pages |
 
 `node-type: "container"` is a custom type, which CALM allows. The data assets sit inside `sqlite-db`
 through a `composed-of` relationship (`database-contents`), so the diagram draws the database as a
-box holding its four kinds of data.
+box holding its five kinds of data.
 
 ### Interfaces
 
@@ -105,8 +108,8 @@ protocol list has no SSH). In-process edges have no protocol and have `metadata.
 
 | Flow | Code path |
 |---|---|
-| `chat-turn` | `bot._chat` → `_run_llm` → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop) → `history.commit_turn` |
-| `history-import` | `scripts/import_history.py::import_deliveries` then `backfill_categories` |
+| `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged) → `history.commit_turn` |
+| `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
 | `picnic-2fa-login` | `bot.cmd_picnic_login` → `client.start_login` → `auth.LoginFlow.start`; `cmd_picnic_code` → `submit_login_code` → `_install` → `auth.save_token` |
 | `build-and-deploy` | `deploy.yml`: `build-and-push` job, then the `deploy` job over SSH |
 
@@ -123,8 +126,8 @@ must satisfy the schema for its kind in `controls/`:
 | Kind | Controls |
 |---|---|
 | `access-control` | PLP-AC-01 user allowlist · PLP-AC-02 Picnic login authorisation · PLP-AC-03 model allowlist |
-| `data-protection` | PLP-DP-01 storage consent · PLP-DP-02 retention/erasure · PLP-DP-03 session token handling |
-| `integrity` | PLP-IN-01 clean-turn archiving · PLP-IN-02 turn-aware window · PLP-IN-03 schema gate · PLP-IN-04 no unprompted 2FA |
+| `data-protection` | PLP-DP-01 storage consent · PLP-DP-02 retention/erasure · PLP-DP-03 session token handling · PLP-DP-04 API log follows history consent · PLP-DP-05 credential redaction in the API log |
+| `integrity` | PLP-IN-01 clean-turn archiving · PLP-IN-02 turn-aware window · PLP-IN-03 schema gate · PLP-IN-04 no unprompted 2FA · PLP-IN-05 API logging never affects the request |
 | `network-exposure` | PLP-NE-01 no inbound ports |
 | `human-in-the-loop` | PLP-HL-01 confirm cart changes |
 

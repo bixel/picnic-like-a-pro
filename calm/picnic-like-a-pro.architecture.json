@@ -4,7 +4,7 @@
     "name": "Picnic Like a Pro",
     "description": "CALM architecture of the Picnic Like a Pro Telegram grocery and meal-planning assistant.",
     "repository": "https://github.com/bixel/picnic-like-a-pro",
-    "schema-revision": "0004"
+    "schema-revision": "0008"
   },
   "nodes": [
     {
@@ -264,6 +264,69 @@
       }
     },
     {
+      "unique-id": "api-log",
+      "node-type": "service",
+      "name": "API logger",
+      "description": "Best-effort, replayable log of every Picnic and OpenRouter HTTP call: method, full URL, headers and untruncated bodies, with credentials masked. Picnic is captured by wrapping the library's requests.Session; OpenRouter by llm.create_message. A contextvar request_context groups rows per bot turn or script run and carries the chat's consent decision.",
+      "interfaces": [
+        {
+          "unique-id": "api-log-api",
+          "functions": [
+            "request_context",
+            "capture_http_requests",
+            "install_picnic_capture",
+            "record",
+            "prune_expired"
+          ]
+        }
+      ],
+      "controls": {
+        "api-log-best-effort": {
+          "description": "Persisting a row never changes the outcome of the logged request. Rows are written on a separate engine with a 0.2 s lock timeout.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/integrity.requirement.json",
+              "config": {
+                "control-id": "PLP-IN-05",
+                "name": "API logging never affects the request",
+                "description": "Persisting a row never changes the outcome of the logged request. Rows are written on a separate engine with a 0.2 s lock timeout.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#api-request-log",
+                "failure-mode": "Warning and a lost row; separate engine with a 0.2 s lock timeout so a locked DB does not stall API calls",
+                "enforced-in": "src/picnic_meal_planner/api_log.py::_persist, db/engine.py::get_log_engine"
+              }
+            }
+          ]
+        },
+        "api-log-redaction": {
+          "description": "Authorization, x-picnic-auth, cookies and token/secret/api-key headers, and password/secret/otp/token body keys, are stored as [REDACTED].",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
+              "config": {
+                "control-id": "PLP-DP-05",
+                "name": "Credential redaction in the API log",
+                "description": "Authorization, x-picnic-auth, cookies and token/secret/api-key headers, and password/secret/otp/token body keys, are stored as [REDACTED].",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#api-request-log",
+                "data-classification": "credential",
+                "erasure": "Credential header values and body keys are replaced by [REDACTED] before storage",
+                "failure-mode": "best-effort log: a failed write loses the row, never the request",
+                "enforced-in": "src/picnic_meal_planner/api_log.py::_redact, _redact_header"
+              }
+            }
+          ]
+        }
+      },
+      "metadata": {
+        "code": [
+          "src/picnic_meal_planner/api_log.py"
+        ],
+        "env": [
+          "API_LOG_BODIES",
+          "API_LOG_RETENTION_DAYS"
+        ]
+      }
+    },
+    {
       "unique-id": "conversation-history",
       "node-type": "service",
       "name": "Conversation history",
@@ -415,7 +478,7 @@
       "unique-id": "picnic-client",
       "node-type": "service",
       "name": "Picnic client",
-      "description": "Async wrapper around the synchronous python-picnic-api2 (thread-pool executor), converting pydantic models to dicts. auth.py owns the session-token-first login policy and the 2FA LoginFlow; _call() keeps the stored token current and turns a rejected token into PicnicLoginRequired. PICNIC_MOCK=true swaps in the mock.",
+      "description": "Async wrapper around the synchronous python-picnic-api2 (thread-pool executor), converting pydantic models to dicts. auth.py owns the session-token-first login policy and the 2FA LoginFlow; _call() keeps the stored token current and turns a rejected token into PicnicLoginRequired. Category lookups read the product page and the L2 category page. Every HTTP call is captured by api_log. PICNIC_MOCK=true swaps in the mock.",
       "interfaces": [
         {
           "unique-id": "picnic-functions",
@@ -428,7 +491,8 @@
             "get_delivery_slots",
             "get_deliveries",
             "get_delivery",
-            "get_product_category",
+            "get_category_ids",
+            "get_l3_names",
             "start_login",
             "submit_login_code"
           ]
@@ -486,7 +550,7 @@
       "unique-id": "db-access-layer",
       "node-type": "service",
       "name": "Database access layer",
-      "description": "SQLAlchemy 2.0 async engine and session factory (PRAGMA foreign_keys=ON on every connection), ORM models, and commit-neutral query helpers that return plain dicts. Startup gates: pending_migration(), missing_columns(), init_db().",
+      "description": "SQLAlchemy 2.0 async engine and session factory (PRAGMA foreign_keys=ON on every connection), ORM models, and commit-neutral query helpers that return plain dicts. Two engines on the same file: get_db() for everything and get_log_db() with a 0.2 s lock timeout for the API log. Startup gates: pending_migration(), missing_columns(), init_db().",
       "controls": {
         "schema-version-gate": {
           "description": "The bot, MCP server and import script refuse to run when Alembic's revision is behind SCHEMA_REVISION (checked before init_db), and the bot also when columns are missing.",
@@ -519,7 +583,7 @@
       "unique-id": "sqlite-db",
       "node-type": "database",
       "name": "SQLite database",
-      "description": "A single SQLite file (DB_PATH, default data/picnic.db) on the picnic-data volume; shared by the bot and every script. Schema managed by Alembic (0001-0004).",
+      "description": "A single SQLite file (DB_PATH, default data/picnic.db) on the picnic-data volume; shared by the bot and every script. Schema managed by Alembic (0001-0008).",
       "interfaces": [
         {
           "unique-id": "sqlite-file",
@@ -537,14 +601,15 @@
     {
       "unique-id": "order-history",
       "node-type": "data-asset",
-      "name": "Order history and product cache",
-      "description": "Tables products, orders, order_items and import_checkpoints: every imported or recorded delivery, with prices.",
+      "name": "Order history and product catalogue",
+      "description": "Tables products, categories, orders, order_items and import_checkpoints: every imported or recorded delivery with prices, and Picnic's L3 categories, which hold the only copy of each category name.",
       "metadata": {
         "code": [
           "src/picnic_meal_planner/db/models.py"
         ],
         "tables": [
           "products",
+          "categories",
           "orders",
           "order_items",
           "import_checkpoints"
@@ -568,7 +633,7 @@
                 "description": "/forget deletes a chat's rows; /privacy off deletes and stops storing. Retention is otherwise unbounded and the file is unencrypted (see OPEN_POINTS.md 1.3/1.4).",
                 "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/OPEN_POINTS.md",
                 "data-classification": "personal",
-                "erasure": "/forget deletes the chat's rows (not scrubbed until VACUUM); no time-based retention",
+                "erasure": "/forget deletes the chat's transcript and api_requests rows (not scrubbed until VACUUM); no time-based retention for transcripts",
                 "failure-mode": "propagate",
                 "enforced-in": "src/picnic_meal_planner/history.py::clear_history"
               }
@@ -582,6 +647,46 @@
         ],
         "tables": [
           "conversation_messages"
+        ],
+        "classification": "personal"
+      }
+    },
+    {
+      "unique-id": "api-request-log",
+      "node-type": "data-asset",
+      "name": "API request log",
+      "description": "Table api_requests: append-only log of Picnic and OpenRouter calls, including prompts, tool results and order data in the bodies. Sensitive.",
+      "controls": {
+        "api-log-consent": {
+          "description": "A chat that opted out of history gets rows without bodies or URL query strings. /forget, /privacy off, delete_turns and delete_day delete the chat's rows in the same transaction.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
+              "config": {
+                "control-id": "PLP-DP-04",
+                "name": "API log follows history consent",
+                "description": "A chat that opted out of history gets rows without bodies or URL query strings. /forget, /privacy off, delete_turns and delete_day delete the chat's rows in the same transaction.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#api-request-log",
+                "data-classification": "personal",
+                "erasure": "Rows carry chat_id and are deleted with the chat's turns; older rows pruned after API_LOG_RETENTION_DAYS by each import run",
+                "failure-mode": "fail-closed: no bodies when consent cannot be confirmed",
+                "enforced-in": "src/picnic_meal_planner/bot.py::_run_llm (request_context store_bodies), api_log.py::_may_store_bodies, history.py deletion paths",
+                "env": [
+                  "API_LOG_BODIES",
+                  "API_LOG_RETENTION_DAYS"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "metadata": {
+        "code": [
+          "src/picnic_meal_planner/db/models.py",
+          "src/picnic_meal_planner/api_log.py"
+        ],
+        "tables": [
+          "api_requests"
         ],
         "classification": "personal"
       }
@@ -607,14 +712,14 @@
       "description": "Table picnic_auth (one row): the Picnic session token every process starts from.",
       "controls": {
         "credential-handling": {
-          "description": "Never logged. Cleared only if it is still the stored one, so a fresh login from another process is never wiped. Stored in plain text in the SQLite file.",
+          "description": "Never logged in clear: api_log masks x-picnic-auth. Cleared only if it is still the stored one, so a fresh login from another process is never wiped. Stored in plain text in the SQLite file.",
           "requirements": [
             {
               "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
               "config": {
                 "control-id": "PLP-DP-03",
                 "name": "Picnic session token handling",
-                "description": "Never logged. Cleared only if it is still the stored one, so a fresh login from another process is never wiped. Stored in plain text in the SQLite file.",
+                "description": "Never logged in clear: api_log masks x-picnic-auth. Cleared only if it is still the stored one, so a fresh login from another process is never wiped. Stored in plain text in the SQLite file.",
                 "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#picnic-login-and-2fa",
                 "data-classification": "credential",
                 "erasure": "Cleared when Picnic rejects it, only if it is still the stored token",
@@ -640,14 +745,15 @@
       "unique-id": "import-history-job",
       "node-type": "service",
       "name": "History import script",
-      "description": "Re-runnable, rate-limit-safe import of past Picnic deliveries into orders/order_items, then a category backfill for products without one. Idle runs write nothing.",
+      "description": "Re-runnable, rate-limit-safe import of past Picnic deliveries into orders/order_items, then a category backfill for products without a category_id, then prunes the API log. Idle runs write no orders or checkpoints.",
       "metadata": {
         "code": [
           "scripts/import_history.py"
         ],
         "env": [
           "IMPORT_BATCH_SIZE",
-          "IMPORT_DELAY_SECONDS"
+          "IMPORT_DELAY_SECONDS",
+          "API_LOG_RETENTION_DAYS"
         ]
       }
     },
@@ -670,6 +776,17 @@
       "metadata": {
         "code": [
           "scripts/chat_model.py"
+        ]
+      }
+    },
+    {
+      "unique-id": "inspect-category-cli",
+      "node-type": "service",
+      "name": "Category inspection script",
+      "description": "Diagnostic: prints or saves the outline of a product's category pages to work out where Picnic keeps L1/L2 names. Read-only apart from refreshing the session token.",
+      "metadata": {
+        "code": [
+          "scripts/inspect_category.py"
         ]
       }
     },
@@ -709,6 +826,7 @@
             "picnic-login-cli",
             "chat-model-cli",
             "preflight-cli",
+            "inspect-category-cli",
             "github-actions",
             "vps-host"
           ]
@@ -837,6 +955,83 @@
       }
     },
     {
+      "unique-id": "bot-opens-log-context",
+      "description": "Each turn runs inside request_context with source bot, the chat id and store_bodies from history consent.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "telegram-bot"
+          },
+          "destination": {
+            "node": "api-log",
+            "interfaces": [
+              "api-log-api"
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "llm-logs-requests",
+      "description": "create_message wraps the OpenRouter call in capture_http_requests and records URL, headers, body, completion and token counts.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "llm-gateway"
+          },
+          "destination": {
+            "node": "api-log",
+            "interfaces": [
+              "api-log-api"
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "picnic-client-logs-requests",
+      "description": "install_picnic_capture wraps the library's requests.Session, and _call / login_step persist the captured requests.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "picnic-client"
+          },
+          "destination": {
+            "node": "api-log",
+            "interfaces": [
+              "api-log-api"
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "api-log-writes",
+      "description": "Inserts api_requests rows through get_log_db, the short-lock-timeout engine, and prunes expired rows.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "api-log"
+          },
+          "destination": {
+            "node": "db-access-layer"
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
       "unique-id": "llm-calls-openrouter",
       "description": "chat.completions.create with OpenAI-format messages and tools; X-Title / HTTP-Referer attribution headers.",
       "relationship-type": {
@@ -877,7 +1072,7 @@
     },
     {
       "unique-id": "history-persists",
-      "description": "load_recent_turns / append_turn / delete_* and the per-chat persist flag.",
+      "description": "load_recent_turns / append_turn / delete_* and the per-chat persist flag. Deletions also remove the chat's api_requests rows in the same transaction.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1047,7 +1242,7 @@
     },
     {
       "unique-id": "import-fetches-deliveries",
-      "description": "get_deliveries, get_delivery and get_product_category.",
+      "description": "get_deliveries, get_delivery, get_category_ids and get_l3_names.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1067,7 +1262,7 @@
     },
     {
       "unique-id": "import-writes-orders",
-      "description": "insert_order / insert_order_item / upsert_product / save_checkpoint / set_product_category.",
+      "description": "insert_order / insert_order_item / upsert_product / save_checkpoint / upsert_category / set_product_category.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1075,6 +1270,46 @@
           },
           "destination": {
             "node": "db-access-layer"
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "import-uses-log",
+      "description": "Wraps the whole run in request_context with source import_history, then calls prune_expired.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "import-history-job"
+          },
+          "destination": {
+            "node": "api-log",
+            "interfaces": [
+              "api-log-api"
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "inspect-category-uses-picnic-client",
+      "description": "Fetches the product page and L2 category page through _call and l3_names_on_page.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "inspect-category-cli"
+          },
+          "destination": {
+            "node": "picnic-client",
+            "interfaces": [
+              "picnic-functions"
+            ]
           }
         }
       },
@@ -1256,6 +1491,7 @@
           "nodes": [
             "telegram-bot",
             "llm-gateway",
+            "api-log",
             "conversation-history",
             "mcp-tool-server",
             "picnic-client",
@@ -1266,7 +1502,8 @@
             "import-history-job",
             "picnic-login-cli",
             "chat-model-cli",
-            "preflight-cli"
+            "preflight-cli",
+            "inspect-category-cli"
           ]
         }
       }
@@ -1280,6 +1517,7 @@
           "nodes": [
             "order-history",
             "conversation-transcripts",
+            "api-request-log",
             "chat-settings",
             "picnic-session-token"
           ]
@@ -1295,6 +1533,7 @@
           "nodes": [
             "telegram-bot",
             "llm-gateway",
+            "api-log",
             "conversation-history",
             "mcp-tool-server",
             "picnic-client",
@@ -1304,7 +1543,8 @@
             "import-history-job",
             "picnic-login-cli",
             "chat-model-cli",
-            "preflight-cli"
+            "preflight-cli",
+            "inspect-category-cli"
           ]
         }
       }
@@ -1339,73 +1579,93 @@
           "description": "The bot receives the update by long polling and checks the allowlist."
         },
         {
-          "relationship-unique-id": "bot-uses-history",
+          "relationship-unique-id": "bot-opens-log-context",
           "sequence-number": 3,
+          "description": "A request_context is opened for the turn: bodies are logged only if the chat consents to history."
+        },
+        {
+          "relationship-unique-id": "bot-uses-history",
+          "sequence-number": 4,
           "description": "history.get_context() returns the cached or DB-loaded window of whole turns."
         },
         {
           "relationship-unique-id": "history-persists",
-          "sequence-number": 4,
+          "sequence-number": 5,
           "description": "On a cold cache, load_recent_turns() reads the newest whole turns."
         },
         {
           "relationship-unique-id": "bot-calls-llm",
-          "sequence-number": 5,
+          "sequence-number": 6,
           "description": "The chat's model is resolved and create_message() is called with tools."
         },
         {
           "relationship-unique-id": "llm-reads-chat-settings",
-          "sequence-number": 6,
+          "sequence-number": 7,
           "description": "chat_settings.model is read (NULL means LLM_MODEL)."
         },
         {
           "relationship-unique-id": "llm-calls-openrouter",
-          "sequence-number": 7,
+          "sequence-number": 8,
           "description": "History is translated to OpenAI format and sent, and the reply is translated back."
         },
         {
+          "relationship-unique-id": "llm-logs-requests",
+          "sequence-number": 9,
+          "description": "The OpenRouter request and completion are logged with the key masked."
+        },
+        {
+          "relationship-unique-id": "api-log-writes",
+          "sequence-number": 10,
+          "description": "The row is written on the log engine and a lock costs the row, not the request."
+        },
+        {
           "relationship-unique-id": "bot-calls-tools",
-          "sequence-number": 8,
+          "sequence-number": 11,
           "description": "Each tool_use is executed with call_tool() and its result goes back as a tool_result."
         },
         {
           "relationship-unique-id": "tools-call-picnic",
-          "sequence-number": 9,
+          "sequence-number": 12,
           "description": "e.g. search_products / add_to_cart go to the Picnic client."
         },
         {
           "relationship-unique-id": "picnic-client-calls-picnic",
-          "sequence-number": 10,
+          "sequence-number": 13,
           "description": "The Picnic API is called with the stored session token."
         },
         {
+          "relationship-unique-id": "picnic-client-logs-requests",
+          "sequence-number": 14,
+          "description": "The captured Picnic HTTP calls are logged with x-picnic-auth masked."
+        },
+        {
           "relationship-unique-id": "tools-query-db",
-          "sequence-number": 11,
+          "sequence-number": 15,
           "description": "History tools and the product cache read and write the local DB."
         },
         {
           "relationship-unique-id": "tools-forecast",
-          "sequence-number": 12,
+          "sequence-number": 16,
           "description": "Forecast tools rank products by urgency."
         },
         {
           "relationship-unique-id": "bot-calls-llm",
-          "sequence-number": 13,
+          "sequence-number": 17,
           "description": "Loop: the conversation including tool results goes back to the model until it stops."
         },
         {
           "relationship-unique-id": "bot-uses-history",
-          "sequence-number": 14,
+          "sequence-number": 18,
           "description": "commit_turn() archives the turn if it ended cleanly."
         },
         {
           "relationship-unique-id": "history-persists",
-          "sequence-number": 15,
+          "sequence-number": 19,
           "description": "append_turn() writes all messages of the turn under one turn_id."
         },
         {
           "relationship-unique-id": "bot-polls-telegram",
-          "sequence-number": 16,
+          "sequence-number": 20,
           "description": "The reply is sent, split into 4096-character chunks."
         }
       ]
@@ -1421,29 +1681,44 @@
           "description": "The operator (or a schedule) runs the import script."
         },
         {
-          "relationship-unique-id": "import-fetches-deliveries",
+          "relationship-unique-id": "import-uses-log",
           "sequence-number": 2,
+          "description": "The run opens request_context with source import_history and one run_id."
+        },
+        {
+          "relationship-unique-id": "import-fetches-deliveries",
+          "sequence-number": 3,
           "description": "All delivery summaries are fetched, then each new delivery's detail."
         },
         {
           "relationship-unique-id": "picnic-client-calls-picnic",
-          "sequence-number": 3,
+          "sequence-number": 4,
           "description": "python-picnic-api2 calls Picnic, pausing IMPORT_DELAY_SECONDS between batches."
         },
         {
           "relationship-unique-id": "import-writes-orders",
-          "sequence-number": 4,
+          "sequence-number": 5,
           "description": "Orders, line items and products are inserted, and a checkpoint is logged per batch."
         },
         {
           "relationship-unique-id": "db-layer-uses-sqlite",
-          "sequence-number": 5,
+          "sequence-number": 6,
           "description": "Rows are committed to SQLite."
         },
         {
           "relationship-unique-id": "import-fetches-deliveries",
-          "sequence-number": 6,
-          "description": "Category backfill: get_product_category() for products without one."
+          "sequence-number": 7,
+          "description": "Category backfill: get_category_ids for products without a category_id, and get_l3_names once per unknown L3."
+        },
+        {
+          "relationship-unique-id": "import-writes-orders",
+          "sequence-number": 8,
+          "description": "upsert_category stores every L3 named on the page, and set_product_category links the product."
+        },
+        {
+          "relationship-unique-id": "import-uses-log",
+          "sequence-number": 9,
+          "description": "prune_expired deletes api_requests rows older than API_LOG_RETENTION_DAYS."
         }
       ]
     },
