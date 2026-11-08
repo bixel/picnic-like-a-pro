@@ -36,6 +36,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from . import api_log
 from .db.queries import get_chat_settings, get_db, upsert_chat_model
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,24 @@ def from_openai_completion(completion: Any) -> LLMResponse:
 # Request
 # ---------------------------------------------------------------------------
 
+def _request_details(client: AsyncOpenAI) -> tuple[str, dict[str, str]]:
+    """The full URL and request headers for a chat completion call.
+
+    The API key lives in ``Authorization``; ``api_log`` masks it when the row
+    is written, so the stored value is ``Bearer [REDACTED]``.
+    """
+    base_url = str(getattr(client, "base_url", OPENROUTER_BASE_URL)).rstrip("/")
+    url = f"{base_url}/chat/completions"
+    headers = {
+        str(name): value
+        for name, value in getattr(client, "default_headers", {}).items()
+        if isinstance(value, str)
+    }
+    headers.setdefault("Content-Type", "application/json")
+    headers.setdefault("Accept", "application/json")
+    return url, headers
+
+
 async def create_message(
     *,
     model: str,
@@ -319,5 +338,28 @@ async def create_message(
     }
     if tools:
         kwargs["tools"] = to_openai_tools(tools)
-    completion = await get_client().chat.completions.create(**kwargs)
-    return from_openai_completion(completion)
+
+    # Every OpenRouter call goes through here, so this is the single place
+    # the request log needs to hook in.  The full URL, headers, request and
+    # reply are kept so the call can be replayed (the table is sensitive).
+    client = get_client()
+    url, headers = _request_details(client)
+    async with api_log.capture_http_requests(
+        api_log.PROVIDER_OPENROUTER,
+        "chat.completions.create",
+        target=model,
+        http_method="POST",
+        url=url,
+        request_headers=headers,
+        request_body=kwargs,
+    ) as entry:
+        completion = await client.chat.completions.create(**kwargs)
+        # Recorded before parsing, so a completion we cannot use (e.g. no
+        # choices, which raises LLMError) is still logged in full.  The SDK
+        # raises on any non-2xx, so 200 stays even if parsing then fails.
+        usage = getattr(completion, "usage", None)
+        entry.http_status = 200
+        entry.response_body = completion
+        entry.input_tokens = getattr(usage, "prompt_tokens", None)
+        entry.output_tokens = getattr(usage, "completion_tokens", None)
+        return from_openai_completion(completion)

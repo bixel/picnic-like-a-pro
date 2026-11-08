@@ -32,7 +32,7 @@ from telegram.ext import (
 load_dotenv()
 
 # Imported after load_dotenv(): both modules read configuration at import time.
-from . import history, llm  # noqa: E402
+from . import api_log, history, llm  # noqa: E402
 from .db.engine import (  # noqa: E402
     SCHEMA_REVISION,
     init_db,
@@ -120,6 +120,20 @@ async def _call_mcp_tool(name: str, input_data: dict):
 
 async def _run_llm(chat_id: int, user_text: str) -> str:
     """Send a message to the chat's model, handle tool use, return the reply."""
+    # Every API request of this turn (OpenRouter and the Picnic tool calls) is
+    # logged under this chat, so deleting its history deletes them too, and
+    # with its bodies only if the chat consents to history being stored.
+    # is_persistence_enabled fails closed, and so does the log.
+    async with api_log.request_context(
+        "bot",
+        chat_id=chat_id,
+        store_bodies=await history.is_persistence_enabled(chat_id),
+    ):
+        return await _run_turn(chat_id, user_text)
+
+
+async def _run_turn(chat_id: int, user_text: str) -> str:
+    """One turn: the model loop with tool calls, then commit to history."""
     tools = await _get_mcp_tools()
     # Resolved once per turn, so a model switch never lands mid-tool-loop.
     model = await llm.get_chat_model(chat_id)

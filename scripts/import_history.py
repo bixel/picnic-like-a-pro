@@ -11,7 +11,8 @@ Picnic returns the whole delivery list with the newest first, so a new delivery
 arrives *above* everything already imported — which is why the checkpoint's
 ``last_delivery_id`` (the newest delivery a run imported) is a progress log
 only and never a resume position.  A checkpoint row is written only by runs
-that import something; an idle run writes nothing.
+that import something; an idle run writes no checkpoint (it still logs its
+API requests, and fills in categories, as described below).
 
 Cancelled deliveries are left out of the work list.  A delivery that cannot be
 imported yet (still CURRENT, or its detail could not be fetched or was
@@ -21,6 +22,13 @@ again, and the run's checkpoint is not marked finished.
 Every run then looks up the category of each stored product that has none
 yet (delivery data carries no categories), including runs that find no new
 deliveries.  A product Picnic no longer lists is retried on the next run.
+
+Every Picnic HTTP request is recorded in the ``api_requests`` table by
+``picnic/client.py`` (best-effort; method, full URL, headers and the full
+request/response bodies).  The run opens a logging context, so all of its rows
+share one ``source`` and ``run_id`` and can be inspected as a single batch.
+At the end, rows older than ``API_LOG_RETENTION_DAYS`` (default 30, ``0`` =
+keep everything) are pruned.
 
 Usage:
     uv run python scripts/import_history.py
@@ -44,6 +52,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from picnic_meal_planner import api_log
 from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.db.engine import SCHEMA_REVISION, init_db, pending_migration
 from picnic_meal_planner.picnic import client as picnic
@@ -63,8 +72,15 @@ async def main() -> None:
             "Run `uv run alembic upgrade head` first."
         )
     await init_db()
-    await import_deliveries()
-    await backfill_categories()
+    # Group every request this run makes under one source/run_id in
+    # `api_requests`, so an import can be inspected as a single batch.
+    async with api_log.request_context("import_history"):
+        await import_deliveries()
+        await backfill_categories()
+    # The scheduled import is the log's retention owner (API_LOG_RETENTION_DAYS).
+    removed = await api_log.prune_expired()
+    if removed:
+        print(f"Pruned {removed} API request log row(s).")
 
 
 async def backfill_categories() -> None:
