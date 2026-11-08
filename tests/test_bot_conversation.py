@@ -735,3 +735,43 @@ class TestPostInit:
 
         async with get_db() as session:
             assert await session.get(Product, "p_survivor") is not None
+
+
+# ---------------------------------------------------------------------------
+# Typing indicator keep-alive
+# ---------------------------------------------------------------------------
+
+class TestKeepTyping:
+    async def test_typing_is_refreshed_while_work_runs(self, monkeypatch):
+        monkeypatch.setattr(bot, "TYPING_REFRESH_SECONDS", 0.01)
+        context = _make_context()
+        async with bot._keep_typing(context.bot, 100):
+            await asyncio.sleep(0.055)
+        assert context.bot.send_chat_action.await_count >= 3
+
+    async def test_typing_stops_when_work_ends(self, monkeypatch):
+        monkeypatch.setattr(bot, "TYPING_REFRESH_SECONDS", 0.01)
+        context = _make_context()
+        async with bot._keep_typing(context.bot, 100):
+            await asyncio.sleep(0.025)
+        count = context.bot.send_chat_action.await_count
+        await asyncio.sleep(0.05)
+        assert context.bot.send_chat_action.await_count == count
+
+    async def test_typing_stops_when_work_fails(self, monkeypatch):
+        monkeypatch.setattr(bot, "TYPING_REFRESH_SECONDS", 0.01)
+        context = _make_context()
+        with pytest.raises(RuntimeError):
+            async with bot._keep_typing(context.bot, 100):
+                raise RuntimeError("boom")
+        count = context.bot.send_chat_action.await_count
+        await asyncio.sleep(0.05)
+        assert context.bot.send_chat_action.await_count == count
+
+    async def test_failed_typing_action_does_not_break_the_reply(self, fake_llm, monkeypatch):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        fake_llm([_reply([_TextBlock("ok")])])
+        update, context = _make_update(), _make_context()
+        context.bot.send_chat_action.side_effect = RuntimeError("telegram down")
+        await bot._chat(update, context)
+        update.message.reply_text.assert_awaited_once_with("ok")
