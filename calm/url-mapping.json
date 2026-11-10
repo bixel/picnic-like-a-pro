@@ -1,0 +1,7 @@
+{
+  "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/access-control.requirement.json": "controls/access-control.requirement.json",
+  "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json": "controls/data-protection.requirement.json",
+  "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/integrity.requirement.json": "controls/integrity.requirement.json",
+  "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/network-exposure.requirement.json": "controls/network-exposure.requirement.json",
+  "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/human-in-the-loop.requirement.json": "controls/human-in-the-loop.requirement.json"
+}

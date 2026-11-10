@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/access-control.requirement.json",
+  "title": "Access control control requirement",
+  "description": "Who may invoke an operation, and the default when nothing is configured.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://calm.finos.org/release/1.2/meta/control-requirement.json"
+    }
+  ],
+  "properties": {
+    "control-id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "documented-in": {
+      "type": "string",
+      "description": "Where the rule is written down"
+    },
+    "enforced-in": {
+      "type": "string",
+      "description": "Code location that enforces the control"
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment variables that configure it"
+    },
+    "allowed-principals": {
+      "type": "string"
+    },
+    "default": {
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    }
+  },
+  "required": [
+    "control-id",
+    "name",
+    "description",
+    "documented-in",
+    "enforced-in",
+    "allowed-principals",
+    "default"
+  ]
+}
