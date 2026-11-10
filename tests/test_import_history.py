@@ -10,10 +10,11 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import requests
 from sqlalchemy import func, select
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.models import ImportCheckpoint, Order, OrderItem
+from picnic_meal_planner.db.models import Category, ImportCheckpoint, Order, OrderItem
 from picnic_meal_planner.picnic import client as picnic
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "import_history.py"
@@ -37,7 +38,11 @@ def fake_picnic(monkeypatch):
     # categories: product id -> L3 name (ids 1/2/3), (l1, l2, l3) ids, or an
     # exception.  pages: (l2, l3) -> {l3: name} on that L2 page, or an
     # exception; unset pages name the L3 given as a string in categories.
-    state = {"summaries": [], "details": {}, "categories": {}, "pages": {}, "l2_requests": []}
+    # l1_pages: l1 id -> (l1 name, {l2: name}) or an exception.
+    state = {
+        "summaries": [], "details": {}, "categories": {}, "pages": {}, "l2_requests": [],
+        "l1_pages": {}, "l1_requests": [],
+    }
 
     async def get_deliveries():
         return list(state["summaries"])
@@ -64,6 +69,14 @@ def fake_picnic(monkeypatch):
             raise page
         return dict(page)
 
+    async def get_l1_names(l1_id):
+        state["l1_requests"].append(l1_id)
+        page = state["l1_pages"].get(l1_id, (None, {}))
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    monkeypatch.setattr(picnic, "get_l1_names", get_l1_names)
     monkeypatch.setattr(picnic, "get_deliveries", get_deliveries)
     monkeypatch.setattr(picnic, "get_category_ids", get_category_ids)
     monkeypatch.setattr(picnic, "get_l3_names", get_l3_names)
@@ -266,6 +279,75 @@ async def test_login_error_stops_the_backfill(fake_picnic, capsys):
     await import_history.main()
     assert await _category("p_milk") is None
     assert "Stopped: log in" in capsys.readouterr().err
+
+
+def _blocked() -> requests.exceptions.JSONDecodeError:
+    return requests.exceptions.JSONDecodeError("Expecting value", "<html>403</html>", 0)
+
+
+async def test_a_block_stops_the_backfill(fake_picnic, capsys):
+    await _seed_products("p_a", "p_b", "p_c")
+    asked = []
+    real = picnic.get_category_ids
+
+    async def get_category_ids(product_id):
+        asked.append(product_id)
+        return await real(product_id)
+
+    picnic.get_category_ids = get_category_ids
+    try:
+        fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": _blocked(), "p_c": (1, 20, 30)}
+        fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+        await import_history.backfill_categories()
+    finally:
+        picnic.get_category_ids = real
+
+    assert asked == ["p_a", "p_b"]
+    assert await _category("p_a") == "Pils"     # what came before the block is kept
+    assert "Stopped: Picnic did not answer with JSON" in capsys.readouterr().err
+
+
+async def test_siblings_get_the_l1_of_the_product_that_found_them(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils", 31: "Alkoholfrei"}}
+    await import_history.backfill_categories()
+    async with db.get_db() as conn:
+        assert (await conn.get(Category, 31)).l1_id == 1
+
+
+async def test_parent_names_are_filled_in_once(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    fake_picnic["l1_pages"] = {1: ("Getraenke", {20: "Bier", 21: "Wein"})}
+    await import_history.backfill_categories()
+    await import_history.backfill_parent_names()
+
+    async with db.get_db() as conn:
+        [listed] = await db.get_categories(conn)
+    assert (listed["l1_name"], listed["l2_name"]) == ("Getraenke", "Bier")
+
+    await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1]
+
+
+async def test_a_parent_lookup_failure_is_retried_and_a_block_stops(fake_picnic, capsys):
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": (2, 21, 31)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}, (21, 31): {31: "Rot"}}
+    await import_history.backfill_categories()
+
+    fake_picnic["l1_pages"] = {1: ConnectionError("boom"), 2: ("Wein", {21: "Rotwein"})}
+    await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1, 2]
+    async with db.get_db() as conn:
+        assert await db.l1_ids_missing_names(conn) == [1]
+
+    fake_picnic["l1_requests"].clear()
+    fake_picnic["l1_pages"][1] = _blocked()
+    await import_history.backfill_parent_names()
+    assert "Stopped: Picnic did not answer" in capsys.readouterr().err
 
 
 async def test_all_picnic_requests_of_a_run_share_one_log_batch(monkeypatch):

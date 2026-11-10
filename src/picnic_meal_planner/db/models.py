@@ -35,6 +35,19 @@ class Category(Base):
     products: Mapped[list[Product]] = relationship(back_populates="category_ref")
 
 
+class CategoryParent(Base):
+    """The name of an L1 or L2 category; ``categories`` refers to them by id.
+
+    Keyed by level as well, so L1 and L2 ids need not be disjoint.
+    """
+
+    __tablename__ = "category_parents"
+
+    level: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # 1 or 2
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class Product(Base):
     __tablename__ = "products"
 

@@ -1,11 +1,10 @@
-"""Show how Picnic describes a product's category, to find the L1/L2 names.
+"""Show how Picnic describes a product's category pages.
 
 A product page's category button links to
 ``app.picnic://categories/{l1}/l2/{l2}/l3/{l3}``.  The L3 name is read from
-the L2 category page (``vertical-article-tiles-sub-header-{l3}``); where that
-page keeps the L2 name, and whether an L1 page exists, is not known yet.  This
-script prints the outline of those pages so the parser can be written against
-a real payload.
+the L2 category page (``vertical-article-tiles-sub-header-{l3}``), the L1 and
+L2 names from the L1 page.  This script prints the outline of those pages, to
+check a parser against a real payload.
 
 Read-only as far as the catalogue goes: it sends GET requests for public
 catalogue pages, and the only database write is a refreshed Picnic session
@@ -35,12 +34,10 @@ from python_picnic_api2.models import Article, pml
 
 from picnic_meal_planner.picnic import client as picnic
 
-# The L1 path is a guess, modelled on the L2 one; a 404 or error page is an
-# answer too.
 PAGES = {
     "product": "/pages/product-details-page-root?id={product_id}&show_category_action=true",
     "l2": picnic.L2_PAGE_PATH,
-    "l1": "/pages/L1-category-page-root?category_id={l1}",
+    "l1": picnic.L1_PAGE_PATH,
 }
 
 
@@ -91,7 +88,7 @@ async def main() -> None:
         pages["l2"] = await fetch(PAGES["l2"].format(l2_id=l2, l3_id=l3))
         for l3_id, name in picnic.l3_names_on_page(pages["l2"]).items():
             print(f"  {l3_id}: {name}")
-        pages["l1"] = await fetch(PAGES["l1"].format(l1=l1))
+        pages["l1"] = await fetch(PAGES["l1"].format(l1_id=l1))
 
     for kind, page in pages.items():
         if kind == "product":

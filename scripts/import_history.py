@@ -27,6 +27,13 @@ name not stored yet.  Every L3 named on a fetched page is stored, so sibling
 categories cost nothing later.  A product Picnic no longer lists, or whose
 name is not on its page, is retried on the next run.
 
+The names of the L1 and L2 categories above them come last: one L1 page names
+the L1 and every L2 below it, so this is one request per L1 with a name still
+missing.
+
+A category lookup that gets a non-JSON answer (Picnic blocking requests with an
+HTML 403) stops the run's category work instead of trying every product.
+
 Every Picnic HTTP request is recorded in the ``api_requests`` table by
 ``picnic/client.py`` (best-effort; method, full URL, headers and the full
 request/response bodies).  The run opens a logging context, so all of its rows
@@ -49,6 +56,8 @@ import asyncio
 import os
 import sys
 
+import requests
+
 # Ensure the src package is importable when run as a script
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -66,6 +75,20 @@ from picnic_meal_planner.picnic import client as picnic
 SKIP_STATUSES = {"CANCELLED"}
 DEFER_STATUSES = {"CURRENT"}
 
+# Every further request would fail the same way.  A block is an HTML 403, which
+# the library fails to parse as JSON.
+_STOP_ERRORS = (
+    picnic.PicnicLoginRequired,
+    picnic.PicnicLoginPending,
+    requests.exceptions.JSONDecodeError,
+)
+
+
+def _stop_reason(exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.JSONDecodeError):
+        return "Picnic did not answer with JSON (blocked or rate limited?); try again later."
+    return str(exc)
+
 
 async def main() -> None:
     stored = await pending_migration()
@@ -81,6 +104,7 @@ async def main() -> None:
     async with api_log.request_context("import_history"):
         await import_deliveries()
         await backfill_categories()
+        await backfill_parent_names()
     # The scheduled import is the log's retention owner (API_LOG_RETENTION_DAYS).
     removed = await api_log.prune_expired()
     if removed:
@@ -105,10 +129,10 @@ async def backfill_categories() -> None:
     # not known yet whether a page lists every L3 whichever one is asked for.
     fetched: set[tuple[int, int]] = set()
     found = 0
-    login_error = None
+    stop_error = None
     for i in range(0, len(product_ids), batch_size):
         categories: dict[str, dict] = {}
-        siblings: dict[int, tuple[int, str]] = {}  # l3_id -> (l2_id, name)
+        siblings: dict[int, tuple[int | None, int, str]] = {}  # l3_id -> (l1_id, l2_id, name)
         for product_id in product_ids[i : i + batch_size]:
             try:
                 ids = await picnic.get_category_ids(product_id)
@@ -119,9 +143,9 @@ async def backfill_categories() -> None:
                     fetched.add((l2_id, l3_id))
                     on_page = await picnic.get_l3_names(l2_id, l3_id)
                     names.update(on_page)
-                    siblings.update({l3: (l2_id, name) for l3, name in on_page.items()})
-            except (picnic.PicnicLoginRequired, picnic.PicnicLoginPending) as exc:
-                login_error = exc
+                    siblings.update({l3: (l1_id, l2_id, name) for l3, name in on_page.items()})
+            except _STOP_ERRORS as exc:
+                stop_error = exc
                 break
             except Exception as exc:  # noqa: BLE001 — retried by the next run
                 print(f"  Warning: could not look up category of {product_id}: {exc}")
@@ -132,13 +156,13 @@ async def backfill_categories() -> None:
                 }
 
         async with db.get_db() as conn:
-            for l3_id, (l2_id, name) in siblings.items():
-                await db.upsert_category(conn, l3_id, l2_id, name)
+            for l3_id, (l1_id, l2_id, name) in siblings.items():
+                await db.upsert_category(conn, l3_id, l2_id, name, l1_id)
             for product_id, category in categories.items():
                 found += await db.set_product_category(conn, product_id, category)
             await conn.commit()
-        if login_error:
-            print(f"  Stopped: {login_error}", file=sys.stderr)
+        if stop_error:
+            print(f"  Stopped: {_stop_reason(stop_error)}", file=sys.stderr)
             break
         print(f"  {min(i + batch_size, len(product_ids))}/{len(product_ids)} checked", flush=True)
 
@@ -148,6 +172,36 @@ async def backfill_categories() -> None:
     print(f"Categories found for {found} of {len(product_ids)} product(s).")
     if found < len(product_ids):
         print("The rest will be retried on the next run.")
+
+
+async def backfill_parent_names() -> None:
+    """Fill in the names of the L1 and L2 categories above the stored L3s."""
+    batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
+    delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
+
+    async with db.get_db() as conn:
+        l1_ids = await db.l1_ids_missing_names(conn)
+    if not l1_ids:
+        return
+    print(f"\nLooking up names for {len(l1_ids)} L1 categor(y/ies)...")
+
+    for done, l1_id in enumerate(l1_ids, start=1):
+        try:
+            l1_name, l2_names = await picnic.get_l1_names(l1_id)
+        except _STOP_ERRORS as exc:
+            print(f"  Stopped: {_stop_reason(exc)}", file=sys.stderr)
+            return
+        except Exception as exc:  # noqa: BLE001 — retried by the next run
+            print(f"  Warning: could not look up L1 category {l1_id}: {exc}")
+            continue
+        async with db.get_db() as conn:
+            if l1_name:
+                await db.upsert_category_parent(conn, 1, l1_id, l1_name)
+            for l2_id, name in l2_names.items():
+                await db.upsert_category_parent(conn, 2, l2_id, name)
+            await conn.commit()
+        if done % batch_size == 0 and done < len(l1_ids):
+            await asyncio.sleep(delay_seconds)
 
 
 async def import_deliveries() -> None:

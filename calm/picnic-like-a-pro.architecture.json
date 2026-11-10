@@ -493,6 +493,7 @@
             "get_delivery",
             "get_category_ids",
             "get_l3_names",
+            "get_l1_names",
             "start_login",
             "submit_login_code"
           ]
@@ -602,7 +603,7 @@
       "unique-id": "order-history",
       "node-type": "data-asset",
       "name": "Order history and product catalogue",
-      "description": "Tables products, categories, orders, order_items and import_checkpoints: every imported or recorded delivery with prices, and Picnic's L3 categories, which hold the only copy of each category name.",
+      "description": "Tables products, categories, category_parents, orders, order_items and import_checkpoints: every imported or recorded delivery with prices, and Picnic's categories, which hold the only copy of each category name.",
       "metadata": {
         "code": [
           "src/picnic_meal_planner/db/models.py"
@@ -610,6 +611,7 @@
         "tables": [
           "products",
           "categories",
+          "category_parents",
           "orders",
           "order_items",
           "import_checkpoints"
@@ -783,7 +785,7 @@
       "unique-id": "inspect-category-cli",
       "node-type": "service",
       "name": "Category inspection script",
-      "description": "Diagnostic: prints or saves the outline of a product's category pages to work out where Picnic keeps L1/L2 names. Read-only apart from refreshing the session token.",
+      "description": "Diagnostic: prints or saves the outline of a product's category pages, to check a parser against a real payload. Read-only apart from refreshing the session token.",
       "metadata": {
         "code": [
           "scripts/inspect_category.py"
@@ -1242,7 +1244,7 @@
     },
     {
       "unique-id": "import-fetches-deliveries",
-      "description": "get_deliveries, get_delivery, get_category_ids and get_l3_names.",
+      "description": "get_deliveries, get_delivery, get_category_ids, get_l3_names and get_l1_names.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1299,7 +1301,7 @@
     },
     {
       "unique-id": "inspect-category-uses-picnic-client",
-      "description": "Fetches the product page and L2 category page through _call and l3_names_on_page.",
+      "description": "Fetches the product, L2 and L1 category pages through _call and l3_names_on_page.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1708,12 +1710,12 @@
         {
           "relationship-unique-id": "import-fetches-deliveries",
           "sequence-number": 7,
-          "description": "Category backfill: get_category_ids for products without a category_id, and get_l3_names once per unknown L3."
+          "description": "Category backfill: get_category_ids for products without a category_id, get_l3_names once per unknown L3, and get_l1_names per L1 with a name still missing."
         },
         {
           "relationship-unique-id": "import-writes-orders",
           "sequence-number": 8,
-          "description": "upsert_category stores every L3 named on the page, and set_product_category links the product."
+          "description": "upsert_category stores every L3 named on the page, set_product_category links the product, and upsert_category_parent stores the L1 and L2 names."
         },
         {
           "relationship-unique-id": "import-uses-log",

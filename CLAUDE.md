@@ -39,13 +39,14 @@ that the caller can batch multiple writes into one transaction.
 
 ### Models: `db/models.py`
 
-Eight ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
+Nine ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
 columns:
 
 | Model | Table | Notes |
 |---|---|---|
 | `Product` | `products` | Picnic product catalogue cache; `category_id` → `categories` |
 | `Category` | `categories` | Picnic leaf (L3) categories: id = L3 id, plus `l2_id`, `l1_id`, `name` |
+| `CategoryParent` | `category_parents` | Names of Picnic's L1 and L2 categories, keyed by `(level, id)` |
 | `Order` | `orders` | Delivery records |
 | `OrderItem` | `order_items` | Line items, FK → orders (CASCADE) + products |
 | `ImportCheckpoint` | `import_checkpoints` | Import progress log, written only by runs that import something (what to import is read from `orders`) |
@@ -80,6 +81,7 @@ Alembic manages all schema changes.
 | `alembic/versions/0006_*.py` | HTTP method, URL and headers on `api_requests` — purely additive |
 | `alembic/versions/0007_*.py` | `api_requests.chat_id` for consent-aware deletion — purely additive |
 | `alembic/versions/0008_*.py` | Category ids (`categories`, `products.category_id`); **drops** `products.category` — names are looked up again, downgrade restores them from `categories` |
+| `alembic/versions/0009_*.py` | L1/L2 names (`category_parents`); fills NULL `categories.l1_id` from siblings — additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -297,7 +299,7 @@ both category endpoints (`get_categories`, `get_article_category`), so
 `scripts/import_history.py` looks categories up afterwards, on every run, for
 products whose `category_id` is still NULL.
 
-- **`categories.name` is the only copy of a name.**  `products` holds just
+- **`categories.name` is the only copy of an L3 name.**  `products` holds just
   `category_id`; queries join to get the name, so renaming a category renames
   it for every product at once.  A product with no `category_id` has no
   category and is not listed by `get_categories`.
@@ -308,6 +310,16 @@ products whose `category_id` is still NULL.
   (`client.get_l3_names()`, one request, every L3 on the page).  The client
   fetches that page itself (`client.L2_PAGE_PATH`) because the library's
   `get_category_by_ids` raises and drops the page when the L3 is missing.
+- **L1 and L2 names live in `category_parents`** and come from the L1 page
+  (`client.L1_PAGE_PATH`, `client.get_l1_names()`, not in the library): its
+  `header.title` is the L1 name, and items
+  `core-list-item-category-{l2}` are labelled with the L2 names (curated
+  `CustomCat...` items are skipped).  One request per L1; `backfill_parent_names`
+  only asks for an L1 with a name still missing.  An L2 its L1 page does not
+  list stays unnamed and costs that L1 one request per run.
+- **A block stops the lookups.**  Picnic blocks with an HTML 403, which the
+  library fails on as `requests.exceptions.JSONDecodeError`; the backfills stop
+  rather than try every remaining product.
 - **The backfill owns the cache.**  It starts from the stored names, fetches
   an L2 page only for an unknown L3, at most once per `(l2, l3)` per run, and
   stores every L3 named on it, so sibling categories cost nothing later.
@@ -317,13 +329,12 @@ products whose `category_id` is still NULL.
   `l2_id`, it logs a warning and keeps the stored row, and
   `set_product_category` leaves the product without a category rather than
   file it under another parent.
-- **Not done yet:** names are never refreshed once stored, and L2/L1 *names*
-  are not known — `scripts/inspect_category.py <product_id> --save DIR`
-  dumps the pages to find out (and whether an L2 page lists every L3 whatever
-  `l3_category_id` is sent).
+- **Not done yet:** names are never refreshed once stored.
+  `scripts/inspect_category.py <product_id> --save DIR` dumps the pages, e.g.
+  to check whether an L2 page lists every L3 whatever `l3_category_id` is sent.
 - The `get_categories` MCP tool lists the local categories with their ids
-  and, given a name or `category_id`, the products in one; there is no live
-  category listing any more.
+  and parents' names and, given a name or `category_id`, the products in one;
+  there is no live category listing any more.
 
 ---
 

@@ -275,6 +275,8 @@ _L3_HEADER_PREFIX = "vertical-article-tiles-sub-header-"
 # method raises when the requested L3 is missing from the page and throws the
 # page away, so the page is fetched here directly and every L3 on it is kept.
 L2_PAGE_PATH = "/pages/L2-category-page-root?category_id={l2_id}&l3_category_id={l3_id}"
+L1_PAGE_PATH = "/pages/L1-category-page-root?category_id={l1_id}"
+_L2_ITEM_PREFIX = "core-list-item-category-"
 
 
 def l3_names_on_page(page) -> dict[int, str]:
@@ -294,6 +296,28 @@ def l3_names_on_page(page) -> dict[int, str]:
         if suffix.isdigit() and label:
             names[int(suffix)] = label
     return names
+
+
+def l1_names_on_page(page) -> tuple[str | None, dict[int, str]]:
+    """``(l1_name, {l2_id: name})`` from an L1 category page.
+
+    The page's title is the L1 name, and it lists its L2 categories as items
+    with the id ``core-list-item-category-{l2_id}``, labelled with the name.
+    Picnic's curated entries (``...-CustomCat...``) are not real L2s: skipped.
+    """
+    if not isinstance(page, dict):
+        return None, {}
+    from python_picnic_api2.models import pml  # noqa: PLC0415
+
+    header = page.get("header")
+    title = header.get("title") if isinstance(header, dict) else None
+    names: dict[int, str] = {}
+    for node in pml.find_all(page, id_prefix=_L2_ITEM_PREFIX):
+        suffix = node["id"][len(_L2_ITEM_PREFIX):]
+        label = pml.accessibility_label(node)
+        if suffix.isdigit() and label:
+            names[int(suffix)] = label
+    return title or None, names
 
 
 async def get_category_ids(product_id: str) -> tuple[int | None, int, int] | None:
@@ -320,6 +344,12 @@ async def get_l3_names(l2_id: int, l3_id: int) -> dict[int, str]:
     """
     page = await _call("_get", L2_PAGE_PATH.format(l2_id=l2_id, l3_id=l3_id), add_picnic_headers=True)
     return l3_names_on_page(page)
+
+
+async def get_l1_names(l1_id: int) -> tuple[str | None, dict[int, str]]:
+    """``(l1_name, {l2_id: name})`` for an L1 category, in one request."""
+    page = await _call("_get", L1_PAGE_PATH.format(l1_id=l1_id), add_picnic_headers=True)
+    return l1_names_on_page(page)
 
 
 # ---------------------------------------------------------------------------

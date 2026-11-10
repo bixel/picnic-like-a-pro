@@ -134,6 +134,27 @@ class TestGetL3Names:
         assert await picnic.get_l3_names(20, 30) == {30: "Alkoholfrei", 31: "Pils"}
         assert paths == ["/pages/L2-category-page-root?category_id=20&l3_category_id=30"]
 
+    async def test_an_l1_page_names_the_l1_and_its_l2s(self, monkeypatch):
+        l1_page = {"header": {"type": "STATIC", "title": "Cerealien"}, "children": [
+            {"id": f"core-list-item-category-{l2}",
+             "pml": {"component": {"accessibilityLabel": name}}}
+            for l2, name in ((20, "Honig"), ("CustomCatLvl2Pos2", "Für dich"))
+        ]}
+        paths = []
+
+        class Api:
+            def _get(self, path, add_picnic_headers=False):
+                paths.append(path)
+                return l1_page
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_l1_names(10) == ("Cerealien", {20: "Honig"})
+        assert paths == ["/pages/L1-category-page-root?category_id=10"]
+
+    def test_an_unusable_l1_page_has_no_names(self):
+        assert picnic.l1_names_on_page({"error": "nope"}) == (None, {})
+        assert picnic.l1_names_on_page([]) == (None, {})
+
     async def test_a_page_without_the_l3_still_names_the_others(self, monkeypatch):
         class Api:
             def _get(self, path, add_picnic_headers=False):

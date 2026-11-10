@@ -22,14 +22,16 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from .engine import get_session_factory
 from .models import (
     ApiRequest,
     Category,
+    CategoryParent,
     ChatSettings,
     ConversationMessage,
     ImportCheckpoint,
@@ -131,15 +133,25 @@ async def get_categories(session: AsyncSession) -> list[dict]:
     """The categories of the stored products, each with its product count.
 
     Grouped by category id, so two categories with the same name (under
-    different L2 parents) stay apart.
+    different L2 parents) stay apart.  ``l1_name`` and ``l2_name`` are ``None``
+    until the names have been looked up.
     """
+    l1 = aliased(CategoryParent)
+    l2 = aliased(CategoryParent)
     stmt = (
         select(
             Category.name,
             Category.id.label("category_id"),
             func.count(Product.id).label("product_count"),
+            Category.l1_id,
+            l1.name.label("l1_name"),
+            Category.l2_id,
+            l2.name.label("l2_name"),
         )
+        .select_from(Category)
         .join(Product, Product.category_id == Category.id)
+        .outerjoin(l1, and_(l1.level == 1, l1.id == Category.l1_id))
+        .outerjoin(l2, and_(l2.level == 2, l2.id == Category.l2_id))
         .group_by(Category.id)
         .order_by(Category.name, Category.id)
     )
@@ -195,6 +207,29 @@ async def upsert_category(
     if l1_id is not None:
         stored.l1_id = l1_id
     return True
+
+
+async def l1_ids_missing_names(session: AsyncSession) -> list[int]:
+    """L1 ids whose own name, or the name of an L2 stored below them, is unknown."""
+    l1 = aliased(CategoryParent)
+    l2 = aliased(CategoryParent)
+    rows = await session.scalars(
+        select(Category.l1_id)
+        .distinct()
+        .outerjoin(l1, and_(l1.level == 1, l1.id == Category.l1_id))
+        .outerjoin(l2, and_(l2.level == 2, l2.id == Category.l2_id))
+        .where(Category.l1_id.is_not(None), or_(l1.name.is_(None), l2.name.is_(None)))
+        .order_by(Category.l1_id)
+    )
+    return list(rows)
+
+
+async def upsert_category_parent(session: AsyncSession, level: int, parent_id: int, name: str) -> None:
+    """Store the name of the L1 or L2 category *parent_id*."""
+    stmt = sqlite_insert(CategoryParent).values(level=level, id=parent_id, name=name)
+    await session.execute(
+        stmt.on_conflict_do_update(index_elements=["level", "id"], set_={"name": stmt.excluded.name})
+    )
 
 
 async def set_product_category(session: AsyncSession, product_id: str, category: dict) -> bool:

@@ -118,7 +118,8 @@ class TestProductCategories:
             db_session, "p_b", {"l1_id": None, "l2_id": 2, "l3_id": 3, "name": "Milch"}
         )
         assert await db.get_categories(db_session) == [
-            {"name": "Milch", "category_id": 3, "product_count": 2},
+            {"name": "Milch", "category_id": 3, "product_count": 2,
+             "l1_id": 1, "l1_name": None, "l2_id": 2, "l2_name": None},
         ]
         assert (await db.get_product(db_session, "p_a"))["category"] == "Milch"
         assert {p["id"] for p in await db.get_products_in_category(db_session, "Milch")} == {
@@ -142,6 +143,28 @@ class TestProductCategories:
         assert (stored.l2_id, stored.name) == (2, "Milk")
         assert (await db.get_product(db_session, "p_b"))["category_id"] is None
         assert await db.products_without_category(db_session) == ["p_b"]
+
+    async def test_lists_the_names_of_the_parents(self, db_session):
+        await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_a"})
+        await db.set_product_category(
+            db_session, "p_a", {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": "Honig"}
+        )
+        assert await db.l1_ids_missing_names(db_session) == [1]
+
+        await db.upsert_category_parent(db_session, 1, 1, "Fruehstueck")
+        assert await db.l1_ids_missing_names(db_session) == [1]   # the L2 is unnamed
+
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstrich")
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstriche")
+        assert await db.l1_ids_missing_names(db_session) == []
+        [listed] = await db.get_categories(db_session)
+        assert (listed["l1_name"], listed["l2_name"], listed["name"]) == (
+            "Fruehstueck", "Aufstriche", "Honig",
+        )
+
+    async def test_an_unknown_l1_is_not_looked_up(self, db_session):
+        await db.upsert_category(db_session, 3, 2, "Honig")
+        assert await db.l1_ids_missing_names(db_session) == []
 
     async def test_products_without_a_category_are_not_listed(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)

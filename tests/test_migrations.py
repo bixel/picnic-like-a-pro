@@ -118,6 +118,7 @@ class TestMigrationRuns:
             "picnic_auth",
             "api_requests",
             "categories",
+            "category_parents",
         }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):
@@ -321,6 +322,45 @@ class TestCategoryMigration:
         assert rows == [{"id": "p_a", "category": "Milch"}, {"id": "p_b", "category": None}]
         tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "categories" not in tables
+
+
+# ---------------------------------------------------------------------------
+# 0009: names of the L1 and L2 categories
+# ---------------------------------------------------------------------------
+
+class TestCategoryParentsMigration:
+    def _sql(self, db_file: Path, *statements: str) -> list[dict]:
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            with engine.begin() as conn:
+                rows = []
+                for sql in statements:
+                    result = conn.exec_driver_sql(sql)
+                    if result.returns_rows:
+                        rows = [dict(r._mapping) for r in result]
+                return rows
+        finally:
+            engine.dispose()
+
+    def test_fills_l1_ids_from_siblings_and_rolls_back(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0008")
+        self._sql(
+            db_file,
+            "INSERT INTO categories (id, l2_id, l1_id, name) VALUES "
+            "(30, 20, 1, 'Pils'), (31, 20, NULL, 'Alkoholfrei'), (40, 21, NULL, 'Honig')",
+        )
+
+        command.upgrade(_alembic_config(), "0009")
+        rows = self._sql(db_file, "SELECT id, l1_id FROM categories ORDER BY id")
+        # 40 has no sibling that knows its L1, so it stays unknown.
+        assert rows == [{"id": 30, "l1_id": 1}, {"id": 31, "l1_id": 1}, {"id": 40, "l1_id": None}]
+
+        command.downgrade(_alembic_config(), "0008")
+        tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "category_parents" not in tables
+        assert self._sql(db_file, "SELECT l1_id FROM categories WHERE id = 31") == [{"l1_id": 1}]
 
 
 def test_schema_revision_is_the_alembic_head():
