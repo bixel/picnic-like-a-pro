@@ -265,9 +265,12 @@ Re-run it whenever you want to pick up new deliveries: each run imports only the
 ## 8. Verify It Works
 
 1. Open Telegram and find your bot by its username.
-2. Send `/start` — the bot should reply with a welcome message.
-3. Try `/forecast` to see products predicted to run low.
-4. Try `/cart` to see your current Picnic cart.
+2. Send `/start` — the bot replies with a welcome message and shows a keyboard of buttons.
+3. Tap **📉 Running low?** to see products predicted to run low.
+4. Tap **🧺 Cart** to see your current Picnic cart.
+5. Tap **⚙️ Settings** for privacy, deleting the stored conversation and the Picnic login.
+
+Every button also exists as a command (`/forecast`, `/cart`, `/settings`, …); `/menu` brings the keyboard back.
 
 If the bot does not respond, check the logs:
 
@@ -414,7 +417,8 @@ docker compose run --rm picnic-bot import-history
 
 - Double-check `PICNIC_USERNAME`, `PICNIC_PASSWORD`, and `PICNIC_COUNTRY_CODE` in `.env`.
 - If the bot says Picnic needs a login code (2FA) or the session expired, send
-  `/picnic_login` (add `email` to get the code by email), then `/picnic_code <code>`.
+  **⚙️ Settings → Log in to Picnic**, choose SMS or email, then send the code as a message
+  (or `/picnic_login [email]`, then `/picnic_code <code>`).
   Or, on the server: `docker compose run --rm picnic-bot python scripts/picnic_login.py`.
   The session is stored in the database, so this is only needed when Picnic
   expires it.

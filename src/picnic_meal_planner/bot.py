@@ -16,13 +16,22 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -231,59 +240,178 @@ async def _reject_unauthorized(update: Update) -> None:
     await update.message.reply_text("Sorry, you're not authorised to use this bot.")
 
 
+# The canned requests behind /plan, /order, … and the keyboard buttons.
+PROMPTS = {
+    "plan": "Let's plan meals for the week. What does the family feel like eating?",
+    "order": (
+        "I'd like to do some grocery shopping. Can you help me search for "
+        "products and manage the cart?"
+    ),
+    "forecast": "What groceries are we likely running low on based on our order history?",
+    "history": "Show me a summary of our recent grocery orders.",
+    "cart": "Show me what's currently in the Picnic cart.",
+}
+
+# The keyboard under the message field.  A tap sends the label as an ordinary
+# message, which ``on_text`` maps back to an action — so a label must never
+# reach the model, and changing one orphans keyboards already on screen until
+# the next /start or /menu.
+SETTINGS_BUTTON = "⚙️ Settings"
+MENU_BUTTONS = {
+    "🍽 Plan meals": "plan",
+    "🛒 Shop": "order",
+    "📉 Running low?": "forecast",
+    "🧾 Recent orders": "history",
+    "🧺 Cart": "cart",
+}
+MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🍽 Plan meals", "🛒 Shop"],
+        ["📉 Running low?", "🧾 Recent orders"],
+        ["🧺 Cart", SETTINGS_BUTTON],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Telegram's own "/" menu, for those who prefer commands.
+BOT_COMMANDS = [
+    BotCommand("menu", "Show the buttons"),
+    BotCommand("plan", "Plan meals for the week"),
+    BotCommand("order", "Shop: search products, manage the cart"),
+    BotCommand("forecast", "What are we running low on?"),
+    BotCommand("history", "Recent orders"),
+    BotCommand("cart", "Current Picnic cart"),
+    BotCommand("settings", "Privacy, stored conversation, Picnic login"),
+]
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/start`` and ``/menu`` — greet and (re)show the button keyboard."""
     if not _is_allowed(update.effective_user.id):
         await _reject_unauthorized(update)
         return
     await update.message.reply_text(
         "Hi! I'm your family grocery and meal planning assistant.\n\n"
-        "Commands:\n"
-        "/plan — start a meal planning session\n"
-        "/order — open a shopping session\n"
-        "/forecast — see what you might be running low on\n"
-        "/history — recent order summary\n"
-        "/cart — current Picnic cart\n"
-        "/forget — delete our stored conversation\n"
-        "/privacy — control whether our conversation is saved\n"
-        "/model — show which AI model this chat uses\n"
-        "/picnic_login — log in to Picnic when it asks for a code\n\n"
-        "Or just chat with me naturally!"
+        "Use the buttons below, or just chat with me naturally. "
+        f"{SETTINGS_BUTTON} has privacy, the stored conversation and the "
+        "Picnic login.",
+        reply_markup=MENU_KEYBOARD,
     )
 
 
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _prompt_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, name: str
+) -> None:
     if not _is_allowed(update.effective_user.id):
         await _reject_unauthorized(update)
         return
-    await _chat(update, context, "Let's plan meals for the week. What does the family feel like eating?")
+    await _chat(update, context, PROMPTS[name])
+
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _prompt_command(update, context, "plan")
 
 
 async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update.effective_user.id):
-        await _reject_unauthorized(update)
-        return
-    await _chat(update, context, "I'd like to do some grocery shopping. Can you help me search for products and manage the cart?")
+    await _prompt_command(update, context, "order")
 
 
 async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update.effective_user.id):
-        await _reject_unauthorized(update)
-        return
-    await _chat(update, context, "What groceries are we likely running low on based on our order history?")
+    await _prompt_command(update, context, "forecast")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update.effective_user.id):
-        await _reject_unauthorized(update)
-        return
-    await _chat(update, context, "Show me a summary of our recent grocery orders.")
+    await _prompt_command(update, context, "history")
 
 
 async def cmd_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update.effective_user.id):
-        await _reject_unauthorized(update)
-        return
-    await _chat(update, context, "Show me what's currently in the Picnic cart.")
+    await _prompt_command(update, context, "cart")
+
+
+# The actions below return the text to show, so a command can send it as a
+# reply and a Settings button can put it in the menu message.
+
+async def _forget(chat_id: int) -> str:
+    """Delete this chat's stored conversation; the outcome as a message."""
+    # history.clear_history deliberately propagates DB failures rather than
+    # failing silently, so never report success without catching them first.
+    try:
+        removed = await history.clear_history(chat_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not clear history for chat %d", chat_id)
+        return "Sorry, I couldn't clear the history just now. Please try again."
+    if removed:
+        return f"Forgotten — deleted {removed} stored message(s). We're starting fresh."
+    return "There was nothing stored. We're starting fresh."
+
+
+async def _set_privacy(chat_id: int, enable: bool) -> str:
+    try:
+        await history.set_persistence(chat_id, enable)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not change persistence for chat %d", chat_id)
+        return "Sorry, I couldn't change that setting just now. Please try again."
+    if enable:
+        return "Saving is ON. I'll remember our conversations between restarts."
+    return (
+        "Saving is OFF, and anything already stored has been deleted. "
+        "I'll still remember this conversation until the bot restarts."
+    )
+
+
+async def _model_line(chat_id: int) -> str:
+    model = await llm.get_chat_model(chat_id)
+    suffix = "" if model != llm.DEFAULT_MODEL else " (the default)"
+    return f"This chat uses {model}{suffix}."
+
+
+async def _picnic_login(user_id: int, channel: str) -> str:
+    """Start a Picnic login for *user_id*; the outcome as a message."""
+    if os.getenv("PICNIC_MOCK", "").lower() == "true":
+        return "Picnic is mocked here; there is nothing to log in to."
+
+    from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
+
+    try:
+        logged_in = await picnic.start_login(channel, owner=user_id)
+    except ValueError:
+        return "Usage: /picnic_login [sms|email]"
+    except picnic.PicnicLoginRequired as exc:  # no credentials, or another login pending
+        return str(exc)
+    except PicnicAuthError:
+        return "Picnic rejected the username or password in the bot's configuration."
+    except Exception:  # noqa: BLE001
+        logger.exception("Picnic login failed")
+        return "Sorry, I couldn't reach Picnic. Please try again."
+
+    if logged_in:
+        return "Logged in to Picnic — no code was needed."
+    minutes = picnic_auth.CODE_TTL_SECONDS // 60
+    return (
+        f"Picnic sent a login code by {channel.lower()}. Send it here as a "
+        f"message within {minutes} minutes (just the digits, or "
+        "/picnic_code 123456)."
+    )
+
+
+async def _picnic_code(code: str) -> str:
+    """Finish the pending Picnic login with *code*; the outcome as a message."""
+    from python_picnic_api2 import Picnic2FAError  # noqa: PLC0415
+
+    try:
+        await picnic.submit_login_code(code)
+    except Picnic2FAError:
+        return (
+            "Picnic didn't accept that code. Check it and send it again, or "
+            "start a new login (/picnic_login) for a new one."
+        )
+    except picnic.PicnicLoginRequired as exc:  # nothing pending, or it expired
+        return str(exc)
+    except Exception:  # noqa: BLE001
+        logger.exception("Picnic 2FA verification failed")
+        return "Sorry, I couldn't reach Picnic. Please try again."
+    return "Logged in to Picnic. You're all set."
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -291,27 +419,7 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _is_allowed(update.effective_user.id):
         await _reject_unauthorized(update)
         return
-
-    chat_id = update.effective_chat.id
-    # history.clear_history deliberately propagates DB failures rather than
-    # failing silently, so never report success without catching them first.
-    try:
-        removed = await history.clear_history(chat_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("Could not clear history for chat %d", chat_id)
-        await update.message.reply_text(
-            "Sorry, I couldn't clear the history just now. Please try again."
-        )
-        return
-
-    if removed:
-        await update.message.reply_text(
-            f"Forgotten — deleted {removed} stored message(s). We're starting fresh."
-        )
-    else:
-        await update.message.reply_text(
-            "There was nothing stored. We're starting fresh."
-        )
+    await update.message.reply_text(await _forget(update.effective_chat.id))
 
 
 async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,25 +441,7 @@ async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    enable = arg == "on"
-    try:
-        await history.set_persistence(chat_id, enable)
-    except Exception:  # noqa: BLE001
-        logger.exception("Could not change persistence for chat %d", chat_id)
-        await update.message.reply_text(
-            "Sorry, I couldn't change that setting just now. Please try again."
-        )
-        return
-
-    if enable:
-        await update.message.reply_text(
-            "Saving is ON. I'll remember our conversations between restarts."
-        )
-    else:
-        await update.message.reply_text(
-            "Saving is OFF, and anything already stored has been deleted. "
-            "I'll still remember this conversation until the bot restarts."
-        )
+    await update.message.reply_text(await _set_privacy(chat_id, arg == "on"))
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -365,9 +455,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update.effective_user.id):
         await _reject_unauthorized(update)
         return
-    model = await llm.get_chat_model(update.effective_chat.id)
-    suffix = "" if model != llm.DEFAULT_MODEL else " (the default)"
-    await update.message.reply_text(f"This chat uses {model}{suffix}.")
+    await update.message.reply_text(await _model_line(update.effective_chat.id))
 
 
 async def cmd_picnic_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -375,39 +463,10 @@ async def cmd_picnic_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _may_log_in_to_picnic(update.effective_user.id):
         await _reject_unauthorized(update)
         return
-    if os.getenv("PICNIC_MOCK", "").lower() == "true":
-        await update.message.reply_text("Picnic is mocked here; there is nothing to log in to.")
-        return
-
-    from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
-
     channel = (context.args[0] if context.args else "sms").upper()
-    try:
-        logged_in = await picnic.start_login(channel, owner=update.effective_user.id)
-    except ValueError:
-        await update.message.reply_text("Usage: /picnic_login [sms|email]")
-        return
-    except picnic.PicnicLoginRequired as exc:  # no credentials, or another login pending
-        await update.message.reply_text(str(exc))
-        return
-    except PicnicAuthError:
-        await update.message.reply_text(
-            "Picnic rejected the username or password in the bot's configuration."
-        )
-        return
-    except Exception:  # noqa: BLE001
-        logger.exception("Picnic login failed")
-        await update.message.reply_text("Sorry, I couldn't reach Picnic. Please try again.")
-        return
-
-    if logged_in:
-        await update.message.reply_text("Logged in to Picnic — no code was needed.")
-    else:
-        minutes = picnic_auth.CODE_TTL_SECONDS // 60
-        await update.message.reply_text(
-            f"Picnic sent a login code by {channel.lower()}. Send it here as "
-            f"/picnic_code 123456 within {minutes} minutes."
-        )
+    await update.message.reply_text(
+        await _picnic_login(update.effective_user.id, channel)
+    )
 
 
 async def cmd_picnic_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -418,25 +477,135 @@ async def cmd_picnic_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not context.args:
         await update.message.reply_text("Usage: /picnic_code 123456")
         return
+    await update.message.reply_text(await _picnic_code(context.args[0]))
 
-    from python_picnic_api2 import Picnic2FAError  # noqa: PLC0415
 
-    try:
-        await picnic.submit_login_code(context.args[0])
-    except Picnic2FAError:
-        await update.message.reply_text(
-            "Picnic didn't accept that code. Check it and send /picnic_code "
-            "again, or /picnic_login for a new one."
+# ---------------------------------------------------------------------------
+# Settings menu (inline buttons)
+# ---------------------------------------------------------------------------
+#
+# One message whose text and buttons are edited in place.  Whatever deletes
+# data asks for confirmation first: a button is easier to hit by accident
+# than a typed command.
+
+def _buttons(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=data) for label, data in row]
+         for row in rows]
+    )
+
+
+_BACK = ("« Back", "menu")
+
+
+async def _settings_view(chat_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    saving = await history.is_persistence_enabled(chat_id)
+    rows = [
+        [("🗑 Forget our conversation", "forget")],
+        [("🚫 Stop saving conversations", "privacy:off")]
+        if saving
+        else [("💾 Save conversations", "privacy:on")],
+    ]
+    if _may_log_in_to_picnic(user_id):
+        rows.append([("🔑 Log in to Picnic", "login")])
+    text = (
+        f"{SETTINGS_BUTTON}\n\n"
+        f"Saving our conversation: {'ON' if saving else 'OFF'}\n"
+        f"{await _model_line(chat_id)}"
+    )
+    return text, _buttons(*rows)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/settings`` or the Settings button — open the settings menu."""
+    if not _is_allowed(update.effective_user.id):
+        await _reject_unauthorized(update)
+        return
+    text, markup = await _settings_view(
+        update.effective_chat.id, update.effective_user.id
+    )
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on an inline button of the settings menu."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    # Checked on every tap: in a group anyone can press a button under a
+    # message that was sent for somebody else.
+    if not _is_allowed(user_id):
+        await query.answer(
+            "Sorry, you're not authorised to use this bot.", show_alert=True
         )
         return
-    except picnic.PicnicLoginRequired as exc:  # nothing pending, or it expired
-        await update.message.reply_text(str(exc))
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    data = query.data or ""
+    markup = _buttons([_BACK])
+
+    if data == "menu":
+        text, markup = await _settings_view(chat_id, user_id)
+    elif data == "forget":
+        text = "Delete everything stored from this chat's conversation?"
+        markup = _buttons([("🗑 Yes, delete", "forget:yes"), ("Cancel", "menu")])
+    elif data == "forget:yes":
+        text = await _forget(chat_id)
+    elif data == "privacy:off":
+        text = "Stop saving this chat's conversation and delete what is already stored?"
+        markup = _buttons([("🚫 Yes, stop and delete", "privacy:off:yes"), ("Cancel", "menu")])
+    elif data == "privacy:off:yes":
+        text = await _set_privacy(chat_id, False)
+    elif data == "privacy:on":
+        text = await _set_privacy(chat_id, True)
+    elif data.startswith("login"):
+        if not _may_log_in_to_picnic(user_id):
+            text = "Sorry, you're not allowed to log in to Picnic from here."
+        elif data == "login":
+            text = "Log in to Picnic. If it asks for a code, how should it be sent?"
+            markup = _buttons(
+                [("📱 SMS", "login:sms"), ("✉️ Email", "login:email")], [_BACK]
+            )
+        else:
+            text = await _picnic_login(user_id, data.removeprefix("login:").upper())
+    else:
+        logger.warning("Unknown button %r in chat %d", data, chat_id)
         return
-    except Exception:  # noqa: BLE001
-        logger.exception("Picnic 2FA verification failed")
-        await update.message.reply_text("Sorry, I couldn't reach Picnic. Please try again.")
-        return
-    await update.message.reply_text("Logged in to Picnic. You're all set.")
+
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except BadRequest:
+        # The message is gone or too old to edit, or already shows this.
+        logger.debug("Could not edit the settings message", exc_info=True)
+        await context.bot.send_message(chat_id, text, reply_markup=markup)
+
+
+# ---------------------------------------------------------------------------
+# Free text
+# ---------------------------------------------------------------------------
+
+_LOGIN_CODE = re.compile(r"\d{4,8}")
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-command message: a keyboard button, a login code, or chat."""
+    text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+
+    if text == SETTINGS_BUTTON:
+        await cmd_settings(update, context)
+    elif text in MENU_BUTTONS:
+        await _prompt_command(update, context, MENU_BUTTONS[text])
+    elif (
+        _LOGIN_CODE.fullmatch(text)
+        and picnic.pending_login_owner() == user_id
+        and _may_log_in_to_picnic(user_id)
+    ):
+        # The code this user's pending login waits for.  Handled here so that
+        # it is never sent to the model or stored in the history.
+        await update.message.reply_text(await _picnic_code(text))
+    else:
+        await _chat(update, context)
 
 
 async def _chat(
@@ -547,6 +716,10 @@ async def _post_init(app: Application) -> None:
         else "off (PERSIST_CONVERSATIONS)",
     )
     logger.info("Default LLM model (via OpenRouter): %s", llm.DEFAULT_MODEL)
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+    except Exception:  # noqa: BLE001 — cosmetic; the commands work regardless
+        logger.warning("Could not publish the command menu", exc_info=True)
 
 
 def main() -> None:
@@ -558,7 +731,8 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler(["start", "menu"], cmd_start))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("order", cmd_order))
     app.add_handler(CommandHandler("forecast", cmd_forecast))
@@ -569,7 +743,8 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("picnic_login", cmd_picnic_login))
     app.add_handler(CommandHandler("picnic_code", cmd_picnic_code))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _chat))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Starting bot with long polling...")
     app.run_polling(drop_pending_updates=True)

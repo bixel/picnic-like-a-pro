@@ -199,6 +199,15 @@ JSON-serialisable without extra steps.
   switch (`scripts/chat_model.py`) applies on the next message.
   `llm.set_chat_model()` enforces `LLM_ALLOWED_MODELS` and is the function a
   future user-facing picker should call; `/model` is read-only today.
+- **Buttons are a second front end to the commands, not a second
+  implementation.**  `bot.MENU_KEYBOARD` (reply keyboard, shown by `/start`
+  and `/menu`) sends its label as a plain message; `bot.on_text` maps the
+  label to the same canned prompt as `/plan`, `/cart`, … so a label never
+  reaches the model.  `⚙️ Settings` (`/settings`) is one inline-keyboard
+  message edited in place by `bot.on_button`; forgetting and "stop saving"
+  ask for confirmation there.  Every action returns its reply text
+  (`_forget`, `_set_privacy`, `_picnic_login`, …) and is shared by the command
+  and the button.  `on_button` re-checks the allowlist on every tap.
 - Conversation history is **persisted to SQLite per chat_id** and survives
   restarts.  All policy lives in `history.py`; `bot.py` only calls
   `get_context()` and `commit_turn()`.
@@ -345,7 +354,10 @@ in `picnic/auth.py`, and `client.py` applies it.
   `{"error": str(exc)}`, so `PicnicLoginRequired`'s message is written for the
   end user and names both ways to log in.
 - **Two front ends, one `LoginFlow`:** `scripts/picnic_login.py` (shell) and
-  `/picnic_login [sms|email]` + `/picnic_code <code>` (Telegram).  The
+  `/picnic_login [sms|email]` + `/picnic_code <code>` (Telegram; also
+  Settings → Log in to Picnic, and the code as a plain digits-only message —
+  `bot.on_text` takes it only from the user whose login is pending, and never
+  forwards it to the model).  The
   library verifies the code against the same `PicnicAPI` instance that asked
   for it, so a pending login is an object in memory with a 10-minute TTL; a
   wrong code keeps it pending.

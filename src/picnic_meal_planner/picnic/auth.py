@@ -198,6 +198,13 @@ class LoginFlow:
             return None
         return self._pending.channel
 
+    @property
+    def pending_owner(self) -> Any:
+        """Who started the login that waits for a code, else ``None``."""
+        if self._pending is None or self._pending.expired():
+            return None
+        return self._pending.owner
+
     def cancel(self) -> None:
         self._pending = None
 

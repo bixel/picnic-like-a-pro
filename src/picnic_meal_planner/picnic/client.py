@@ -214,6 +214,11 @@ def pending_login_channel() -> str | None:
     return _login.pending_channel
 
 
+def pending_login_owner() -> Any:
+    """The *owner* given to :func:`start_login` while its code is awaited."""
+    return _login.pending_owner
+
+
 async def logout() -> int:
     """Forget the session here and in the database."""
     reset_client()

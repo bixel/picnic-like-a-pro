@@ -482,11 +482,18 @@ class TestChatHandler:
 # ---------------------------------------------------------------------------
 
 class TestCommandHandlers:
-    async def test_start_lists_commands(self, monkeypatch):
+    async def test_start_shows_the_button_keyboard(self, monkeypatch):
         monkeypatch.setenv("ALLOW_ALL_USERS", "true")
         update = _make_update()
         await bot.cmd_start(update, _make_context())
-        assert "/forecast" in update.message.reply_text.await_args[0][0]
+        call = update.message.reply_text.await_args
+        assert "buttons" in call.args[0]
+        assert call.kwargs["reply_markup"] is bot.MENU_KEYBOARD
+
+    def test_every_keyboard_button_has_an_action(self):
+        labels = {b.text for row in bot.MENU_KEYBOARD.keyboard for b in row}
+        assert labels == set(bot.MENU_BUTTONS) | {bot.SETTINGS_BUTTON}
+        assert set(bot.MENU_BUTTONS.values()) == set(bot.PROMPTS)
 
     async def test_start_rejects_unauthorised(self, monkeypatch):
         monkeypatch.delenv("ALLOW_ALL_USERS", raising=False)
@@ -548,6 +555,139 @@ class TestModelCommand:
         update = _make_update(user_id=1)
         await bot.cmd_model(update, _make_context())
         assert "not authorised" in update.message.reply_text.await_args[0][0]
+
+
+def _labels(markup) -> dict[str, str]:
+    """Inline keyboard as {callback_data: label}."""
+    return {b.callback_data: b.text for row in markup.inline_keyboard for b in row}
+
+
+def _make_callback(data: str, user_id: int = 1, chat_id: int = 100):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_chat.id = chat_id
+    update.message = None  # as in a real callback-query update
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    return update
+
+
+async def _press(data: str, **kwargs):
+    """Press an inline button; returns (text, markup) the menu was edited to."""
+    update = _make_callback(data, **kwargs)
+    await bot.on_button(update, _make_context())
+    update.callback_query.answer.assert_awaited_once()
+    call = update.callback_query.edit_message_text.await_args
+    return call.args[0], call.kwargs["reply_markup"]
+
+
+class TestKeyboardButtons:
+    """A tap on the reply keyboard arrives as a plain text message."""
+
+    async def test_button_sends_its_prompt_not_its_label(self, fake_llm, monkeypatch):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        client = fake_llm([_reply([_TextBlock("ok")])])
+        await bot.on_text(_make_update(text="🧺 Cart"), _make_context())
+        assert client.calls[0]["messages"][-1]["content"] == bot.PROMPTS["cart"]
+
+    async def test_other_text_is_chat(self, fake_llm, monkeypatch):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        client = fake_llm([_reply([_TextBlock("ok")])])
+        await bot.on_text(_make_update(text="12345"), _make_context())
+        assert client.calls[0]["messages"][-1]["content"] == "12345"
+
+    async def test_settings_button_opens_the_menu(self, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+        update = _make_update(text=bot.SETTINGS_BUTTON)
+        await bot.on_text(update, _make_context())
+        call = update.message.reply_text.await_args
+        assert "Saving our conversation: ON" in call.args[0]
+        assert llm.DEFAULT_MODEL in call.args[0]
+        assert {"forget", "privacy:off", "login"} == set(_labels(call.kwargs["reply_markup"]))
+
+    @pytest.mark.parametrize("text", ["🧺 Cart", "⚙️ Settings"])
+    async def test_buttons_reject_unauthorised(self, monkeypatch, text):
+        monkeypatch.delenv("ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "999")
+        update = _make_update(text=text, user_id=1)
+        await bot.on_text(update, _make_context())
+        assert "not authorised" in update.message.reply_text.await_args[0][0]
+
+
+class TestSettingsMenu:
+    @pytest.fixture(autouse=True)
+    def allowed(self, monkeypatch, db_path):
+        monkeypatch.setenv("ALLOW_ALL_USERS", "true")
+
+    async def test_forget_asks_before_deleting(self, fake_llm):
+        fake_llm([_reply([_TextBlock("ok")])])
+        await bot._run_llm(100, "remember this")
+
+        text, markup = await _press("forget")
+        assert "Delete" in text
+        assert set(_labels(markup)) == {"forget:yes", "menu"}
+        assert await history.get_context(100) != []
+
+        text, markup = await _press("forget:yes")
+        assert "deleted 2" in text
+        assert set(_labels(markup)) == {"menu"}
+        assert await history.get_context(100) == []
+
+    async def test_forget_reports_failure(self, monkeypatch):
+        async def boom(chat_id):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(history, "clear_history", boom)
+        text, _ = await _press("forget:yes")
+        assert "couldn't clear" in text
+
+    async def test_privacy_toggle(self):
+        text, _ = await _press("privacy:off")
+        assert await history.is_persistence_enabled(100)  # only asked so far
+
+        text, _ = await _press("privacy:off:yes")
+        assert "OFF" in text
+        assert not await history.is_persistence_enabled(100)
+
+        text, markup = await _press("menu")
+        assert "Saving our conversation: OFF" in text
+        assert "privacy:on" in _labels(markup)
+
+        text, _ = await _press("privacy:on")
+        assert "ON" in text
+        assert await history.is_persistence_enabled(100)
+
+    async def test_unauthorised_tap_changes_nothing(self, monkeypatch):
+        monkeypatch.delenv("ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "999")
+        update = _make_callback("privacy:off:yes", user_id=1)
+        await bot.on_button(update, _make_context())
+        assert "not authorised" in update.callback_query.answer.await_args.args[0]
+        update.callback_query.edit_message_text.assert_not_awaited()
+        assert await history.is_persistence_enabled(100)
+
+    async def test_login_is_hidden_and_refused_without_permission(self, monkeypatch):
+        monkeypatch.setenv("PICNIC_LOGIN_USER_IDS", "2")
+        _, markup = await _press("menu", user_id=1)
+        assert "login" not in _labels(markup)
+        text, _ = await _press("login:sms", user_id=1)
+        assert "not allowed" in text
+        _, markup = await _press("login", user_id=2)
+        assert {"login:sms", "login:email"} <= set(_labels(markup))
+
+    async def test_uneditable_message_gets_a_new_one(self):
+        update = _make_callback("menu")
+        update.callback_query.edit_message_text.side_effect = bot.BadRequest("gone")
+        context = _make_context()
+        context.bot.send_message = AsyncMock()
+        await bot.on_button(update, context)
+        assert context.bot.send_message.await_args.args[0] == 100
+
+    async def test_unknown_button_is_ignored(self):
+        update = _make_callback("nonsense")
+        await bot.on_button(update, _make_context())
+        update.callback_query.edit_message_text.assert_not_awaited()
 
 
 class TestForgetCommand:
@@ -681,7 +821,8 @@ class TestMain:
 
         bot.main()
 
-        assert app.add_handler.call_count == 12  # 11 commands + 1 message handler
+        # 12 command handlers + inline buttons + the message handler
+        assert app.add_handler.call_count == 14
         app.run_polling.assert_called_once()
         # The DB must be initialised on startup, before any update is handled.
         builder.post_init.assert_called_once_with(bot._post_init)

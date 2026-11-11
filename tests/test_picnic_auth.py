@@ -354,6 +354,42 @@ class TestTelegramCommands:
 
         assert "no code was needed" in await self._reply(bot.cmd_picnic_login)
 
+    async def test_buttons_and_a_plain_code_message(self, monkeypatch):
+        """Settings → Log in → Email, then the code as an ordinary message."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from picnic_meal_planner import bot
+
+        FakePicnicAPI.needs_2fa = True
+        press = MagicMock()
+        press.effective_user.id = 1
+        press.callback_query.data = "login:email"
+        press.callback_query.answer = AsyncMock()
+        press.callback_query.edit_message_text = AsyncMock()
+        await bot.on_button(press, MagicMock())
+        assert "by email" in press.callback_query.edit_message_text.call_args.args[0]
+
+        # Never forwarded to the model: neither the code, nor by another user.
+        chat = AsyncMock()
+        monkeypatch.setattr(bot, "_chat", chat)
+
+        async def send(text, user_id):
+            update = MagicMock()
+            update.effective_user.id = user_id
+            update.message.text = text
+            update.message.reply_text = AsyncMock()
+            await bot.on_text(update, MagicMock())
+            return update.message.reply_text
+
+        await send("123456", user_id=2)
+        chat.assert_awaited_once()
+        assert picnic.pending_login_channel() == "EMAIL"
+
+        reply = await send(" 123456 ", user_id=1)
+        chat.assert_awaited_once()
+        assert "Logged in" in reply.call_args.args[0]
+        assert await _stored_token() == "2fa-token"
+
     async def test_wrong_code_invites_a_retry(self):
         from picnic_meal_planner import bot
 

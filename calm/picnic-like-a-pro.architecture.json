@@ -137,6 +137,8 @@
           "unique-id": "telegram-commands",
           "commands": [
             "/start",
+            "/menu",
+            "/settings",
             "/plan",
             "/order",
             "/forecast",
@@ -147,6 +149,7 @@
             "/model",
             "/picnic_login",
             "/picnic_code",
+            "<keyboard and inline buttons>",
             "<free text>"
           ]
         }

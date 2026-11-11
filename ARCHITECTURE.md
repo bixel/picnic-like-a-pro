@@ -415,10 +415,20 @@ decomposition) can replace just the `engine.py` file later without touching anyt
 
 ## Telegram Bot Flows
 
+### Buttons
+`/start` (or `/menu`) shows a persistent keyboard under the message field:
+Plan meals, Shop, Running low?, Recent orders, Cart and Settings.  The first
+five send the same request as the matching command below.  Settings opens an
+inline menu: forget the conversation, stop/start saving it (both deletions ask
+for confirmation), the chat's model, and the Picnic login (SMS or email; the
+code is then sent as a plain message).  Every button has a command equivalent,
+and the commands are published to Telegram's "/" menu.
+
 ### Commands
 | Command | Behaviour |
 |---------|-----------|
-| `/start` | Welcome message, brief how-to |
+| `/start`, `/menu` | Welcome message, shows the button keyboard |
+| `/settings` | Open the settings menu |
 | `/plan` | Start a meal planning session with Claude |
 | `/order` | Open a shopping session (search, cart management) |
 | `/forecast` | Ask Claude what you're likely running low on |

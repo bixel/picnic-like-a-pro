@@ -340,7 +340,7 @@ credits left.
 
 | # | Do this | Expect |
 |---|---|---|
-| 1 | `/start` | Help text listing `/forget` and `/privacy` |
+| 1 | `/start` | Welcome text and the button keyboard; **⚙️ Settings** opens a menu with forget / saving / Picnic login |
 | 2 | "we usually buy oat milk on Fridays" | A normal reply |
 | 3 | "what did I just tell you?" | It remembers — in-session context works |
 | 4 | **Restart** | Comes back up |
