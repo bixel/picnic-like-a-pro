@@ -400,7 +400,7 @@
       "unique-id": "mcp-tool-server",
       "node-type": "service",
       "name": "MCP tool server",
-      "description": "FastMCP server with 15 tools (Picnic, order history, forecasting). The bot calls the tools in-process via get_tool_schemas()/call_tool(); `uv run mcp-server` exposes the same tools over stdio, SSE or streamable HTTP. Tool exceptions become {\"error\": str(exc)} results.",
+      "description": "FastMCP server with 15 tools (Picnic, order history, forecasting). The bot calls the tools in-process via get_tool_schemas()/call_tool(); `uv run mcp-server` exposes the same tools over stdio, SSE or streamable HTTP. Tool exceptions are returned as an error result carrying str(exc).",
       "interfaces": [
         {
           "unique-id": "mcp-in-process",
@@ -590,7 +590,7 @@
       "interfaces": [
         {
           "unique-id": "sqlite-file",
-          "path": "${DB_PATH:-data/picnic.db}",
+          "path": "DB_PATH, default data/picnic.db",
           "driver": "sqlite+aiosqlite"
         }
       ],

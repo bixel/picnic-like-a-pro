@@ -22,13 +22,25 @@ cd calm
 # Validate (schema + every control config against its requirement schema)
 calm validate -a picnic-like-a-pro.architecture.json -u url-mapping.json --strict -f pretty
 
-# Browsable docs site with diagrams for every node, relationship and flow
-calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-docs \
-  --export-diagrams png        # optional; needs a Chromium (add --browser-path if it isn't found)
+# Browsable docs site with diagrams for every node, relationship and flow.
+# docify writes a Docusaurus project, not HTML: install and serve it to browse.
+calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-docs
+cd /tmp/calm-docs && npm install && npm start    # http://localhost:3000
+
+# PNGs for diagrams/ (not for the site: its pages then point at image files Docusaurus does not serve).
+# Needs a Chromium; add --browser-path if it isn't found.
+calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-png \
+  --export-diagrams png
+cp /tmp/calm-png/docs/_diagrams/index-1.png diagrams/overview.png
+for f in /tmp/calm-png/docs/flows/_diagrams/*-1.png; do
+  cp "$f" "diagrams/flow-$(basename "$f" -1.png).png"
+done
 ```
 
 Keep relationship and flow-transition descriptions free of `(` `)` and `;`: docify shows parentheses in edge labels as
-HTML entities, and Mermaid reads `;` in a sequence-diagram message as a line break.
+HTML entities, and Mermaid reads `;` in a sequence-diagram message as a line break.  Keep `{` and `}`
+out of every string: the generated pages are MDX, which reads braces as a JavaScript expression and
+fails to compile the page.
 
 When the code changes, update the JSON in the same PR. Each node's `metadata.code` lists the files
 it stands for, so `git diff --stat` shows which nodes to check.
