@@ -39,6 +39,7 @@ from .models import (
     OrderItem,
     PicnicAuth,
     Product,
+    WebLoginToken,
 )
 
 logger = logging.getLogger(__name__)
@@ -1128,3 +1129,84 @@ async def prune_api_requests(session: AsyncSession, *, keep_days: int) -> int:
         delete(ApiRequest).where(ApiRequest.requested_at < cutoff)
     )
     return result.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Reporting UI: login links
+# ---------------------------------------------------------------------------
+
+async def create_login_token(
+    session: AsyncSession, token_hash: str, user_id: int, expires_at: str
+) -> None:
+    """Store a one-time login token (by hash) and drop the expired ones."""
+    await session.execute(delete(WebLoginToken).where(WebLoginToken.expires_at <= _now()))
+    session.add(WebLoginToken(token_hash=token_hash, user_id=user_id, expires_at=expires_at))
+
+
+async def consume_login_token(session: AsyncSession, token_hash: str) -> int | None:
+    """Mark the token used and return its user id; ``None`` if it cannot be used.
+
+    One UPDATE decides it, so of two requests with the same token only one
+    gets the user id.
+    """
+    now = _now()
+    result = await session.execute(
+        update(WebLoginToken)
+        .where(
+            WebLoginToken.token_hash == token_hash,
+            WebLoginToken.used_at.is_(None),
+            WebLoginToken.expires_at > now,
+        )
+        .values(used_at=now)
+        .returning(WebLoginToken.user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# Reporting UI: raw rows (aggregated by web/reports.py)
+# ---------------------------------------------------------------------------
+
+async def report_orders(session: AsyncSession) -> list[dict]:
+    """Every order as ``{id, date, total_price}``.
+
+    ``date`` is the delivery time, or the order time when that is unknown.
+    """
+    stmt = select(
+        Order.id,
+        func.coalesce(func.nullif(Order.delivered_at, ""), Order.ordered_at).label("date"),
+        Order.total_price,
+    )
+    return [row._asdict() for row in (await session.execute(stmt)).all()]
+
+
+async def report_order_lines(session: AsyncSession) -> list[dict]:
+    """Every order line as ``{order_id, product_id, quantity, unit_price}``."""
+    stmt = select(
+        OrderItem.order_id, OrderItem.product_id, OrderItem.quantity, OrderItem.unit_price
+    )
+    return [row._asdict() for row in (await session.execute(stmt)).all()]
+
+
+async def report_products(session: AsyncSession) -> list[dict]:
+    """Every product with its category path; names are ``None`` until looked up."""
+    l1 = aliased(CategoryParent)
+    l2 = aliased(CategoryParent)
+    stmt = (
+        select(
+            Product.id,
+            Product.name,
+            Product.unit_quantity,
+            Product.category_id.label("l3_id"),
+            Category.name.label("l3_name"),
+            Category.l2_id,
+            l2.name.label("l2_name"),
+            Category.l1_id,
+            l1.name.label("l1_name"),
+        )
+        .select_from(Product)
+        .outerjoin(Category, Product.category_id == Category.id)
+        .outerjoin(l1, and_(l1.level == 1, l1.id == Category.l1_id))
+        .outerjoin(l2, and_(l2.level == 2, l2.id == Category.l2_id))
+    )
+    return [row._asdict() for row in (await session.execute(stmt)).all()]

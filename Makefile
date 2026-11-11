@@ -10,7 +10,7 @@
 # All three use distinct compose project names, container names, and volumes,
 # so they can run side by side on the same host.
 
-.PHONY: help install test test-fast coverage open-coverage wipe-test \
+.PHONY: help install api-types test test-fast coverage open-coverage wipe-test \
         test-docker test-docker-wipe \
         prod-up prod-down prod-logs prod-pull \
         mock-up mock-down mock-logs mock-seed mock-reset \
@@ -124,3 +124,8 @@ mock-reset:
 
 status:
 	@docker ps --filter name=picnic --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+
+# Regenerate the reporting UI's API types from the FastAPI schema.
+api-types:
+	uv run python -c "import json; from picnic_meal_planner.web.app import create_app; print(json.dumps(create_app().openapi(), indent=2))" > frontend/openapi.json
+	cd frontend && npm run gen:api

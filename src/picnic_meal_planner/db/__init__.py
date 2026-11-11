@@ -13,6 +13,7 @@ from .models import (
     OrderItem,
     PicnicAuth,
     Product,
+    WebLoginToken,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "OrderItem",
     "PicnicAuth",
     "Product",
+    "WebLoginToken",
     "get_db",
     "get_engine",
     "init_db",

@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+/* shadcn/ui theme tokens (neutral). Dark follows the OS setting. */
+:root {
+  color-scheme: light dark;
+  --radius: 0.625rem;
+  --background: #fafaf9;
+  --foreground: #0b0b0b;
+  --card: #ffffff;
+  --card-foreground: #0b0b0b;
+  --muted: #f1f1ef;
+  --muted-foreground: #5f5e5a;
+  --accent: #ececea;
+  --accent-foreground: #0b0b0b;
+  --primary: #1c1c1b;
+  --primary-foreground: #fafaf9;
+  --border: #e2e2df;
+  --input: #d6d6d2;
+  --ring: #2a78d6;
+  --destructive: #c0312f;
+  /* Chart series 1 — validated against both surfaces (dataviz palette). */
+  --chart-1: #2a78d6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #121211;
+    --foreground: #f0efec;
+    --card: #1a1a19;
+    --card-foreground: #f0efec;
+    --muted: #262624;
+    --muted-foreground: #b3b2a8;
+    --accent: #2e2e2c;
+    --accent-foreground: #f0efec;
+    --primary: #f0efec;
+    --primary-foreground: #1a1a19;
+    --border: #333331;
+    --input: #40403d;
+    --ring: #3987e5;
+    --destructive: #e66767;
+    --chart-1: #3987e5;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-chart-1: var(--chart-1);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+}

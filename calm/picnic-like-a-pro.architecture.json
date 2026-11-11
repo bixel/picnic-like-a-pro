@@ -147,6 +147,7 @@
             "/model",
             "/picnic_login",
             "/picnic_code",
+            "/report",
             "<free text>"
           ]
         }
@@ -163,7 +164,7 @@
                 "description": "Every handler checks the sender against ALLOWED_TELEGRAM_USER_IDS; an empty list denies everyone unless ALLOW_ALL_USERS=true. This is the only control protecting stored conversations.",
                 "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/ARCHITECTURE.md#multi-user-design-notes",
                 "allowed-principals": "Telegram user ids in ALLOWED_TELEGRAM_USER_IDS (everyone if ALLOW_ALL_USERS=true)",
-                "enforced-in": "src/picnic_meal_planner/bot.py::_is_allowed",
+                "enforced-in": "src/picnic_meal_planner/access.py::is_allowed, called by every handler in bot.py",
                 "default": "deny",
                 "env": [
                   "ALLOWED_TELEGRAM_USER_IDS",
@@ -212,7 +213,8 @@
       },
       "metadata": {
         "code": [
-          "src/picnic_meal_planner/bot.py"
+          "src/picnic_meal_planner/bot.py",
+          "src/picnic_meal_planner/access.py"
         ],
         "entrypoint": "bot = picnic_meal_planner.bot:main"
       }
@@ -584,7 +586,7 @@
       "unique-id": "sqlite-db",
       "node-type": "database",
       "name": "SQLite database",
-      "description": "A single SQLite file (DB_PATH, default data/picnic.db) on the picnic-data volume; shared by the bot and every script. Schema managed by Alembic (0001-0008).",
+      "description": "A single SQLite file (DB_PATH, default data/picnic.db) on the picnic-data volume; shared by the bot and every script. Schema managed by Alembic (0001-0011).",
       "interfaces": [
         {
           "unique-id": "sqlite-file",
@@ -800,6 +802,154 @@
       "metadata": {
         "code": [
           "scripts/preflight.py"
+        ]
+      }
+    },
+    {
+      "unique-id": "reporting-web",
+      "node-type": "service",
+      "name": "Reporting web app",
+      "description": "FastAPI app (`uv run web`): read-only reports over the order history, the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in web/reports.py. Refuses to start when the schema is behind.",
+      "interfaces": [
+        {
+          "unique-id": "reports-http",
+          "host": "127.0.0.1",
+          "port": 8080,
+          "env": [
+            "WEB_HOST",
+            "WEB_PORT"
+          ],
+          "paths": [
+            "/api/auth/login",
+            "/api/auth/logout",
+            "/api/me",
+            "/api/hierarchy",
+            "/api/timeseries"
+          ]
+        },
+        {
+          "unique-id": "login-links",
+          "functions": [
+            "web.login.create_login_link"
+          ]
+        }
+      ],
+      "controls": {
+        "report-session": {
+          "description": "Every /api route except the login needs a signed session cookie, and the Telegram allowlist is checked again on each request, so removing a user ends their session at once.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/access-control.requirement.json",
+              "config": {
+                "control-id": "PLP-AC-04",
+                "name": "Report session and allowlist",
+                "description": "Every /api route except the login needs a signed session cookie, and the Telegram allowlist is checked again on each request, so removing a user ends their session at once.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#reporting-ui",
+                "allowed-principals": "Telegram user ids in ALLOWED_TELEGRAM_USER_IDS holding a session cookie",
+                "default": "deny",
+                "enforced-in": "src/picnic_meal_planner/web/app.py::current_user",
+                "env": [
+                  "WEB_SESSION_SECRET",
+                  "ALLOWED_TELEGRAM_USER_IDS",
+                  "ALLOW_ALL_USERS"
+                ]
+              }
+            }
+          ]
+        },
+        "local-only-listener": {
+          "description": "The web app binds 127.0.0.1 unless WEB_HOST says otherwise. It is not part of the container image or the compose file.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/network-exposure.requirement.json",
+              "config": {
+                "control-id": "PLP-NE-02",
+                "name": "Reports listen on localhost",
+                "description": "The web app binds 127.0.0.1 unless WEB_HOST says otherwise. It is not part of the container image or the compose file.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#reporting-ui",
+                "inbound-ports": [
+                  8080
+                ],
+                "enforced-in": "src/picnic_meal_planner/web/app.py::main",
+                "env": [
+                  "WEB_HOST",
+                  "WEB_PORT"
+                ]
+              }
+            }
+          ]
+        },
+        "reports-read-only-scope": {
+          "description": "The web app reads orders, order lines, products and categories. It never reads conversations, the API request log or the Picnic token, and writes nothing but login tokens.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
+              "config": {
+                "control-id": "PLP-DP-07",
+                "name": "Reports read order data only",
+                "description": "The web app reads orders, order lines, products and categories. It never reads conversations, the API request log or the Picnic token, and writes nothing but login tokens.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#reporting-ui",
+                "data-classification": "business",
+                "erasure": "Nothing stored",
+                "failure-mode": "Request fails with an error",
+                "enforced-in": "src/picnic_meal_planner/web/app.py, db/queries.py report_* helpers"
+              }
+            }
+          ]
+        }
+      },
+      "metadata": {
+        "code": [
+          "src/picnic_meal_planner/web/app.py",
+          "src/picnic_meal_planner/web/login.py",
+          "src/picnic_meal_planner/web/reports.py",
+          "src/picnic_meal_planner/access.py"
+        ]
+      }
+    },
+    {
+      "unique-id": "reporting-frontend",
+      "node-type": "webclient",
+      "name": "Reporting frontend",
+      "description": "React single-page app in the browser: category tree, orders-over-time chart and login page. Built with Vite, shadcn/ui, Recharts, TanStack Query and Router. The selected node, interval and date range live in the URL.",
+      "metadata": {
+        "code": [
+          "frontend/src/",
+          "frontend/openapi.json"
+        ]
+      }
+    },
+    {
+      "unique-id": "web-login-tokens",
+      "node-type": "data-asset",
+      "name": "Report login tokens",
+      "description": "Table web_login_tokens: SHA-256 hashes of the one-time login links, with user id, expiry and time of use.",
+      "controls": {
+        "one-time-login-links": {
+          "description": "A link's token is random, stored only as a hash, valid for 5 minutes and consumed by a single UPDATE on first use. It travels in the URL fragment, which is not sent to the server.",
+          "requirements": [
+            {
+              "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/data-protection.requirement.json",
+              "config": {
+                "control-id": "PLP-DP-06",
+                "name": "One-time login links",
+                "description": "A link's token is random, stored only as a hash, valid for 5 minutes and consumed by a single UPDATE on first use. It travels in the URL fragment, which is not sent to the server.",
+                "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#reporting-ui",
+                "data-classification": "credential",
+                "erasure": "Expired rows are deleted whenever a new link is created",
+                "failure-mode": "Creating or redeeming propagates errors, a login never succeeds unverified",
+                "enforced-in": "src/picnic_meal_planner/web/login.py, db/queries.py::consume_login_token"
+              }
+            }
+          ]
+        }
+      },
+      "metadata": {
+        "code": [
+          "src/picnic_meal_planner/db/models.py"
+        ],
+        "tables": [
+          "web_login_tokens"
         ]
       }
     }
@@ -1505,7 +1655,9 @@
             "picnic-login-cli",
             "chat-model-cli",
             "preflight-cli",
-            "inspect-category-cli"
+            "inspect-category-cli",
+            "reporting-web",
+            "reporting-frontend"
           ]
         }
       }
@@ -1521,7 +1673,8 @@
             "conversation-transcripts",
             "api-request-log",
             "chat-settings",
-            "picnic-session-token"
+            "picnic-session-token",
+            "web-login-tokens"
           ]
         }
       }
@@ -1561,6 +1714,73 @@
             "picnic-bot-container"
           ]
         }
+      }
+    },
+    {
+      "unique-id": "family-member-uses-reports",
+      "description": "Family members open the reports in a browser.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "family-member",
+          "nodes": [
+            "reporting-frontend"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "frontend-calls-reports-api",
+      "description": "Same-origin JSON requests with the session cookie. In development Vite proxies /api to the web app.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "reporting-frontend"
+          },
+          "destination": {
+            "node": "reporting-web",
+            "interfaces": [
+              "reports-http"
+            ]
+          }
+        }
+      },
+      "protocol": "HTTP"
+    },
+    {
+      "unique-id": "bot-creates-login-link",
+      "description": "/report stores a hashed one-time token and replies with the link.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "telegram-bot"
+          },
+          "destination": {
+            "node": "reporting-web",
+            "interfaces": [
+              "login-links"
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "reports-query-db",
+      "description": "Reads orders, order lines, products and categories. Creates and consumes login tokens.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "reporting-web"
+          },
+          "destination": {
+            "node": "db-access-layer"
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
       }
     }
   ],
@@ -1790,6 +2010,53 @@
           "relationship-unique-id": "vps-pulls-image",
           "sequence-number": 4,
           "description": "The VPS pulls :latest and recreates the container."
+        }
+      ]
+    },
+    {
+      "unique-id": "report-login",
+      "name": "Open the order reports",
+      "description": "From /report in Telegram to a drill-down chart in the browser.",
+      "transitions": [
+        {
+          "relationship-unique-id": "family-member-uses-telegram",
+          "sequence-number": 1,
+          "description": "An authorised user sends /report in their private chat."
+        },
+        {
+          "relationship-unique-id": "bot-polls-telegram",
+          "sequence-number": 2,
+          "description": "The bot checks the allowlist and refuses group chats."
+        },
+        {
+          "relationship-unique-id": "bot-creates-login-link",
+          "sequence-number": 3,
+          "description": "create_login_link stores the token's hash with a 5 minute expiry and the bot replies with the link."
+        },
+        {
+          "relationship-unique-id": "family-member-uses-reports",
+          "sequence-number": 4,
+          "description": "The user opens the link. The login page takes the token out of the address bar and waits for a click."
+        },
+        {
+          "relationship-unique-id": "frontend-calls-reports-api",
+          "sequence-number": 5,
+          "description": "The page posts the token to /api/auth/login."
+        },
+        {
+          "relationship-unique-id": "reports-query-db",
+          "sequence-number": 6,
+          "description": "The token is consumed once, the allowlist is checked again, and a signed session cookie is set."
+        },
+        {
+          "relationship-unique-id": "frontend-calls-reports-api",
+          "sequence-number": 7,
+          "description": "The page loads the category tree and the time series with the cookie."
+        },
+        {
+          "relationship-unique-id": "reports-query-db",
+          "sequence-number": 8,
+          "description": "Orders, order lines, products and categories are read and aggregated."
         }
       ]
     }

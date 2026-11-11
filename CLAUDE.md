@@ -39,7 +39,7 @@ that the caller can batch multiple writes into one transaction.
 
 ### Models: `db/models.py`
 
-Nine ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
+Ten ORM models with SQLAlchemy 2.0 `DeclarativeBase` + typed `Mapped[]`
 columns:
 
 | Model | Table | Notes |
@@ -53,6 +53,7 @@ columns:
 | `ConversationMessage` | `conversation_messages` | Chat history; grouped by `turn_id`, the unit of deletion |
 | `ChatSettings` | `chat_settings` | Per-chat `persist_history` opt-out and `model` (NULL = `LLM_MODEL`) |
 | `PicnicAuth` | `picnic_auth` | The Picnic session token (one row); a credential — never log it |
+| `WebLoginToken` | `web_login_tokens` | One-time login links of the reporting UI; only the token's SHA-256 is stored |
 | `ApiRequest` | `api_requests` | Append-only log of Picnic/OpenRouter HTTP calls; URLs, headers and bodies are sensitive |
 
 Datetime values are stored as **ISO-8601 strings** (`String` column type,
@@ -83,6 +84,7 @@ Alembic manages all schema changes.
 | `alembic/versions/0008_*.py` | Category ids (`categories`, `products.category_id`); **drops** `products.category` — names are looked up again, downgrade restores them from `categories` |
 | `alembic/versions/0009_*.py` | L1/L2 names (`category_parents`); fills NULL `categories.l1_id` from siblings where they agree — additive |
 | `alembic/versions/0010_*.py` | `checked_at` on `categories` and `category_parents`; `category_parents.name` nullable — additive, downgrade drops unnamed rows |
+| `alembic/versions/0011_*.py` | Reporting UI login links (`web_login_tokens`) — purely additive |
 
 **Important flags:**
 - `render_as_batch=True` — required for SQLite because it cannot do most
@@ -158,6 +160,7 @@ src/picnic_meal_planner/
 │                     #   per-chat model selection
 ├── history.py        # Conversation history policy: serialization, truncation,
 │                     #   caching, persistence, opt-out, deletion
+├── access.py         # The Telegram user allowlist (bot handlers and the web app)
 ├── api_log.py        # Best-effort Picnic/OpenRouter request logging (URLs, headers, bodies)
 ├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting
 ├── db/
@@ -168,8 +171,15 @@ src/picnic_meal_planner/
 ├── picnic/
 │   ├── auth.py       # Stored session token + password/2FA login flow
 │   └── client.py     # Thin async wrapper around python-picnic-api2
-└── forecasting/
-    └── engine.py     # Urgency-score model (pure Python, no DB access)
+├── forecasting/
+│   └── engine.py     # Urgency-score model (pure Python, no DB access)
+└── web/
+    ├── app.py        # FastAPI app: report API, login, serves the built frontend
+    ├── login.py      # One-time login links and the signed session cookie
+    └── reports.py    # Hierarchy / time-series aggregation (pure Python, no DB access)
+
+frontend/             # Reporting UI: Vite + React + TypeScript, shadcn/ui, Recharts,
+                      #   TanStack Query and Router
 ```
 
 `calm/picnic-like-a-pro.architecture.json` is a FINOS CALM model of this
@@ -442,6 +452,57 @@ its OpenRouter call.  Both go through one wrapper,
 
 ---
 
+## Reporting UI
+
+`uv run web` serves read-only order reports: the category tree
+(Global → L1 → L2 → L3 → product) beside an orders-over-time chart of the
+selected node.  It is a separate process on the same SQLite file and, for
+now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
+
+- **It reads order data only** — `orders`, `order_items`, `products`,
+  `categories`, `category_parents`, through the `report_*` helpers in
+  `queries.py`.  Never add a route that reads conversations, `api_requests`
+  or `picnic_auth`.
+- **Aggregation is Python, not SQL.**  The helpers return raw rows and
+  `web/reports.py` (pure, like `forecasting/engine.py`) builds the tree and
+  the buckets.  The data is one family's orders, and a parent's order count
+  is a distinct count that cannot be summed from its children.
+- **Spend is `quantity × unit_price` of the order lines** at every level, so
+  a node equals the sum of its children.  `orders.total_price` (fees,
+  deposits) is shown only for the global node, as `order_total`.
+- **An order's date** is `delivered_at`, else `ordered_at`, as the calendar
+  day written in the stored string.  An order with neither is left out.
+- **Nodes are `(level, id)` with string ids.**  Names are `null` until the
+  import has looked them up; the frontend then shows "Category 1234".
+  Products without a category hang under `uncategorised`/`none`; an L3
+  without an L1 under `l1`/`unknown`.  Only nodes with orders in the date
+  range are listed.
+- **Login is a one-time link** from the bot's `/report` command
+  (`web/login.py`).  The token is random, stored only as a hash, valid for
+  5 minutes, and consumed by one `UPDATE … RETURNING`.  It sits in the URL
+  *fragment* (never sent to the server) and the login page posts it after a
+  click, so a link preview or prefetch cannot use it up.  `/report` refuses
+  group chats.
+- **The session is a signed cookie** (`user_id.expires.hmac`, 30 days,
+  `HttpOnly`, `SameSite=Lax`, `Secure` when `WEB_BASE_URL` is https).  There
+  is no session table.  `current_user` checks the allowlist
+  (`access.is_allowed`) on **every** request, so removing a user from
+  `ALLOWED_TELEGRAM_USER_IDS` locks them out at once.  Without
+  `WEB_SESSION_SECRET` the key is random per process.
+- **Failure behaviour:** nothing degrades — creating or redeeming a token
+  propagates errors; a login never succeeds unverified.
+- **API types are generated.**  After changing a response model run
+  `make api-types` (writes `frontend/openapi.json` and
+  `frontend/src/lib/api-types.ts`); both are committed.
+- **shadcn components are in `frontend/src/components/ui/`** as source.
+  The chart colour (`--chart-1`) and its dark step are in `src/index.css`.
+- **Frontend development:** `uv run web` plus `npm run dev` in `frontend/`
+  (Vite on :5173 proxies `/api`); set `WEB_BASE_URL=http://localhost:5173` so
+  `/report` links open the dev server.  `npm run build` writes
+  `frontend/dist`, which `uv run web` serves (`WEB_STATIC_DIR`).
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -465,6 +526,10 @@ its OpenRouter call.  Both go through one wrapper,
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | MCP server host (sse/http only) |
 | `MCP_PORT` | `8000` | MCP server port (sse/http only) |
+| `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8080` | Where `uv run web` listens |
+| `WEB_BASE_URL` | `http://localhost:8080` | Base of the links `/report` sends; https makes the cookie `Secure` |
+| `WEB_SESSION_SECRET` | — | Signs the session cookie; unset = random per process (sessions end on restart) |
+| `WEB_STATIC_DIR` | `frontend/dist` | The built frontend served by `uv run web` |
 | `IMPORT_BATCH_SIZE` | `10` | Deliveries per batch in import script |
 | `IMPORT_DELAY_SECONDS` | `2` | Pause between import batches |
 | `IMPORT_BACKOFF_SECONDS` | `60` | First wait after Picnic rate limits a category lookup; doubles per retry |
@@ -485,6 +550,9 @@ Copy `.env.example` to `.env` and fill in your values.
 uv sync                               # install dependencies
 uv run bot                            # start Telegram bot
 uv run mcp-server                     # start MCP server (stdio)
+uv run web                            # start the reporting UI (http://localhost:8080)
+(cd frontend && npm ci && npm run build)  # build the UI that `uv run web` serves
+make api-types                        # regenerate the frontend's API types
 uv run python scripts/import_history.py  # import new Picnic deliveries (re-runnable)
 uv run alembic upgrade head           # apply all pending migrations
 uv run alembic revision --autogenerate -m "msg"  # generate migration from model diff
