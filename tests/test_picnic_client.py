@@ -155,6 +155,10 @@ class TestGetL3Names:
         assert picnic.l1_names_on_page({"error": "nope"}) == (None, {})
         assert picnic.l1_names_on_page([]) == (None, {})
 
+    def test_an_l1_title_that_is_not_text_is_ignored(self):
+        page = {"header": {"title": {"text": "Cerealien"}}, "children": []}
+        assert picnic.l1_names_on_page(page) == (None, {})
+
     async def test_a_page_without_the_l3_still_names_the_others(self, monkeypatch):
         class Api:
             def _get(self, path, add_picnic_headers=False):
@@ -542,3 +546,73 @@ class TestRequestLogging:
         assert row["error_type"] == "RuntimeError"
         assert row["error_message"] == "picnic down"
         assert json.loads(row["request_body"]) == {"args": ["milk"], "kwargs": {}}
+
+
+class TestRateLimits:
+    """Telling a rate limit or block apart from a problem with one page."""
+
+    @staticmethod
+    def _api(status: int, body: bytes, headers: dict | None = None):
+        import requests
+        from requests.adapters import BaseAdapter
+
+        from picnic_meal_planner import api_log
+
+        class _Adapter(BaseAdapter):
+            def send(self, request, **kwargs):
+                response = requests.Response()
+                response.status_code = status
+                response._content = body
+                response.headers.update(headers or {})
+                response.request = request
+                response.url = request.url
+                return response
+
+            def close(self):
+                pass
+
+        session = requests.Session()
+        session.mount("https://", _Adapter())
+
+        class Api:
+            # Like python_picnic_api2: the status is ignored, the body parsed.
+            def _get(self, path, add_picnic_headers=False):
+                return self.session.get("https://storefront.example" + path).json()
+
+        api = Api()
+        api.session = session
+        api_log.install_picnic_capture(api)
+        return api
+
+    async def test_an_html_403_is_a_block(self, monkeypatch):
+        monkeypatch.setattr(picnic, "_client", self._api(403, b"<html>Forbidden</html>"))
+        with pytest.raises(picnic.PicnicRateLimited) as raised:
+            await picnic.get_l1_names(10)
+        assert (raised.value.status, raised.value.retry_after) == (403, None)
+
+    async def test_a_429_is_a_rate_limit_even_with_a_json_body(self, monkeypatch):
+        api = self._api(429, b'{"error": "slow down"}', {"Retry-After": "12"})
+        monkeypatch.setattr(picnic, "_client", api)
+        with pytest.raises(picnic.PicnicRateLimited) as raised:
+            await picnic.get_l1_names(10)
+        assert (raised.value.status, raised.value.retry_after) == (429, 12.0)
+
+    async def test_a_missing_page_is_an_ordinary_error(self, monkeypatch):
+        import requests
+
+        monkeypatch.setattr(picnic, "_client", self._api(404, b"<html>Not found</html>"))
+        with pytest.raises(requests.exceptions.JSONDecodeError):
+            await picnic.get_l1_names(10)
+
+    async def test_a_json_403_is_not_a_block(self, monkeypatch):
+        monkeypatch.setattr(picnic, "_client", self._api(403, b'{"error": {"code": "X"}}'))
+        assert await picnic.get_l1_names(10) == (None, {})
+
+    def test_retry_after_as_a_date(self):
+        from datetime import UTC, datetime, timedelta
+        from email.utils import format_datetime
+
+        when = format_datetime(datetime.now(UTC) + timedelta(seconds=90), usegmt=True)
+        assert 80 < picnic._retry_after({"retry-after": when}) <= 90
+        assert picnic._retry_after({"Retry-After": "soon"}) is None
+        assert picnic._retry_after(None) is None

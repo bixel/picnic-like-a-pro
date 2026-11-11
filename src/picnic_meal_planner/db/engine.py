@@ -33,7 +33,7 @@ def _db_url() -> str:
 
 
 # The Alembic head this code expects; tests/test_migrations.py keeps it in step.
-SCHEMA_REVISION = "0009"
+SCHEMA_REVISION = "0010"
 
 # How long a write to the API request log waits for a database lock held by
 # another connection before giving up.  sqlite3's default is 5 s, and the log

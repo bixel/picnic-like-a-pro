@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -182,9 +182,19 @@ async def get_products_in_category(
 
 
 async def upsert_category(
-    session: AsyncSession, l3_id: int, l2_id: int, name: str, l1_id: int | None = None
+    session: AsyncSession,
+    l3_id: int,
+    l2_id: int,
+    name: str,
+    l1_id: int | None = None,
+    *,
+    checked_at: str | None = None,
 ) -> bool:
     """Insert or update an L3 category; ``False`` if it was left alone.
+
+    Picnic's answer wins over the stored one: a changed name or L1 id is
+    updated (and logged).  *checked_at* is passed when the name comes from a
+    page fetched just now, and records that it was confirmed then.
 
     L3 ids are assumed to be unique across the whole catalogue.  Should a
     stored category turn up under another L2 parent, that assumption is wrong
@@ -193,7 +203,7 @@ async def upsert_category(
     """
     stored = await session.get(Category, l3_id)
     if stored is None:
-        session.add(Category(id=l3_id, l2_id=l2_id, l1_id=l1_id, name=name))
+        session.add(Category(id=l3_id, l2_id=l2_id, l1_id=l1_id, name=name, checked_at=checked_at))
         await session.flush()
         return True
     if stored.l2_id != l2_id:
@@ -203,33 +213,112 @@ async def upsert_category(
             l3_id, stored.l2_id, l2_id, name,
         )
         return False
-    stored.name = name
-    if l1_id is not None:
+    if stored.name != name:
+        logger.info("Category %s renamed from %r to %r", l3_id, stored.name, name)
+        stored.name = name
+    if l1_id is not None and stored.l1_id != l1_id:
+        if stored.l1_id is not None:
+            logger.info("Category %s moved from L1 %s to L1 %s", l3_id, stored.l1_id, l1_id)
         stored.l1_id = l1_id
+    if checked_at is not None:
+        stored.checked_at = checked_at
     return True
 
 
-async def l1_ids_missing_names(session: AsyncSession) -> list[int]:
-    """L1 ids whose own name, or the name of an L2 stored below them, is unknown."""
-    l1 = aliased(CategoryParent)
-    l2 = aliased(CategoryParent)
-    rows = await session.scalars(
-        select(Category.l1_id)
-        .distinct()
-        .outerjoin(l1, and_(l1.level == 1, l1.id == Category.l1_id))
-        .outerjoin(l2, and_(l2.level == 2, l2.id == Category.l2_id))
-        .where(Category.l1_id.is_not(None), or_(l1.name.is_(None), l2.name.is_(None)))
-        .order_by(Category.l1_id)
-    )
-    return list(rows)
+async def mark_l3s_checked(session: AsyncSession, l2_id: int, checked_at: str) -> None:
+    """Record that the L3s of *l2_id* were checked, named on the page or not.
 
-
-async def upsert_category_parent(session: AsyncSession, level: int, parent_id: int, name: str) -> None:
-    """Store the name of the L1 or L2 category *parent_id*."""
-    stmt = sqlite_insert(CategoryParent).values(level=level, id=parent_id, name=name)
+    An L3 its L2 page no longer lists keeps its name, but is not fetched again
+    until the next refresh is due.
+    """
     await session.execute(
-        stmt.on_conflict_do_update(index_elements=["level", "id"], set_={"name": stmt.excluded.name})
+        update(Category).where(Category.l2_id == l2_id).values(checked_at=checked_at)
     )
+
+
+def _due(checked_at: str | None, before: str | None) -> bool:
+    """Whether a row last checked at *checked_at* is due; ``before=None`` = never."""
+    return before is not None and (checked_at is None or checked_at < before)
+
+
+async def l1_ids_due(
+    session: AsyncSession, *, retry_before: str, refresh_before: str | None = None
+) -> dict[int, list[int]]:
+    """``{l1_id: [stored l2_ids]}`` for each L1 whose page should be fetched.
+
+    The page names the L1 and its L2s.  Due when a name was never looked up, when a lookup that found none is
+    older than *retry_before*, or when any name is older than *refresh_before*
+    (``None``: names are never refreshed).
+    """
+    pairs = (await session.execute(
+        select(Category.l1_id, Category.l2_id).distinct().where(Category.l1_id.is_not(None))
+    )).all()
+    parents = {
+        (row.level, row.id): row
+        for row in await session.scalars(select(CategoryParent))
+    }
+    wanted: dict[int, set[tuple[int, int]]] = {}
+    for l1_id, l2_id in pairs:
+        wanted.setdefault(l1_id, {(1, l1_id)}).add((2, l2_id))
+    due: dict[int, list[int]] = {}
+    for l1_id, keys in sorted(wanted.items()):
+        for key in keys:
+            row = parents.get(key)
+            if (
+                row is None
+                or (row.name is None and _due(row.checked_at, retry_before))
+                or _due(row.checked_at, refresh_before)
+            ):
+                due[l1_id] = sorted(l2 for level, l2 in keys if level == 2)
+                break
+    return due
+
+
+async def l2_pages_due(
+    session: AsyncSession, *, refresh_before: str | None, limit: int
+) -> list[tuple[int, int, int | None]]:
+    """``(l2_id, l3_id, l1_id)`` of up to *limit* L2 pages due a refresh of their L3 names.
+
+    Least recently checked first (never checked before all others).  The L3 is
+    the one checked longest ago, for the page's URL; the L1 is its stored one,
+    for L3s the page names that are not stored yet.
+    """
+    if refresh_before is None or limit <= 0:
+        return []
+    rows = (await session.execute(
+        select(Category.l2_id, Category.id, Category.l1_id, Category.checked_at)
+        .order_by(Category.checked_at.is_not(None), Category.checked_at, Category.id)
+    )).all()
+    pages: dict[int, tuple[int, int, int | None]] = {}
+    for row in rows:
+        if row.l2_id not in pages and _due(row.checked_at, refresh_before):
+            pages[row.l2_id] = (row.l2_id, row.id, row.l1_id)
+    return list(pages.values())[:limit]
+
+
+async def upsert_category_parent(
+    session: AsyncSession,
+    level: int,
+    parent_id: int,
+    name: str | None,
+    checked_at: str | None = None,
+) -> None:
+    """Store the name of the L1 or L2 category *parent_id*.
+
+    A ``None`` *name* records a lookup that found none, and keeps a name
+    stored earlier.  A changed name is updated and logged.
+    """
+    stored = await session.get(CategoryParent, (level, parent_id))
+    if stored is None:
+        session.add(CategoryParent(level=level, id=parent_id, name=name, checked_at=checked_at))
+        await session.flush()
+        return
+    if name is not None and stored.name != name:
+        if stored.name is not None:
+            logger.info("L%s category %s renamed from %r to %r", level, parent_id, stored.name, name)
+        stored.name = name
+    if checked_at is not None:
+        stored.checked_at = checked_at
 
 
 async def set_product_category(session: AsyncSession, product_id: str, category: dict) -> bool:

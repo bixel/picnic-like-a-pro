@@ -19,13 +19,33 @@ Set PICNIC_MOCK=true to swap the real Picnic API for the in-process mock
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from .. import api_log
 from . import auth
 from .auth import PicnicLoginPending, PicnicLoginRequired
+
+
+class PicnicRateLimited(RuntimeError):
+    """Picnic is refusing requests for now: a 429, or a 403 with an HTML body.
+
+    Every further request would fail the same way until the limit lifts, so a
+    caller making many requests should wait and retry, or stop.
+    ``retry_after`` is Picnic's ``Retry-After`` in seconds, when it sent one.
+    """
+
+    def __init__(self, status: int, retry_after: float | None = None) -> None:
+        self.status = status
+        self.retry_after = retry_after
+        wait = f"; retry after {retry_after:.0f} s" if retry_after is not None else ""
+        reason = "rate limited" if status == 429 else "blocked"
+        super().__init__(f"Picnic {reason} the request (HTTP {status}{wait}). Try again later.")
+
 
 __all__ = ["PicnicLoginPending", "PicnicLoginRequired"]  # re-exported for callers of this module
 
@@ -139,6 +159,52 @@ def _log_target(method: str, args: tuple) -> str | None:
     return None
 
 
+def rate_limit_of(captures) -> PicnicRateLimited | None:
+    """The rate limit or block shown by the last HTTP response, if any.
+
+    Picnic signals a rate limit with 429, and blocks with a 403 whose body is
+    an HTML page.  A 403 with a JSON body is an authentication error (handled
+    by the library), and any other status (a 404 for a product no longer
+    listed, a 5xx) concerns that one request only.
+    """
+    answered = [c for c in captures if getattr(c, "status_code", None) is not None]
+    if not answered:
+        return None
+    last = answered[-1]
+    if last.status_code == 429 or (last.status_code == 403 and not _is_json(last.response_body)):
+        return PicnicRateLimited(last.status_code, _retry_after(last.response_headers))
+    return None
+
+
+def _is_json(body: Any) -> bool:
+    if not isinstance(body, str) or not body.strip():
+        return False
+    try:
+        json.loads(body)
+    except ValueError:
+        return False
+    return True
+
+
+def _retry_after(headers: dict | None) -> float | None:
+    """``Retry-After`` in seconds: either delay-seconds or an HTTP date."""
+    value = next(
+        (v for k, v in (headers or {}).items() if k.lower() == "retry-after"), None
+    )
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
 async def _call(method: str, *args, **kwargs) -> Any:
     """Call a client method, keeping the stored token in step with the session.
 
@@ -153,6 +219,7 @@ async def _call(method: str, *args, **kwargs) -> Any:
     """
     global _client, _saved_token
     client = await get_client()
+    session = None
     try:
         async with api_log.capture_http_requests(
             api_log.PROVIDER_PICNIC,
@@ -164,9 +231,18 @@ async def _call(method: str, *args, **kwargs) -> Any:
                 getattr(client, method), *args, **kwargs
             )
             result = session.response_body
+            # The library returns a JSON 429 body as if it were the answer.
+            limited = rate_limit_of(session.captures)
+            if limited is not None:
+                raise limited
     except Exception as exc:
         from python_picnic_api2 import PicnicAuthError  # noqa: PLC0415
 
+        if not isinstance(exc, PicnicRateLimited):
+            # An HTML block makes the library fail on .json(); say what it was.
+            limited = rate_limit_of(session.captures) if session is not None else None
+            if limited is not None:
+                raise limited from exc
         if not isinstance(exc, PicnicAuthError) or _mocked():
             raise
         failed = auth.token_of(client)
@@ -317,7 +393,7 @@ def l1_names_on_page(page) -> tuple[str | None, dict[int, str]]:
         label = pml.accessibility_label(node)
         if suffix.isdigit() and label:
             names[int(suffix)] = label
-    return title or None, names
+    return (title.strip() or None) if isinstance(title, str) else None, names
 
 
 async def get_category_ids(product_id: str) -> tuple[int | None, int, int] | None:

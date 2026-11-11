@@ -27,12 +27,23 @@ name not stored yet.  Every L3 named on a fetched page is stored, so sibling
 categories cost nothing later.  A product Picnic no longer lists, or whose
 name is not on its page, is retried on the next run.
 
-The names of the L1 and L2 categories above them come last: one L1 page names
+The names of the L1 and L2 categories above them come next: one L1 page names
 the L1 and every L2 below it, so this is one request per L1 with a name still
-missing.
+missing.  A lookup that finds no name is retried after ``CATEGORY_RETRY_DAYS``,
+not on every run.
 
-A category lookup that gets a non-JSON answer (Picnic blocking requests with an
-HTML 403) stops the run's category work instead of trying every product.
+Names change, so stored ones are refreshed once they are older than
+``CATEGORY_REFRESH_DAYS``: the L1 pages above, and at most
+``CATEGORY_REFRESH_LIMIT`` L2 pages per run for the L3 names, least recently
+checked first.  A renamed category is updated and logged.
+
+Picnic signals a rate limit with HTTP 429 and blocks with a 403 whose body is
+an HTML page (``picnic.PicnicRateLimited``).  The category lookups then wait
+(``Retry-After`` when sent, otherwise ``IMPORT_BACKOFF_SECONDS`` doubling) and
+retry, up to ``IMPORT_BACKOFF_RETRIES`` times; after that, or when Picnic asks
+for a wait longer than ``_MAX_BACKOFF_SECONDS``, the run's category work stops.
+Any other failure (a product no longer listed, a 404 or 5xx, a page that is not
+JSON) concerns one product or page: it is skipped and retried by a later run.
 
 Every Picnic HTTP request is recorded in the ``api_requests`` table by
 ``picnic/client.py`` (best-effort; method, full URL, headers and the full
@@ -47,6 +58,11 @@ Usage:
 Environment variables (from .env):
     IMPORT_BATCH_SIZE     — deliveries fetched per batch (default 10)
     IMPORT_DELAY_SECONDS  — pause between batches (default 2)
+    IMPORT_BACKOFF_SECONDS — first wait after a rate limit (default 60, doubles)
+    IMPORT_BACKOFF_RETRIES — retries after a rate limit before stopping (default 4)
+    CATEGORY_REFRESH_DAYS — refresh category names older than this (default 30, 0 = never)
+    CATEGORY_RETRY_DAYS   — retry a lookup that found no name after this (default 7, 0 = every run)
+    CATEGORY_REFRESH_LIMIT — L2 pages refreshed per run (default 20)
     DB_PATH               — path to SQLite file (default data/picnic.db)
 """
 
@@ -55,8 +71,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-
-import requests
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 # Ensure the src package is importable when run as a script
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -75,19 +91,50 @@ from picnic_meal_planner.picnic import client as picnic
 SKIP_STATUSES = {"CANCELLED"}
 DEFER_STATUSES = {"CURRENT"}
 
-# Every further request would fail the same way.  A block is an HTML 403, which
-# the library fails to parse as JSON.
+# Every further request would fail the same way.  PicnicRateLimited gets here
+# only once the backoff has given up.
 _STOP_ERRORS = (
     picnic.PicnicLoginRequired,
     picnic.PicnicLoginPending,
-    requests.exceptions.JSONDecodeError,
+    picnic.PicnicRateLimited,
 )
 
+# A Retry-After beyond this ends the run's category work instead of waiting.
+_MAX_BACKOFF_SECONDS = 15 * 60
 
-def _stop_reason(exc: Exception) -> str:
-    if isinstance(exc, requests.exceptions.JSONDecodeError):
-        return "Picnic did not answer with JSON (blocked or rate limited?); try again later."
-    return str(exc)
+_sleep = asyncio.sleep  # replaced by the tests
+
+
+async def _with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
+    """``await func(*args)``, waiting and retrying while Picnic rate limits.
+
+    Raises :class:`picnic.PicnicRateLimited` once the retries are used up, or
+    when Picnic asks for a wait longer than ``_MAX_BACKOFF_SECONDS``.
+    """
+    retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
+    base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
+    for attempt in range(retries + 1):
+        try:
+            return await func(*args)
+        except picnic.PicnicRateLimited as exc:
+            wait = exc.retry_after if exc.retry_after is not None else base * 2**attempt
+            if attempt == retries or wait > _MAX_BACKOFF_SECONDS:
+                raise
+            print(f"  {exc} Waiting {wait:.0f} s (retry {attempt + 1}/{retries})...", flush=True)
+            await _sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _days_ago(variable: str, default: str) -> str | None:
+    """The cutoff *variable* days ago; ``None`` when it is ``0`` (never)."""
+    days = float(os.getenv(variable, default))
+    if days <= 0:
+        return None
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
 
 async def main() -> None:
@@ -103,16 +150,22 @@ async def main() -> None:
     # `api_requests`, so an import can be inspected as a single batch.
     async with api_log.request_context("import_history"):
         await import_deliveries()
-        await backfill_categories()
-        await backfill_parent_names()
+        # Each step makes more requests; none of them is worth making once
+        # Picnic has blocked the run or needs a login.
+        if await backfill_categories() and await backfill_parent_names():
+            await refresh_category_names()
     # The scheduled import is the log's retention owner (API_LOG_RETENTION_DAYS).
     removed = await api_log.prune_expired()
     if removed:
         print(f"Pruned {removed} API request log row(s).")
 
 
-async def backfill_categories() -> None:
-    """Fill in the category of every stored product without one."""
+async def backfill_categories() -> bool:
+    """Fill in the category of every stored product without one.
+
+    ``False`` when it stopped early (rate limit, login), so the run's other
+    category lookups are skipped as well.
+    """
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
@@ -122,7 +175,7 @@ async def backfill_categories() -> None:
         # L3 is already named costs one request instead of two.
         names = await db.get_category_names(conn)
     if not product_ids:
-        return
+        return True
     print(f"\nLooking up categories for {len(product_ids)} product(s)...")
 
     # L2 pages already fetched this run, keyed with the L3 in their URL: it is
@@ -135,13 +188,13 @@ async def backfill_categories() -> None:
         siblings: dict[int, tuple[int | None, int, str]] = {}  # l3_id -> (l1_id, l2_id, name)
         for product_id in product_ids[i : i + batch_size]:
             try:
-                ids = await picnic.get_category_ids(product_id)
+                ids = await _with_backoff(picnic.get_category_ids, product_id)
                 if ids is None:
                     continue
                 l1_id, l2_id, l3_id = ids
                 if l3_id not in names and (l2_id, l3_id) not in fetched:
                     fetched.add((l2_id, l3_id))
-                    on_page = await picnic.get_l3_names(l2_id, l3_id)
+                    on_page = await _with_backoff(picnic.get_l3_names, l2_id, l3_id)
                     names.update(on_page)
                     siblings.update({l3: (l1_id, l2_id, name) for l3, name in on_page.items()})
             except _STOP_ERRORS as exc:
@@ -155,14 +208,15 @@ async def backfill_categories() -> None:
                     "l1_id": l1_id, "l2_id": l2_id, "l3_id": l3_id, "name": names[l3_id],
                 }
 
+        checked = _now()
         async with db.get_db() as conn:
             for l3_id, (l1_id, l2_id, name) in siblings.items():
-                await db.upsert_category(conn, l3_id, l2_id, name, l1_id)
+                await db.upsert_category(conn, l3_id, l2_id, name, l1_id, checked_at=checked)
             for product_id, category in categories.items():
                 found += await db.set_product_category(conn, product_id, category)
             await conn.commit()
         if stop_error:
-            print(f"  Stopped: {_stop_reason(stop_error)}", file=sys.stderr)
+            print(f"  Stopped: {stop_error}", file=sys.stderr)
             break
         print(f"  {min(i + batch_size, len(product_ids))}/{len(product_ids)} checked", flush=True)
 
@@ -172,36 +226,87 @@ async def backfill_categories() -> None:
     print(f"Categories found for {found} of {len(product_ids)} product(s).")
     if found < len(product_ids):
         print("The rest will be retried on the next run.")
+    return stop_error is None
 
 
-async def backfill_parent_names() -> None:
-    """Fill in the names of the L1 and L2 categories above the stored L3s."""
+async def backfill_parent_names() -> bool:
+    """Look up the L1 and L2 names that are missing, or due a retry or refresh.
+
+    ``False`` when it stopped early (rate limit, login).
+    """
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
     async with db.get_db() as conn:
-        l1_ids = await db.l1_ids_missing_names(conn)
-    if not l1_ids:
-        return
-    print(f"\nLooking up names for {len(l1_ids)} L1 categor(y/ies)...")
+        due = await db.l1_ids_due(
+            conn,
+            retry_before=_days_ago("CATEGORY_RETRY_DAYS", "7") or _now(),
+            refresh_before=_days_ago("CATEGORY_REFRESH_DAYS", "30"),
+        )
+    if not due:
+        return True
+    print(f"\nLooking up names for {len(due)} L1 categor(y/ies)...")
 
-    for done, l1_id in enumerate(l1_ids, start=1):
+    for done, (l1_id, stored_l2_ids) in enumerate(due.items(), start=1):
         try:
-            l1_name, l2_names = await picnic.get_l1_names(l1_id)
+            l1_name, l2_names = await _with_backoff(picnic.get_l1_names, l1_id)
         except _STOP_ERRORS as exc:
-            print(f"  Stopped: {_stop_reason(exc)}", file=sys.stderr)
-            return
+            print(f"  Stopped: {exc}", file=sys.stderr)
+            return False
         except Exception as exc:  # noqa: BLE001 — retried by the next run
             print(f"  Warning: could not look up L1 category {l1_id}: {exc}")
             continue
+        # Stamped even where the page named nothing, so an L1 without a title
+        # or an L2 its page does not list waits for CATEGORY_RETRY_DAYS.
+        checked = _now()
         async with db.get_db() as conn:
-            if l1_name:
-                await db.upsert_category_parent(conn, 1, l1_id, l1_name)
-            for l2_id, name in l2_names.items():
-                await db.upsert_category_parent(conn, 2, l2_id, name)
+            await db.upsert_category_parent(conn, 1, l1_id, l1_name, checked)
+            for l2_id in set(l2_names) | set(stored_l2_ids):
+                await db.upsert_category_parent(conn, 2, l2_id, l2_names.get(l2_id), checked)
             await conn.commit()
-        if done % batch_size == 0 and done < len(l1_ids):
+        if done % batch_size == 0 and done < len(due):
             await asyncio.sleep(delay_seconds)
+    return True
+
+
+async def refresh_category_names() -> bool:
+    """Fetch the L2 pages whose L3 names are due a refresh, oldest first.
+
+    At most ``CATEGORY_REFRESH_LIMIT`` pages per run, so a large backlog (every
+    category after the 0010 migration) is spread over several runs.
+    ``False`` when it stopped early (rate limit, login).
+    """
+    batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
+    delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
+
+    async with db.get_db() as conn:
+        pages = await db.l2_pages_due(
+            conn,
+            refresh_before=_days_ago("CATEGORY_REFRESH_DAYS", "30"),
+            limit=int(os.getenv("CATEGORY_REFRESH_LIMIT", "20")),
+        )
+    if not pages:
+        return True
+    print(f"\nRefreshing category names on {len(pages)} L2 page(s)...")
+
+    for done, (l2_id, l3_id, l1_id) in enumerate(pages, start=1):
+        try:
+            on_page = await _with_backoff(picnic.get_l3_names, l2_id, l3_id)
+        except _STOP_ERRORS as exc:
+            print(f"  Stopped: {exc}", file=sys.stderr)
+            return False
+        except Exception as exc:  # noqa: BLE001 — retried by the next run
+            print(f"  Warning: could not refresh L2 category {l2_id}: {exc}")
+            continue
+        checked = _now()
+        async with db.get_db() as conn:
+            for l3, name in on_page.items():
+                await db.upsert_category(conn, l3, l2_id, name, l1_id, checked_at=checked)
+            await db.mark_l3s_checked(conn, l2_id, checked)
+            await conn.commit()
+        if done % batch_size == 0 and done < len(pages):
+            await asyncio.sleep(delay_seconds)
+    return True
 
 
 async def import_deliveries() -> None:

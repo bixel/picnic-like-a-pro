@@ -478,7 +478,7 @@
       "unique-id": "picnic-client",
       "node-type": "service",
       "name": "Picnic client",
-      "description": "Async wrapper around the synchronous python-picnic-api2 (thread-pool executor), converting pydantic models to dicts. auth.py owns the session-token-first login policy and the 2FA LoginFlow; _call() keeps the stored token current and turns a rejected token into PicnicLoginRequired. Category lookups read the product page and the L2 category page. Every HTTP call is captured by api_log. PICNIC_MOCK=true swaps in the mock.",
+      "description": "Async wrapper around the synchronous python-picnic-api2 (thread-pool executor), converting pydantic models to dicts. auth.py owns the session-token-first login policy and the 2FA LoginFlow; _call() keeps the stored token current, turns a rejected token into PicnicLoginRequired, and a 429 or an HTML 403 into PicnicRateLimited. Category lookups read the product page and the L2 category page. Every HTTP call is captured by api_log. PICNIC_MOCK=true swaps in the mock.",
       "interfaces": [
         {
           "unique-id": "picnic-functions",
@@ -747,7 +747,7 @@
       "unique-id": "import-history-job",
       "node-type": "service",
       "name": "History import script",
-      "description": "Re-runnable, rate-limit-safe import of past Picnic deliveries into orders/order_items, then a category backfill for products without a category_id, then prunes the API log. Idle runs write no orders or checkpoints.",
+      "description": "Re-runnable, rate-limit-safe import of past Picnic deliveries into orders/order_items, then a category backfill for products without a category_id, L1/L2 name lookups and a capped refresh of stale names (each skipped once Picnic rate limits past the backoff), then prunes the API log. Idle runs write no orders or checkpoints.",
       "metadata": {
         "code": [
           "scripts/import_history.py"
@@ -1710,12 +1710,12 @@
         {
           "relationship-unique-id": "import-fetches-deliveries",
           "sequence-number": 7,
-          "description": "Category backfill: get_category_ids for products without a category_id, get_l3_names once per unknown L3, and get_l1_names per L1 with a name still missing."
+          "description": "Category backfill: get_category_ids for products without a category_id, get_l3_names once per unknown L3, get_l1_names per L1 with a name missing or due a retry/refresh, and get_l3_names per L2 page due a refresh (CATEGORY_REFRESH_LIMIT per run); a rate limit backs off and retries."
         },
         {
           "relationship-unique-id": "import-writes-orders",
           "sequence-number": 8,
-          "description": "upsert_category stores every L3 named on the page, set_product_category links the product, and upsert_category_parent stores the L1 and L2 names."
+          "description": "upsert_category stores every L3 named on the page, set_product_category links the product, upsert_category_parent stores the L1 and L2 names, and checked_at records when each name was confirmed."
         },
         {
           "relationship-unique-id": "import-uses-log",

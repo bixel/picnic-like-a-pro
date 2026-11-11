@@ -31,6 +31,8 @@ class Category(Base):
     l2_id: Mapped[int] = mapped_column(Integer, nullable=False)
     l1_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
+    # When a fetched L2 page last confirmed the name; NULL = never.
+    checked_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
     products: Mapped[list[Product]] = relationship(back_populates="category_ref")
 
@@ -45,7 +47,10 @@ class CategoryParent(Base):
 
     level: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # 1 or 2
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    name: Mapped[str] = mapped_column(String, nullable=False)
+    # NULL: looked up, but the L1 page gave no name.
+    name: Mapped[str | None] = mapped_column(String, nullable=True)
+    # When an L1 page was last fetched for it; NULL = never.
+    checked_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Product(Base):

@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.models import Category, Order, Product
+from picnic_meal_planner.db.models import Category, CategoryParent, Order, Product
 
 
 def _now_iso() -> str:
@@ -145,18 +145,19 @@ class TestProductCategories:
         assert await db.products_without_category(db_session) == ["p_b"]
 
     async def test_lists_the_names_of_the_parents(self, db_session):
+        now = "2026-11-11T00:00:00+00:00"
         await db.upsert_product(db_session, {**SAMPLE_PRODUCT, "id": "p_a"})
         await db.set_product_category(
             db_session, "p_a", {"l1_id": 1, "l2_id": 2, "l3_id": 3, "name": "Honig"}
         )
-        assert await db.l1_ids_missing_names(db_session) == [1]
+        assert await db.l1_ids_due(db_session, retry_before=now) == {1: [2]}
 
-        await db.upsert_category_parent(db_session, 1, 1, "Fruehstueck")
-        assert await db.l1_ids_missing_names(db_session) == [1]   # the L2 is unnamed
+        await db.upsert_category_parent(db_session, 1, 1, "Fruehstueck", now)
+        assert await db.l1_ids_due(db_session, retry_before=now) == {1: [2]}   # L2 unnamed
 
-        await db.upsert_category_parent(db_session, 2, 2, "Aufstrich")
-        await db.upsert_category_parent(db_session, 2, 2, "Aufstriche")
-        assert await db.l1_ids_missing_names(db_session) == []
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstrich", now)
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstriche", now)
+        assert await db.l1_ids_due(db_session, retry_before=now) == {}
         [listed] = await db.get_categories(db_session)
         assert (listed["l1_name"], listed["l2_name"], listed["name"]) == (
             "Fruehstueck", "Aufstriche", "Honig",
@@ -164,7 +165,51 @@ class TestProductCategories:
 
     async def test_an_unknown_l1_is_not_looked_up(self, db_session):
         await db.upsert_category(db_session, 3, 2, "Honig")
-        assert await db.l1_ids_missing_names(db_session) == []
+        assert await db.l1_ids_due(db_session, retry_before="9999") == {}
+
+    async def test_a_lookup_without_a_name_waits_for_the_retry(self, db_session):
+        await db.upsert_category(db_session, 3, 2, "Honig", 1)
+        await db.upsert_category_parent(db_session, 1, 1, None, "2026-11-01")
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstrich", "2026-11-01")
+        assert await db.l1_ids_due(db_session, retry_before="2026-10-01") == {}
+        assert await db.l1_ids_due(db_session, retry_before="2026-11-02") == {1: [2]}
+
+    async def test_a_missing_name_keeps_the_stored_one(self, db_session):
+        await db.upsert_category_parent(db_session, 1, 1, "Fruehstueck", "2026-11-01")
+        await db.upsert_category_parent(db_session, 1, 1, None, "2026-11-10")
+        stored = await db_session.get(CategoryParent, (1, 1))
+        assert (stored.name, stored.checked_at) == ("Fruehstueck", "2026-11-10")
+
+    async def test_names_are_refreshed_once_stale(self, db_session):
+        await db.upsert_category(db_session, 3, 2, "Honig", 1, checked_at="2026-10-01")
+        await db.upsert_category(db_session, 4, 2, "Marmelade", 1, checked_at="2026-11-01")
+        await db.upsert_category(db_session, 5, 6, "Brot", None)
+        await db.upsert_category_parent(db_session, 1, 1, "Fruehstueck", "2026-10-01")
+        await db.upsert_category_parent(db_session, 2, 2, "Aufstrich", "2026-11-01")
+
+        assert await db.l1_ids_due(
+            db_session, retry_before="2026-10-01", refresh_before="2026-09-01"
+        ) == {}
+        assert await db.l1_ids_due(
+            db_session, retry_before="2026-10-01", refresh_before="2026-10-15"
+        ) == {1: [2]}
+        # Never checked first, then the oldest L3 of each L2.
+        assert await db.l2_pages_due(db_session, refresh_before="2026-10-15", limit=5) == [
+            (6, 5, None), (2, 3, 1),
+        ]
+        assert await db.l2_pages_due(db_session, refresh_before="2026-10-15", limit=1) == [
+            (6, 5, None),
+        ]
+        assert await db.l2_pages_due(db_session, refresh_before=None, limit=5) == []
+
+    async def test_a_rename_is_logged(self, db_session, caplog):
+        caplog.set_level("INFO", logger="picnic_meal_planner.db.queries")
+        await db.upsert_category(db_session, 3, 2, "Honig", 1)
+        assert await db.upsert_category(db_session, 3, 2, "Bienenhonig", 7, checked_at="t")
+        stored = await db_session.get(Category, 3)
+        assert (stored.name, stored.l1_id, stored.checked_at) == ("Bienenhonig", 7, "t")
+        assert "renamed from 'Honig' to 'Bienenhonig'" in caplog.text
+        assert "moved from L1 1 to L1 7" in caplog.text
 
     async def test_products_without_a_category_are_not_listed(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)

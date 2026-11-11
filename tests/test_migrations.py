@@ -349,18 +349,47 @@ class TestCategoryParentsMigration:
         self._sql(
             db_file,
             "INSERT INTO categories (id, l2_id, l1_id, name) VALUES "
-            "(30, 20, 1, 'Pils'), (31, 20, NULL, 'Alkoholfrei'), (40, 21, NULL, 'Honig')",
+            "(30, 20, 1, 'Pils'), (31, 20, NULL, 'Alkoholfrei'), (40, 21, NULL, 'Honig'), "
+            "(50, 22, 1, 'A'), (51, 22, 5, 'B'), (52, 22, NULL, 'C')",
         )
 
         command.upgrade(_alembic_config(), "0009")
         rows = self._sql(db_file, "SELECT id, l1_id FROM categories ORDER BY id")
-        # 40 has no sibling that knows its L1, so it stays unknown.
-        assert rows == [{"id": 30, "l1_id": 1}, {"id": 31, "l1_id": 1}, {"id": 40, "l1_id": None}]
+        # 40 has no sibling that knows its L1, and 52's siblings disagree.
+        assert rows == [
+            {"id": 30, "l1_id": 1}, {"id": 31, "l1_id": 1}, {"id": 40, "l1_id": None},
+            {"id": 50, "l1_id": 1}, {"id": 51, "l1_id": 5}, {"id": 52, "l1_id": None},
+        ]
 
         command.downgrade(_alembic_config(), "0008")
         tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "category_parents" not in tables
         assert self._sql(db_file, "SELECT l1_id FROM categories WHERE id = 31") == [{"l1_id": 1}]
+
+
+class TestCategoryCheckedAtMigration:
+    def test_adds_checked_at_and_rolls_back(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0009")
+        sql = TestCategoryParentsMigration._sql
+        sql(
+            None, db_file,
+            "INSERT INTO categories (id, l2_id, l1_id, name) VALUES (30, 20, 1, 'Pils')",
+            "INSERT INTO category_parents (level, id, name) VALUES (1, 1, 'Getraenke')",
+        )
+
+        command.upgrade(_alembic_config(), "0010")
+        assert sql(None, db_file, "SELECT checked_at FROM categories") == [{"checked_at": None}]
+        sql(None, db_file, "INSERT INTO category_parents (level, id, name, checked_at) "
+                           "VALUES (2, 20, NULL, '2026-11-11')")
+
+        command.downgrade(_alembic_config(), "0009")
+        assert sql(None, db_file, "SELECT level, id, name FROM category_parents") == [
+            {"level": 1, "id": 1, "name": "Getraenke"},
+        ]
+        columns = sql(None, db_file, "SELECT name FROM pragma_table_info('categories')")
+        assert "checked_at" not in {c["name"] for c in columns}
 
 
 def test_schema_revision_is_the_alembic_head():

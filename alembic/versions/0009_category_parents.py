@@ -6,7 +6,8 @@ stays the only copy of an L3 name.
 
 Also fills ``categories.l1_id`` where it is NULL: L3s stored from an L2 page,
 rather than through a product's link, were saved without one.  Every L3 of an
-L2 shares its L1, so the id is taken from a sibling.
+L2 shares its L1, so the id is taken from a sibling — only when the
+siblings that know one all agree.
 
 Rolling back drops the table and keeps the filled ids, which are correct.
 
@@ -36,10 +37,14 @@ def upgrade() -> None:
         sa.Column("name", sa.String(), nullable=False),
         sa.PrimaryKeyConstraint("level", "id"),
     )
+    # Only where the siblings agree: an L2 seen under two L1s is left for the
+    # backfill to settle from a product's own link.
     op.execute(
         "UPDATE categories SET l1_id = "
-        "(SELECT max(c.l1_id) FROM categories c WHERE c.l2_id = categories.l2_id) "
-        "WHERE l1_id IS NULL"
+        "(SELECT min(c.l1_id) FROM categories c WHERE c.l2_id = categories.l2_id) "
+        "WHERE l1_id IS NULL AND ("
+        "SELECT count(DISTINCT c.l1_id) FROM categories c WHERE c.l2_id = categories.l2_id"
+        ") = 1"
     )
 
 
