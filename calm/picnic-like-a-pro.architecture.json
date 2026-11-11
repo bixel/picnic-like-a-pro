@@ -1921,7 +1921,7 @@
         {
           "relationship-unique-id": "import-fetches-deliveries",
           "sequence-number": 7,
-          "description": "Category backfill: get_category_ids for products without a category_id, get_l3_names once per unknown L3, get_l1_names per L1 with a name missing or due a retry/refresh, and get_l3_names per L2 page due a refresh (CATEGORY_REFRESH_LIMIT per run); a rate limit backs off and retries."
+          "description": "Category backfill: get_category_ids for products without a category_id, get_l3_names once per unknown L3, get_l1_names per L1 with a name missing or due a retry/refresh, and get_l3_names per L2 page due a refresh, at most CATEGORY_REFRESH_LIMIT per run. A rate limit backs off and retries."
         },
         {
           "relationship-unique-id": "import-writes-orders",

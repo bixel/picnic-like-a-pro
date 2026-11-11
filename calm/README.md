@@ -27,7 +27,7 @@ calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/c
   --export-diagrams png        # optional; needs a Chromium (add --browser-path if it isn't found)
 ```
 
-Keep relationship descriptions free of `(` `)` and `;`: docify shows parentheses in edge labels as
+Keep relationship and flow-transition descriptions free of `(` `)` and `;`: docify shows parentheses in edge labels as
 HTML entities, and Mermaid reads `;` in a sequence-diagram message as a line break.
 
 When the code changes, update the JSON in the same PR. Each node's `metadata.code` lists the files
