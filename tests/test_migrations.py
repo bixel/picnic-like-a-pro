@@ -118,6 +118,7 @@ class TestMigrationRuns:
             "picnic_auth",
             "api_requests",
             "categories",
+            "category_parents",
         }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):
@@ -321,6 +322,74 @@ class TestCategoryMigration:
         assert rows == [{"id": "p_a", "category": "Milch"}, {"id": "p_b", "category": None}]
         tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "categories" not in tables
+
+
+# ---------------------------------------------------------------------------
+# 0009: names of the L1 and L2 categories
+# ---------------------------------------------------------------------------
+
+class TestCategoryParentsMigration:
+    def _sql(self, db_file: Path, *statements: str) -> list[dict]:
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            with engine.begin() as conn:
+                rows = []
+                for sql in statements:
+                    result = conn.exec_driver_sql(sql)
+                    if result.returns_rows:
+                        rows = [dict(r._mapping) for r in result]
+                return rows
+        finally:
+            engine.dispose()
+
+    def test_fills_l1_ids_from_siblings_and_rolls_back(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0008")
+        self._sql(
+            db_file,
+            "INSERT INTO categories (id, l2_id, l1_id, name) VALUES "
+            "(30, 20, 1, 'Pils'), (31, 20, NULL, 'Alkoholfrei'), (40, 21, NULL, 'Honig'), "
+            "(50, 22, 1, 'A'), (51, 22, 5, 'B'), (52, 22, NULL, 'C')",
+        )
+
+        command.upgrade(_alembic_config(), "0009")
+        rows = self._sql(db_file, "SELECT id, l1_id FROM categories ORDER BY id")
+        # 40 has no sibling that knows its L1, and 52's siblings disagree.
+        assert rows == [
+            {"id": 30, "l1_id": 1}, {"id": 31, "l1_id": 1}, {"id": 40, "l1_id": None},
+            {"id": 50, "l1_id": 1}, {"id": 51, "l1_id": 5}, {"id": 52, "l1_id": None},
+        ]
+
+        command.downgrade(_alembic_config(), "0008")
+        tables = {r["name"] for r in self._sql(db_file, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "category_parents" not in tables
+        assert self._sql(db_file, "SELECT l1_id FROM categories WHERE id = 31") == [{"l1_id": 1}]
+
+
+class TestCategoryCheckedAtMigration:
+    def test_adds_checked_at_and_rolls_back(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old.db"
+        monkeypatch.setenv("DB_PATH", str(db_file))
+        command.upgrade(_alembic_config(), "0009")
+        sql = TestCategoryParentsMigration._sql
+        sql(
+            None, db_file,
+            "INSERT INTO categories (id, l2_id, l1_id, name) VALUES (30, 20, 1, 'Pils')",
+            "INSERT INTO category_parents (level, id, name) VALUES (1, 1, 'Getraenke')",
+        )
+
+        command.upgrade(_alembic_config(), "0010")
+        assert sql(None, db_file, "SELECT checked_at FROM categories") == [{"checked_at": None}]
+        sql(None, db_file, "INSERT INTO category_parents (level, id, name, checked_at) "
+                           "VALUES (2, 20, NULL, '2026-11-11')")
+
+        command.downgrade(_alembic_config(), "0009")
+        assert sql(None, db_file, "SELECT level, id, name FROM category_parents") == [
+            {"level": 1, "id": 1, "name": "Getraenke"},
+        ]
+        columns = sql(None, db_file, "SELECT name FROM pragma_table_info('categories')")
+        assert "checked_at" not in {c["name"] for c in columns}
 
 
 def test_schema_revision_is_the_alembic_head():

@@ -10,10 +10,17 @@ import importlib.util
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+import requests
+from sqlalchemy import func, select, update
 
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.models import ImportCheckpoint, Order, OrderItem
+from picnic_meal_planner.db.models import (
+    Category,
+    CategoryParent,
+    ImportCheckpoint,
+    Order,
+    OrderItem,
+)
 from picnic_meal_planner.picnic import client as picnic
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "import_history.py"
@@ -35,9 +42,20 @@ def fake_picnic(monkeypatch):
     """Summaries and details the test can change between runs."""
     monkeypatch.setenv("IMPORT_DELAY_SECONDS", "0")
     # categories: product id -> L3 name (ids 1/2/3), (l1, l2, l3) ids, or an
-    # exception.  pages: (l2, l3) -> {l3: name} on that L2 page, or an
-    # exception; unset pages name the L3 given as a string in categories.
-    state = {"summaries": [], "details": {}, "categories": {}, "pages": {}, "l2_requests": []}
+    # exception; a list is answered one entry per request.  pages: (l2, l3) ->
+    # {l3: name} on that L2 page, or an exception; unset pages name the L3
+    # given as a string in categories.  l1_pages: l1 id -> (l1 name, {l2:
+    # name}) or an exception.  *_requests record what was asked, sleeps every
+    # backoff wait.
+    state = {
+        "summaries": [], "details": {}, "categories": {}, "pages": {}, "l2_requests": [],
+        "l1_pages": {}, "l1_requests": [], "category_requests": [], "sleeps": [],
+    }
+
+    async def sleep(seconds):
+        state["sleeps"].append(seconds)
+
+    monkeypatch.setattr(import_history, "_sleep", sleep)
 
     async def get_deliveries():
         return list(state["summaries"])
@@ -49,7 +67,10 @@ def fake_picnic(monkeypatch):
         return detail
 
     async def get_category_ids(product_id):
+        state["category_requests"].append(product_id)
         category = state["categories"].get(product_id)
+        if isinstance(category, list):
+            category = category.pop(0)
         if isinstance(category, Exception):
             raise category
         if isinstance(category, str):
@@ -64,6 +85,14 @@ def fake_picnic(monkeypatch):
             raise page
         return dict(page)
 
+    async def get_l1_names(l1_id):
+        state["l1_requests"].append(l1_id)
+        page = state["l1_pages"].get(l1_id, (None, {}))
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    monkeypatch.setattr(picnic, "get_l1_names", get_l1_names)
     monkeypatch.setattr(picnic, "get_deliveries", get_deliveries)
     monkeypatch.setattr(picnic, "get_category_ids", get_category_ids)
     monkeypatch.setattr(picnic, "get_l3_names", get_l3_names)
@@ -266,6 +295,196 @@ async def test_login_error_stops_the_backfill(fake_picnic, capsys):
     await import_history.main()
     assert await _category("p_milk") is None
     assert "Stopped: log in" in capsys.readouterr().err
+
+
+def _not_json() -> requests.exceptions.JSONDecodeError:
+    return requests.exceptions.JSONDecodeError("Expecting value", "<html>404</html>", 0)
+
+
+def _limited(retry_after=None) -> picnic.PicnicRateLimited:
+    return picnic.PicnicRateLimited(429, retry_after)
+
+
+async def test_a_page_that_is_not_json_skips_only_that_product(fake_picnic, capsys):
+    await _seed_products("p_a", "p_b", "p_c")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": _not_json(), "p_c": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    assert await import_history.backfill_categories()
+
+    assert fake_picnic["category_requests"] == ["p_a", "p_b", "p_c"]
+    assert (await _category("p_a"), await _category("p_c")) == ("Pils", "Pils")
+    assert "could not look up category of p_b" in capsys.readouterr().out
+
+
+async def test_a_rate_limit_waits_and_retries(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": [_limited(), _limited(7), (1, 20, 30)]}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    assert await import_history.backfill_categories()
+
+    # IMPORT_BACKOFF_SECONDS (60) first, then Picnic's Retry-After.
+    assert fake_picnic["sleeps"] == [60, 7]
+    assert await _category("p_a") == "Pils"
+
+
+async def test_a_lasting_rate_limit_stops_every_category_lookup(fake_picnic, monkeypatch, capsys):
+    monkeypatch.setenv("IMPORT_BACKOFF_RETRIES", "2")
+    monkeypatch.setenv("IMPORT_BACKOFF_SECONDS", "10")
+    fake_picnic["summaries"] = [{"id": "d1", "status": "COMPLETED"}]
+    fake_picnic["details"] = {"d1": _detail("d1")}
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": _limited()}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    await import_history.main()
+
+    assert fake_picnic["sleeps"] == [10, 20]
+    assert fake_picnic["category_requests"] == ["p_a", "p_b", "p_b", "p_b"]
+    assert await _category("p_a") == "Pils"     # what came before the block is kept
+    assert "Stopped: Picnic rate limited" in capsys.readouterr().err
+    # Neither the parent names nor the refresh ask a blocking server.
+    assert fake_picnic["l1_requests"] == []
+    assert fake_picnic["l2_requests"] == [(20, 30)]
+
+
+async def test_a_long_retry_after_stops_without_waiting(fake_picnic, capsys):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": _limited(3600)}
+    assert not await import_history.backfill_categories()
+    assert fake_picnic["sleeps"] == []
+    assert "retry after 3600 s" in capsys.readouterr().err
+
+
+async def test_siblings_get_the_l1_of_the_product_that_found_them(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils", 31: "Alkoholfrei"}}
+    await import_history.backfill_categories()
+    async with db.get_db() as conn:
+        assert (await conn.get(Category, 31)).l1_id == 1
+
+
+async def test_parent_names_are_filled_in_once(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    fake_picnic["l1_pages"] = {1: ("Getraenke", {20: "Bier", 21: "Wein"})}
+    await import_history.backfill_categories()
+    await import_history.backfill_parent_names()
+
+    async with db.get_db() as conn:
+        [listed] = await db.get_categories(conn)
+    assert (listed["l1_name"], listed["l2_name"]) == ("Getraenke", "Bier")
+
+    await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1]
+
+
+async def _l1_ids_due() -> list[int]:
+    async with db.get_db() as conn:
+        return list(await db.l1_ids_due(conn, retry_before=import_history._now()))
+
+
+async def test_a_parent_lookup_failure_is_retried_and_a_block_stops(fake_picnic, capsys):
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": (2, 21, 31)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}, (21, 31): {31: "Rot"}}
+    await import_history.backfill_categories()
+
+    fake_picnic["l1_pages"] = {1: ConnectionError("boom"), 2: ("Wein", {21: "Rotwein"})}
+    assert await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1, 2]
+    assert await _l1_ids_due() == [1]
+
+    fake_picnic["l1_requests"].clear()
+    fake_picnic["l1_pages"][1] = picnic.PicnicRateLimited(403, 3600)
+    assert not await import_history.backfill_parent_names()
+    assert "Stopped: Picnic blocked" in capsys.readouterr().err
+
+
+async def _age_checks(days: int) -> None:
+    """Make every stored check *days* older."""
+    from datetime import UTC, datetime, timedelta
+
+    then = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    async with db.get_db() as conn:
+        await conn.execute(update(Category).values(checked_at=then))
+        await conn.execute(update(CategoryParent).values(checked_at=then))
+        await conn.commit()
+
+
+async def test_a_page_without_names_is_retried_only_after_a_while(fake_picnic):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    await import_history.backfill_categories()
+
+    # No title, and L2 20 is not listed.
+    fake_picnic["l1_pages"] = {1: (None, {21: "Wein"})}
+    await import_history.backfill_parent_names()
+    await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1]
+
+    await _age_checks(8)   # past CATEGORY_RETRY_DAYS (7)
+    fake_picnic["l1_pages"] = {1: ("Getraenke", {20: "Bier"})}
+    await import_history.backfill_parent_names()
+    assert fake_picnic["l1_requests"] == [1, 1]
+    async with db.get_db() as conn:
+        [listed] = await db.get_categories(conn)
+    assert (listed["l1_name"], listed["l2_name"]) == ("Getraenke", "Bier")
+
+
+async def test_stale_names_are_refreshed(fake_picnic, monkeypatch):
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils", 31: "Alkoholfrei"}}
+    fake_picnic["l1_pages"] = {1: ("Getraenke", {20: "Bier"})}
+    await import_history.main()
+    assert fake_picnic["l2_requests"] == [(20, 30)]   # fresh: no refresh yet
+
+    await _age_checks(31)  # past CATEGORY_REFRESH_DAYS (30)
+    fake_picnic["pages"] = {(20, 30): {30: "Pilsener", 32: "Radler"}}
+    fake_picnic["l1_pages"] = {1: ("Getränke", {20: "Biere"})}
+    await import_history.main()
+
+    async with db.get_db() as conn:
+        [listed] = await db.get_categories(conn)
+        names = await db.get_category_names(conn)
+        radler = await conn.get(Category, 32)
+    assert (listed["l1_name"], listed["l2_name"], listed["name"]) == ("Getränke", "Biere", "Pilsener")
+    # A name the page no longer lists is kept; a new sibling gets the L1.
+    assert names == {30: "Pilsener", 31: "Alkoholfrei", 32: "Radler"}
+    assert radler.l1_id == 1
+
+    fake_picnic["l2_requests"].clear()
+    fake_picnic["l1_requests"].clear()
+    await import_history.main()
+    assert (fake_picnic["l2_requests"], fake_picnic["l1_requests"]) == ([], [])
+
+
+async def test_the_refresh_is_limited_per_run(fake_picnic, monkeypatch):
+    monkeypatch.setenv("CATEGORY_REFRESH_LIMIT", "1")
+    await _seed_products("p_a", "p_b")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30), "p_b": (1, 21, 31)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}, (21, 31): {31: "Rot"}}
+    await import_history.backfill_categories()
+    await _age_checks(31)
+
+    fake_picnic["l2_requests"].clear()
+    await import_history.refresh_category_names()
+    await import_history.refresh_category_names()
+    assert sorted(fake_picnic["l2_requests"]) == [(20, 30), (21, 31)]
+
+
+async def test_no_refresh_when_disabled(fake_picnic, monkeypatch):
+    monkeypatch.setenv("CATEGORY_REFRESH_DAYS", "0")
+    await _seed_products("p_a")
+    fake_picnic["categories"] = {"p_a": (1, 20, 30)}
+    fake_picnic["pages"] = {(20, 30): {30: "Pils"}}
+    await import_history.backfill_categories()
+    await _age_checks(365)
+    fake_picnic["l2_requests"].clear()
+    await import_history.refresh_category_names()
+    assert fake_picnic["l2_requests"] == []
 
 
 async def test_all_picnic_requests_of_a_run_share_one_log_batch(monkeypatch):

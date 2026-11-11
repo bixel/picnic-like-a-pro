@@ -67,7 +67,7 @@ hops (`metadata.transport: "in-process call"`).
 | `forecasting-engine` | service | `forecasting/engine.py` | pure functions, no I/O |
 | `db-access-layer` | service | `db/engine.py`, `db/models.py`, `db/queries.py`, `alembic/` | the only code that touches SQLAlchemy; two engines on one file (`get_db`, and `get_log_db` with a 0.2 s lock timeout) |
 | `sqlite-db` | database | the file at `DB_PATH` | shared by every process in the container |
-| `order-history` | data-asset | tables `products`, `categories`, `orders`, `order_items`, `import_checkpoints` | |
+| `order-history` | data-asset | tables `products`, `categories`, `category_parents`, `orders`, `order_items`, `import_checkpoints` | |
 | `conversation-transcripts` | data-asset | table `conversation_messages` | personal data |
 | `api-request-log` | data-asset | table `api_requests` | personal data (prompts, tool results, orders in bodies) |
 | `chat-settings` | data-asset | table `chat_settings` | |
@@ -109,7 +109,7 @@ protocol list has no SSH). In-process edges have no protocol and have `metadata.
 | Flow | Code path |
 |---|---|
 | `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged) → `history.commit_turn` |
-| `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
+| `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `backfill_parent_names` (`get_l1_names`, `upsert_category_parent`), then `refresh_category_names` (`get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
 | `picnic-2fa-login` | `bot.cmd_picnic_login` → `client.start_login` → `auth.LoginFlow.start`; `cmd_picnic_code` → `submit_login_code` → `_install` → `auth.save_token` |
 | `build-and-deploy` | `deploy.yml`: `build-and-push` job, then the `deploy` job over SSH |
 
