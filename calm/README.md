@@ -25,7 +25,12 @@ calm validate -a picnic-like-a-pro.architecture.json -u url-mapping.json --stric
 # Browsable docs site with diagrams for every node, relationship and flow.
 # docify writes a Docusaurus project, not HTML: install and serve it to browse.
 calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-docs
-cd /tmp/calm-docs && npm install && npm start    # http://localhost:3000
+cd /tmp/calm-docs
+# Workaround, needed after every docify: d3 7.9.2 is marked side-effect free, so webpack drops
+# d3-transition and hovering a diagram node throws "tooltipElem.transition is not a function".
+mkdir -p src && echo "import 'd3-transition';" > src/d3-transition.js
+perl -pi -e "s|^(\s*themes: \[)|    clientModules: [require.resolve('./src/d3-transition.js')],\n\$1|" docusaurus.config.js
+npm install && npm start    # http://localhost:3000
 
 # PNGs for diagrams/ (not for the site: its pages then point at image files Docusaurus does not serve).
 # Needs a Chromium; add --browser-path if it isn't found.
