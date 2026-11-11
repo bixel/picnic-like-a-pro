@@ -5,6 +5,7 @@ export type TimeSeries = components["schemas"]["TimeSeries"];
 export type BucketTotals = components["schemas"]["BucketTotals"];
 export type Crumb = components["schemas"]["Crumb"];
 export type Summary = components["schemas"]["Summary"];
+export type Me = components["schemas"]["Me"];
 export type Level = HierarchyNode["level"];
 export type Bucket = TimeSeries["bucket"];
 
@@ -40,9 +41,8 @@ export interface Range {
 }
 
 export const api = {
-  me: () => request<{ user_id: number }>("/api/me"),
   login: (token: string) =>
-    request<{ user_id: number }>("/api/auth/login", {
+    request<Me>("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token }),

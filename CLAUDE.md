@@ -126,13 +126,14 @@ exist, otherwise it creates them.
 > running any, so a missing column stays missing.  `MIGRATION_OPENROUTER.md`
 > step 3 shows how to tell which revision a database matches.
 >
-> The bot refuses to start (`SchemaOutOfDateError`) when
+> Every entry point (bot, MCP server, import script, web app) starts with
+> `engine.ensure_schema()` and refuses to run (`SchemaOutOfDateError`) when
 > `engine.pending_migration()` finds Alembic's revision behind
 > `engine.SCHEMA_REVISION` — checked *before* `init_db()`, which would
 > otherwise create the new tables and make `alembic upgrade head` fail with
-> "table already exists" — or when `engine.missing_columns()` reports drift,
-> and `scripts/chat_model.py` refuses to run — a stale schema would otherwise
-> silently disable history storage.
+> "table already exists" — or when `engine.missing_columns()` reports drift.
+> `scripts/chat_model.py` refuses on drift too — a stale schema would
+> otherwise silently disable history storage.
 
 ---
 

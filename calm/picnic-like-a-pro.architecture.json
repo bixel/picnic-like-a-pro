@@ -553,20 +553,20 @@
       "unique-id": "db-access-layer",
       "node-type": "service",
       "name": "Database access layer",
-      "description": "SQLAlchemy 2.0 async engine and session factory (PRAGMA foreign_keys=ON on every connection), ORM models, and commit-neutral query helpers that return plain dicts. Two engines on the same file: get_db() for everything and get_log_db() with a 0.2 s lock timeout for the API log. Startup gates: pending_migration(), missing_columns(), init_db().",
+      "description": "SQLAlchemy 2.0 async engine and session factory (PRAGMA foreign_keys=ON on every connection), ORM models, and commit-neutral query helpers that return plain dicts. Two engines on the same file: get_db() for everything and get_log_db() with a 0.2 s lock timeout for the API log. Startup gate: ensure_schema() (pending_migration, init_db, missing_columns).",
       "controls": {
         "schema-version-gate": {
-          "description": "The bot, MCP server and import script refuse to run when Alembic's revision is behind SCHEMA_REVISION (checked before init_db), and the bot also when columns are missing.",
+          "description": "The bot, MCP server, import script and web app refuse to run when Alembic's revision is behind SCHEMA_REVISION (checked before init_db) or when columns are missing.",
           "requirements": [
             {
               "requirement-url": "https://raw.githubusercontent.com/bixel/picnic-like-a-pro/main/calm/controls/integrity.requirement.json",
               "config": {
                 "control-id": "PLP-IN-03",
                 "name": "Schema version gate",
-                "description": "The bot, MCP server and import script refuse to run when Alembic's revision is behind SCHEMA_REVISION (checked before init_db), and the bot also when columns are missing.",
+                "description": "The bot, MCP server, import script and web app refuse to run when Alembic's revision is behind SCHEMA_REVISION (checked before init_db) or when columns are missing.",
                 "documented-in": "https://github.com/bixel/picnic-like-a-pro/blob/main/CLAUDE.md#development--fresh-install",
                 "failure-mode": "Process refuses to start (SchemaOutOfDateError / SystemExit)",
-                "enforced-in": "src/picnic_meal_planner/db/engine.py::pending_migration, missing_columns"
+                "enforced-in": "src/picnic_meal_planner/db/engine.py::ensure_schema"
               }
             }
           ]
@@ -809,7 +809,7 @@
       "unique-id": "reporting-web",
       "node-type": "service",
       "name": "Reporting web app",
-      "description": "FastAPI app (`uv run web`): read-only reports over the order history, the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in web/reports.py. Refuses to start when the schema is behind.",
+      "description": "FastAPI app (`uv run web`): read-only reports over the order history, redeeming the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in web/reports.py. Refuses to start when the schema is behind.",
       "interfaces": [
         {
           "unique-id": "reports-http",
@@ -825,12 +825,6 @@
             "/api/me",
             "/api/hierarchy",
             "/api/timeseries"
-          ]
-        },
-        {
-          "unique-id": "login-links",
-          "functions": [
-            "web.login.create_login_link"
           ]
         }
       ],
@@ -1748,17 +1742,14 @@
     },
     {
       "unique-id": "bot-creates-login-link",
-      "description": "/report stores a hashed one-time token and replies with the link.",
+      "description": "/report calls web.login.create_login_link, which stores a hashed one-time token in web_login_tokens, and replies with the link. The web app is another process: the shared database (same DB_PATH) is the only hand-off between the two.",
       "relationship-type": {
         "connects": {
           "source": {
             "node": "telegram-bot"
           },
           "destination": {
-            "node": "reporting-web",
-            "interfaces": [
-              "login-links"
-            ]
+            "node": "db-access-layer"
           }
         }
       },
@@ -1768,7 +1759,7 @@
     },
     {
       "unique-id": "reports-query-db",
-      "description": "Reads orders, order lines, products and categories. Creates and consumes login tokens.",
+      "description": "Reads orders, order lines, products and categories. Consumes the login tokens the bot stored.",
       "relationship-type": {
         "connects": {
           "source": {

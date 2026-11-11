@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from .. import access
 from ..db import queries as db
-from ..db.engine import SCHEMA_REVISION, init_db, missing_columns, pending_migration
+from ..db.engine import ensure_schema
 from . import login, reports
 
 logger = logging.getLogger(__name__)
@@ -105,30 +105,9 @@ DateTo = Annotated[date | None, Query(alias="to")]
 # App
 # ---------------------------------------------------------------------------
 
-class SchemaOutOfDateError(RuntimeError):
-    """The database is behind the code; a migration was skipped."""
-
-
-async def ensure_schema() -> None:
-    """Refuse to serve reports from a database a migration was skipped on."""
-    stored = await pending_migration()
-    if stored is not None:
-        raise SchemaOutOfDateError(
-            f"Database is at migration {stored}, the code needs {SCHEMA_REVISION}. "
-            "Run `alembic upgrade head` before starting the web app."
-        )
-    await init_db()
-    missing = await missing_columns()
-    if missing:
-        raise SchemaOutOfDateError(
-            f"Database schema is behind the code (missing {', '.join(missing)}). "
-            "Run `alembic upgrade head` before starting the web app."
-        )
-
-
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    await ensure_schema()
+    await ensure_schema("the web app")
     yield
 
 

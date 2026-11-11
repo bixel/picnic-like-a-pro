@@ -92,11 +92,12 @@ def verify_session(value: str | None, now: float | None = None) -> int | None:
     if not value:
         return None
     payload, _, signature = value.rpartition(".")
-    if not payload or not hmac.compare_digest(signature, _signature(payload)):
-        return None
     try:
+        # compare_digest raises TypeError on a non-ASCII string.
+        if not payload or not hmac.compare_digest(signature, _signature(payload)):
+            return None
         user_id, expires = (int(part) for part in payload.split("."))
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     if expires <= (now if now is not None else time.time()):
         return None

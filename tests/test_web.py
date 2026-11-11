@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 from picnic_meal_planner import bot
+from picnic_meal_planner.db import engine as engine_mod
 from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.web import app as web_app
 from picnic_meal_planner.web import login, reports
@@ -28,7 +29,7 @@ def _config(monkeypatch):
 
 def _product(pid, l3=None, l2=None, l1=None, **names):
     return {
-        "id": pid, "name": pid.title(), "unit_quantity": None,
+        "id": pid, "name": pid.title(),
         "l3_id": l3, "l3_name": names.get("l3_name"),
         "l2_id": l2, "l2_name": names.get("l2_name"),
         "l1_id": l1, "l1_name": names.get("l1_name"),
@@ -210,7 +211,7 @@ class TestSessions:
         assert login.verify_session(cookie, now=1000 + ttl - 1) == USER
         assert login.verify_session(cookie, now=1000 + ttl) is None
 
-    @pytest.mark.parametrize("value", [None, "", "garbage", "1.2.3", "a.b.c.d"])
+    @pytest.mark.parametrize("value", [None, "", "garbage", "1.2.3", "a.b.c.d", "1.2.é"])
     def test_malformed_values(self, value):
         assert login.verify_session(value) is None
 
@@ -412,16 +413,18 @@ class TestFrontend:
 
 class TestStartup:
     async def test_current_schema_passes(self):
-        await web_app.ensure_schema()
+        async with web_app._lifespan(None):
+            pass
 
     async def test_pending_migration_stops_the_app(self, monkeypatch):
-        monkeypatch.setattr(web_app, "pending_migration", AsyncMock(return_value="0010"))
-        with pytest.raises(web_app.SchemaOutOfDateError, match="alembic upgrade head"):
-            await web_app.ensure_schema()
+        monkeypatch.setattr(engine_mod, "pending_migration", AsyncMock(return_value="0010"))
+        with pytest.raises(engine_mod.SchemaOutOfDateError, match="starting the web app"):
+            async with web_app._lifespan(None):
+                pass
 
     async def test_missing_columns_stop_the_app(self, monkeypatch):
-        monkeypatch.setattr(web_app, "missing_columns", AsyncMock(return_value=["orders.x"]))
-        with pytest.raises(web_app.SchemaOutOfDateError, match="orders.x"):
+        monkeypatch.setattr(engine_mod, "missing_columns", AsyncMock(return_value=["orders.x"]))
+        with pytest.raises(engine_mod.SchemaOutOfDateError, match="orders.x"):
             async with web_app._lifespan(None):
                 pass
 

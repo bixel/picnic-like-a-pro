@@ -17,8 +17,6 @@ from datetime import date, timedelta
 
 GLOBAL = ("global", "all")
 UNCATEGORISED = ("uncategorised", "none")
-LEVELS = ("global", "l1", "l2", "l3", "product", "uncategorised")
-BUCKETS = ("week", "month")
 
 NodeKey = tuple[str, str]
 

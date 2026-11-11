@@ -1196,7 +1196,6 @@ async def report_products(session: AsyncSession) -> list[dict]:
         select(
             Product.id,
             Product.name,
-            Product.unit_quantity,
             Product.category_id.label("l3_id"),
             Category.name.label("l3_name"),
             Category.l2_id,

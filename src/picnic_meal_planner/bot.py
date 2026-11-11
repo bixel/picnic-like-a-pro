@@ -33,12 +33,7 @@ load_dotenv()
 
 # Imported after load_dotenv(): both modules read configuration at import time.
 from . import access, api_log, history, llm  # noqa: E402
-from .db.engine import (  # noqa: E402
-    SCHEMA_REVISION,
-    init_db,
-    missing_columns,
-    pending_migration,
-)
+from .db.engine import SchemaOutOfDateError, ensure_schema  # noqa: E402, F401
 from .picnic import auth as picnic_auth  # noqa: E402
 from .web import login as web_login  # noqa: E402
 from .picnic import client as picnic  # noqa: E402
@@ -533,10 +528,6 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-class SchemaOutOfDateError(RuntimeError):
-    """The database lacks columns the code needs; a migration was skipped."""
-
-
 async def _post_init(app: Application) -> None:
     """Ensure the database is usable before the bot starts handling messages.
 
@@ -547,22 +538,7 @@ async def _post_init(app: Application) -> None:
     every ``chat_settings`` read fails, persistence fails closed, and history
     silently stops being saved while the bot looks healthy.
     """
-    stored = await pending_migration()
-    if stored is not None:
-        # Checked before init_db(), which would create the new tables outside
-        # Alembic and make the pending migration fail on them.
-        raise SchemaOutOfDateError(
-            f"Database is at migration {stored}, the code needs "
-            f"{SCHEMA_REVISION}. Run `alembic upgrade head` before starting the bot."
-        )
-    await init_db()
-    missing = await missing_columns()
-    if missing:
-        raise SchemaOutOfDateError(
-            f"Database schema is behind the code (missing {', '.join(missing)}). "
-            "Run `alembic upgrade head` before starting the bot — see "
-            "MIGRATION_OPENROUTER.md."
-        )
+    await ensure_schema("the bot")
     logger.info(
         "Database initialised. Conversation persistence: %s",
         "on"

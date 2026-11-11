@@ -83,7 +83,7 @@ load_dotenv()
 
 from picnic_meal_planner import api_log
 from picnic_meal_planner.db import queries as db
-from picnic_meal_planner.db.engine import SCHEMA_REVISION, init_db, pending_migration
+from picnic_meal_planner.db.engine import SchemaOutOfDateError, ensure_schema
 from picnic_meal_planner.picnic import client as picnic
 
 # A cancelled delivery never arrived, so it is skipped for good.  A current one
@@ -138,14 +138,10 @@ def _days_ago(variable: str, default: str) -> str | None:
 
 
 async def main() -> None:
-    stored = await pending_migration()
-    if stored is not None:
-        # Before init_db(), which would create the new tables outside Alembic.
-        raise SystemExit(
-            f"Database is at migration {stored}, the code needs {SCHEMA_REVISION}. "
-            "Run `uv run alembic upgrade head` first."
-        )
-    await init_db()
+    try:
+        await ensure_schema("the import")
+    except SchemaOutOfDateError as exc:
+        raise SystemExit(str(exc)) from None
     # Group every request this run makes under one source/run_id in
     # `api_requests`, so an import can be inspected as a single batch.
     async with api_log.request_context("import_history"):
