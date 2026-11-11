@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -409,6 +411,14 @@ class TestFrontend:
         assert (await client.get("/login")).text == "<html>app</html>"
         assert (await client.get("/..%2Fsecret.txt")).text == "<html>app</html>"
         assert (await client.get("/api/nope")).status_code == 404
+
+
+class TestApiSchema:
+    def test_committed_openapi_matches_the_app(self):
+        """The frontend's types are generated from this file; CI checks that
+        step, this checks the file itself.  Fix with `make api-types`."""
+        committed = Path(__file__).resolve().parent.parent / "frontend" / "openapi.json"
+        assert json.loads(committed.read_text()) == web_app.create_app().openapi()
 
 
 class TestStartup:
