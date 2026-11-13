@@ -19,6 +19,7 @@ A family meal planner and grocery assistant Telegram bot powered by an LLM of yo
 11. [Useful Commands](#11-useful-commands)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Order Reports (local)](#13-order-reports-local)
+14. [Run the Bot Locally](#14-run-the-bot-locally)
 
 ---
 
@@ -457,3 +458,51 @@ restarted once after pulling this change so it knows `/report`.
 
 Category names appear once `scripts/import_history.py` has looked them up;
 until then a category is shown as "Category 1234".
+
+---
+
+## 14. Run the Bot Locally
+
+For development, or to try the bot without a VPS, run it straight from a
+checkout. You need [uv](https://docs.astral.sh/uv/); it installs Python 3.13
+itself.
+
+```bash
+git clone https://github.com/bixel/picnic-like-a-pro.git
+cd picnic-like-a-pro
+uv sync
+cp .env.example .env
+```
+
+Fill in `.env`:
+
+| Variable | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | A token from BotFather (step 2). **Use a second bot, not the deployed one** — see below. |
+| `OPENROUTER_API_KEY` | Your OpenRouter key |
+| `ALLOWED_TELEGRAM_USER_IDS` | Your Telegram user id (step 3) |
+| `PICNIC_USERNAME`, `PICNIC_PASSWORD`, `PICNIC_COUNTRY_CODE` | Your Picnic account — or set `PICNIC_MOCK=true` instead |
+
+Then create the database and start the bot:
+
+```bash
+uv run alembic upgrade head     # creates data/picnic.db; run again after every pull
+uv run bot                      # stop with Ctrl+C
+```
+
+Send your bot a message in Telegram; the log in the terminal shows each request.
+
+- **One process per bot token.** Telegram delivers a bot's messages to a single
+  poller. If the same token also runs on the VPS, the two fight over updates
+  and both log `Conflict` errors. Create a separate bot with BotFather for
+  local use.
+- **Try it without touching Picnic.** With `PICNIC_MOCK=true` the Picnic API is
+  replaced by an in-process fake: no credentials are used and nothing can be
+  ordered. The LLM calls are still real.
+- **Picnic asks for a code.** With a real account, the first login may need a
+  2FA code: run `uv run python scripts/picnic_login.py`, or send
+  `/picnic_login` to the bot. The session is then stored in the database.
+- **Order history.** `uv run python scripts/import_history.py` imports your
+  deliveries; it is safe to re-run.
+- **The bot refuses to start with "Database is at migration …".** The code is
+  newer than the database: run `uv run alembic upgrade head`.
