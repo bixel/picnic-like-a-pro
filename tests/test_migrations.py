@@ -119,6 +119,7 @@ class TestMigrationRuns:
             "api_requests",
             "categories",
             "category_parents",
+            "web_login_tokens",
         }
 
     def test_upgrade_stamps_alembic_version(self, migrated_db):
@@ -390,6 +391,25 @@ class TestCategoryCheckedAtMigration:
         ]
         columns = sql(None, db_file, "SELECT name FROM pragma_table_info('categories')")
         assert "checked_at" not in {c["name"] for c in columns}
+
+
+# ---------------------------------------------------------------------------
+# 0011: login links of the reporting UI
+# ---------------------------------------------------------------------------
+
+def test_login_tokens_migration_round_trip(tmp_path, monkeypatch):
+    db_file = tmp_path / "old.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    sql = TestCategoryParentsMigration._sql
+    tables = "SELECT name FROM sqlite_master WHERE name = 'web_login_tokens'"
+
+    command.upgrade(_alembic_config(), "0011")
+    sql(None, db_file, "INSERT INTO web_login_tokens (token_hash, user_id, expires_at) "
+                       "VALUES ('h', 1, '2026-11-11')")
+    assert sql(None, db_file, "SELECT used_at FROM web_login_tokens") == [{"used_at": None}]
+
+    command.downgrade(_alembic_config(), "0010")
+    assert sql(None, db_file, tables) == []
 
 
 def test_schema_revision_is_the_alembic_head():

@@ -181,6 +181,22 @@ class PicnicAuth(Base):
     updated_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime
 
 
+class WebLoginToken(Base):
+    """A one-time login link for the reporting UI, handed out by ``/report``.
+
+    Only the SHA-256 of the token is stored, so a copy of the database cannot
+    be used to log in.  A row is consumed (``used_at`` set) on first use and
+    is worthless after ``expires_at`` either way.
+    """
+
+    __tablename__ = "web_login_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)  # Telegram user
+    expires_at: Mapped[str] = mapped_column(String, nullable=False)  # ISO datetime, UTC
+    used_at: Mapped[str | None] = mapped_column(String, nullable=True)  # ISO datetime
+
+
 class ApiRequest(Base):
     """One logged call to an external API (Picnic or OpenRouter).
 

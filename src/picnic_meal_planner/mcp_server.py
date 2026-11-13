@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 from .db import queries as db
-from .db.engine import SCHEMA_REVISION, init_db, pending_migration
+from .db.engine import SchemaOutOfDateError, ensure_schema
 from .picnic import client as picnic
 from .forecasting import engine as forecasting
 
@@ -292,14 +292,10 @@ async def call_tool(name: str, input_data: dict):
 
 def main() -> None:
     import asyncio
-    stored = asyncio.run(pending_migration())
-    if stored is not None:
-        # Before init_db(), which would create the new tables outside Alembic.
-        raise SystemExit(
-            f"Database is at migration {stored}, the code needs {SCHEMA_REVISION}. "
-            "Run `alembic upgrade head` first."
-        )
-    asyncio.run(init_db())
+    try:
+        asyncio.run(ensure_schema("the MCP server"))
+    except SchemaOutOfDateError as exc:
+        raise SystemExit(str(exc)) from None
     logger.info("Database initialised.")
 
     transport = os.getenv("MCP_TRANSPORT", "stdio")

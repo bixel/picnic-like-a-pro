@@ -16,11 +16,14 @@ dependencies = [
     "openai>=1.40",
     "httpx>=0.27",                # used directly by scripts/preflight.py
     "requests>=2.31",             # likewise (Picnic transport errors)
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
 bot = "picnic_meal_planner.bot:main"
 mcp-server = "picnic_meal_planner.mcp_server:main"
+web = "picnic_meal_planner.web.app:main"
 # import-history is a standalone script (not a package); run it directly:
 #   uv run python scripts/import_history.py
 

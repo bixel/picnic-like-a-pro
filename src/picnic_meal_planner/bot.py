@@ -32,14 +32,10 @@ from telegram.ext import (
 load_dotenv()
 
 # Imported after load_dotenv(): both modules read configuration at import time.
-from . import api_log, history, llm  # noqa: E402
-from .db.engine import (  # noqa: E402
-    SCHEMA_REVISION,
-    init_db,
-    missing_columns,
-    pending_migration,
-)
+from . import access, api_log, history, llm  # noqa: E402
+from .db.engine import SchemaOutOfDateError, ensure_schema  # noqa: E402, F401
 from .picnic import auth as picnic_auth  # noqa: E402
+from .web import login as web_login  # noqa: E402
 from .picnic import client as picnic  # noqa: E402
 
 logging.basicConfig(
@@ -76,16 +72,8 @@ Formatting: your replies are sent to Telegram as plain text, so no markup is ren
 _mcp_tools: list[dict] | None = None
 
 
-def _allowed_user_ids() -> set[int]:
-    raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").strip()
-    return {int(uid.strip()) for uid in raw.split(",") if uid.strip()}
-
-
-def _is_allowed(user_id: int) -> bool:
-    # Explicit opt-in required to allow all users (e.g. for local dev)
-    if os.getenv("ALLOW_ALL_USERS", "").lower() == "true":
-        return True
-    return user_id in _allowed_user_ids()
+_allowed_user_ids = access.allowed_user_ids
+_is_allowed = access.is_allowed
 
 
 def _may_log_in_to_picnic(user_id: int) -> bool:
@@ -245,6 +233,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cart — current Picnic cart\n"
         "/forget — delete our stored conversation\n"
         "/privacy — control whether our conversation is saved\n"
+        "/report — get a login link for the order reports\n"
         "/model — show which AI model this chat uses\n"
         "/picnic_login — log in to Picnic when it asks for a code\n\n"
         "Or just chat with me naturally!"
@@ -312,6 +301,35 @@ async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(
             "There was nothing stored. We're starting fresh."
         )
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/report`` — send a one-time login link for the reporting UI."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await _reject_unauthorized(update)
+        return
+    # The link logs in whoever opens it, so it must not land in a group.
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Please send /report in our private chat — the login link is personal."
+        )
+        return
+    try:
+        link = await web_login.create_login_link(user_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not create a report login link")
+        await update.message.reply_text(
+            "Sorry, I couldn't create a login link just now. Please try again."
+        )
+        return
+    minutes = int(web_login.LOGIN_TOKEN_TTL.total_seconds() // 60)
+    # No preview: Telegram would otherwise fetch the page behind the link.
+    await update.message.reply_text(
+        f"Open this link to see your order reports:\n{link}\n\n"
+        f"It works once and expires in {minutes} minutes. Don't forward it.",
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -510,10 +528,6 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-class SchemaOutOfDateError(RuntimeError):
-    """The database lacks columns the code needs; a migration was skipped."""
-
-
 async def _post_init(app: Application) -> None:
     """Ensure the database is usable before the bot starts handling messages.
 
@@ -524,22 +538,7 @@ async def _post_init(app: Application) -> None:
     every ``chat_settings`` read fails, persistence fails closed, and history
     silently stops being saved while the bot looks healthy.
     """
-    stored = await pending_migration()
-    if stored is not None:
-        # Checked before init_db(), which would create the new tables outside
-        # Alembic and make the pending migration fail on them.
-        raise SchemaOutOfDateError(
-            f"Database is at migration {stored}, the code needs "
-            f"{SCHEMA_REVISION}. Run `alembic upgrade head` before starting the bot."
-        )
-    await init_db()
-    missing = await missing_columns()
-    if missing:
-        raise SchemaOutOfDateError(
-            f"Database schema is behind the code (missing {', '.join(missing)}). "
-            "Run `alembic upgrade head` before starting the bot — see "
-            "MIGRATION_OPENROUTER.md."
-        )
+    await ensure_schema("the bot")
     logger.info(
         "Database initialised. Conversation persistence: %s",
         "on"
@@ -566,6 +565,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cart", cmd_cart))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("picnic_login", cmd_picnic_login))
     app.add_handler(CommandHandler("picnic_code", cmd_picnic_code))

@@ -6,7 +6,7 @@ flows and controls, validated against the CALM 1.2 schema.
 
 | File | What it is |
 |---|---|
-| `picnic-like-a-pro.architecture.json` | The architecture: 31 nodes, 39 relationships, 4 flows, 15 controls |
+| `picnic-like-a-pro.architecture.json` | The architecture: 34 nodes, 43 relationships, 5 flows, 19 controls |
 | `controls/*.requirement.json` | JSON Schemas for the 5 control kinds; every control's `config` is validated against one |
 | `url-mapping.json` | Maps the controls' published `requirement-url`s to the local files, so validation works offline and before merge |
 | `diagrams/` | PNGs rendered by `calm docify` (overview + one per flow) |
@@ -22,13 +22,30 @@ cd calm
 # Validate (schema + every control config against its requirement schema)
 calm validate -a picnic-like-a-pro.architecture.json -u url-mapping.json --strict -f pretty
 
-# Browsable docs site with diagrams for every node, relationship and flow
-calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-docs \
-  --export-diagrams png        # optional; needs a Chromium (add --browser-path if it isn't found)
+# Browsable docs site with diagrams for every node, relationship and flow.
+# docify writes a Docusaurus project, not HTML: install and serve it to browse.
+calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-docs
+cd /tmp/calm-docs
+# Workaround, needed after every docify: d3 7.9.2 is marked side-effect free, so webpack drops
+# d3-transition and hovering a diagram node throws "tooltipElem.transition is not a function".
+mkdir -p src && echo "import 'd3-transition';" > src/d3-transition.js
+perl -pi -e "s|^(\s*themes: \[)|    clientModules: [require.resolve('./src/d3-transition.js')],\n\$1|" docusaurus.config.js
+npm install && npm start    # http://localhost:3000
+
+# PNGs for diagrams/ (not for the site: its pages then point at image files Docusaurus does not serve).
+# Needs a Chromium; add --browser-path if it isn't found.
+calm docify -a picnic-like-a-pro.architecture.json -u url-mapping.json -o /tmp/calm-png \
+  --export-diagrams png
+cp /tmp/calm-png/docs/_diagrams/index-1.png diagrams/overview.png
+for f in /tmp/calm-png/docs/flows/_diagrams/*-1.png; do
+  cp "$f" "diagrams/flow-$(basename "$f" -1.png).png"
+done
 ```
 
-Keep relationship descriptions free of `(` `)` and `;`: docify shows parentheses in edge labels as
-HTML entities, and Mermaid reads `;` in a sequence-diagram message as a line break.
+Keep relationship and flow-transition descriptions free of `(` `)` and `;`: docify shows parentheses in edge labels as
+HTML entities, and Mermaid reads `;` in a sequence-diagram message as a line break.  Keep `{` and `}`
+out of every string: the generated pages are MDX, which reads braces as a JavaScript expression and
+fails to compile the page.
 
 When the code changes, update the JSON in the same PR. Each node's `metadata.code` lists the files
 it stands for, so `git diff --stat` shows which nodes to check.
@@ -77,10 +94,13 @@ hops (`metadata.transport: "in-process call"`).
 | `chat-model-cli` | service | `scripts/chat_model.py` | |
 | `preflight-cli` | service | `scripts/preflight.py` | |
 | `inspect-category-cli` | service | `scripts/inspect_category.py` | diagnostic dump of a product's category pages |
+| `reporting-web` | service | `web/app.py`, `web/login.py`, `web/reports.py`, `access.py` | the FastAPI process (`uv run web`): read-only reports, login links, session cookie; not in the container |
+| `reporting-frontend` | webclient | `frontend/` | the React app in the browser; only talks to `reporting-web` |
+| `web-login-tokens` | data-asset | table `web_login_tokens` | a credential while unused; only hashes are stored |
 
 `node-type: "container"` is a custom type, which CALM allows. The data assets sit inside `sqlite-db`
 through a `composed-of` relationship (`database-contents`), so the diagram draws the database as a
-box holding its five kinds of data.
+box holding its six kinds of data.
 
 ### Interfaces
 
@@ -111,6 +131,7 @@ protocol list has no SSH). In-process edges have no protocol and have `metadata.
 | `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged) → `history.commit_turn` |
 | `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `backfill_parent_names` (`get_l1_names`, `upsert_category_parent`), then `refresh_category_names` (`get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
 | `picnic-2fa-login` | `bot.cmd_picnic_login` → `client.start_login` → `auth.LoginFlow.start`; `cmd_picnic_code` → `submit_login_code` → `_install` → `auth.save_token` |
+| `report-login` | `bot.cmd_report` → `web.login.create_login_link` → `web_login_tokens` (the bot and the web app meet only in the database); browser → `POST /api/auth/login` → `redeem_login_token` → cookie; then `/api/hierarchy` and `/api/timeseries` → `queries.report_*` → `web/reports.py` |
 | `build-and-deploy` | `deploy.yml`: `build-and-push` job, then the `deploy` job over SSH |
 
 Each transition refers to a relationship by id, so a flow is a route through the graph above.
@@ -125,10 +146,10 @@ must satisfy the schema for its kind in `controls/`:
 
 | Kind | Controls |
 |---|---|
-| `access-control` | PLP-AC-01 user allowlist · PLP-AC-02 Picnic login authorisation · PLP-AC-03 model allowlist |
-| `data-protection` | PLP-DP-01 storage consent · PLP-DP-02 retention/erasure · PLP-DP-03 session token handling · PLP-DP-04 API log follows history consent · PLP-DP-05 credential redaction in the API log |
+| `access-control` | PLP-AC-01 user allowlist · PLP-AC-02 Picnic login authorisation · PLP-AC-03 model allowlist · PLP-AC-04 report session and allowlist |
+| `data-protection` | PLP-DP-01 storage consent · PLP-DP-02 retention/erasure · PLP-DP-03 session token handling · PLP-DP-04 API log follows history consent · PLP-DP-05 credential redaction in the API log · PLP-DP-06 one-time login links · PLP-DP-07 reports read order data only |
 | `integrity` | PLP-IN-01 clean-turn archiving · PLP-IN-02 turn-aware window · PLP-IN-03 schema gate · PLP-IN-04 no unprompted 2FA · PLP-IN-05 API logging never affects the request |
-| `network-exposure` | PLP-NE-01 no inbound ports |
+| `network-exposure` | PLP-NE-01 no inbound ports · PLP-NE-02 reports listen on localhost |
 | `human-in-the-loop` | PLP-HL-01 confirm cart changes |
 
 The `requirement-url`s point at `raw.githubusercontent.com/.../main/calm/controls/`, so they resolve
