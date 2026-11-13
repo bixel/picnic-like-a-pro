@@ -61,6 +61,34 @@ jobs:
             coverage.xml
             junit.xml
 
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # The committed API types must match the FastAPI schema they were made from.
+      - name: API types are up to date
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/lib/api-types.ts
+
+      - run: npm test
+
+      - name: Typecheck and build
+        run: npm run build
+
   # The suite above runs directly on the runner, which says nothing about
   # whether the images actually build. This job builds both targets and runs
   # the suite inside the test image, i.e. what `make test-docker` does locally.

@@ -25,6 +25,8 @@ COPY tests/ ./tests/
 # tests/test_migrations.py runs `alembic upgrade head` against a temp database.
 COPY alembic.ini ./
 COPY alembic/ ./alembic/
+# tests/test_web.py compares the committed API schema with the FastAPI app.
+COPY frontend/openapi.json ./frontend/openapi.json
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src:/app" \

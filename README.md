@@ -18,6 +18,7 @@ A family meal planner and grocery assistant Telegram bot powered by an LLM of yo
 10. [Automated CI/CD Deployment](#10-automated-cicd-deployment)
 11. [Useful Commands](#11-useful-commands)
 12. [Troubleshooting](#12-troubleshooting)
+13. [Order Reports (local)](#13-order-reports-local)
 
 ---
 
@@ -420,3 +421,39 @@ docker compose run --rm picnic-bot import-history
   expires it.
 - After editing `.env`, restart the container: `docker compose restart picnic-bot`.
 - Confirm your Picnic account is active and can log in via the Picnic app.
+
+---
+
+## 13. Order Reports (local)
+
+A small web UI shows what you spend over time: the Picnic category tree on the
+left, and a chart of the selected category or product on the right. It runs on
+your own machine, next to the bot, on the same database file. It is not part of
+the Docker image yet.
+
+You need [uv](https://docs.astral.sh/uv/) and Node.js 22.
+
+```bash
+uv sync
+uv run alembic upgrade head            # adds the login-link table
+```
+
+```bash
+cd frontend && npm ci && npm run build && cd ..
+```
+
+```bash
+uv run web                             # http://localhost:8080
+```
+
+To log in, send `/report` to the bot in your private chat and open the link it
+replies with on the machine that runs `uv run web`. Telegram may not make a
+`localhost` address tappable; copy it into the browser instead. The link works
+once and expires after 5 minutes. A session lasts 30 days; set
+`WEB_SESSION_SECRET` in `.env` so it survives a restart of the web app.
+
+The bot and the web app must use the same `DB_PATH`, and the bot must be
+restarted once after pulling this change so it knows `/report`.
+
+Category names appear once `scripts/import_history.py` has looked them up;
+until then a category is shown as "Category 1234".

@@ -33,7 +33,7 @@ def _db_url() -> str:
 
 
 # The Alembic head this code expects; tests/test_migrations.py keeps it in step.
-SCHEMA_REVISION = "0010"
+SCHEMA_REVISION = "0011"
 
 # How long a write to the API request log waits for a database lock held by
 # another connection before giving up.  sqlite3's default is 5 s, and the log
@@ -204,3 +204,31 @@ async def get_log_db():
     """Like :func:`get_db`, on the API request log's short-timeout engine."""
     async with get_log_session_factory()() as session:
         yield session
+
+
+class SchemaOutOfDateError(RuntimeError):
+    """The database is behind the code; a migration was skipped."""
+
+
+async def ensure_schema(app: str) -> None:
+    """Create missing tables, or refuse to run on a database behind the code.
+
+    The start-up gate of every entry point; *app* names it in the message
+    ("the bot").  Raises :class:`SchemaOutOfDateError` when Alembic's revision
+    is behind :data:`SCHEMA_REVISION` or a model column is missing.
+    """
+    fix = f"Run `uv run alembic upgrade head` before starting {app}"
+    stored = await pending_migration()
+    if stored is not None:
+        # Before init_db(), which would create the new tables outside Alembic
+        # and make the pending migration fail on them.
+        raise SchemaOutOfDateError(
+            f"Database is at migration {stored}, the code needs {SCHEMA_REVISION}. {fix}."
+        )
+    await init_db()
+    missing = await missing_columns()
+    if missing:
+        raise SchemaOutOfDateError(
+            f"Database schema is behind the code (missing {', '.join(missing)}). "
+            f"{fix} — see MIGRATION_OPENROUTER.md."
+        )

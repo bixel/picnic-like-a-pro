@@ -1,0 +1,555 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Picnic Like a Pro \u2014 Reports",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/auth/login": {
+      "post": {
+        "summary": "Log In",
+        "operationId": "log_in_api_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "summary": "Log Out",
+        "operationId": "log_out_api_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/api/me": {
+      "get": {
+        "summary": "Me",
+        "operationId": "me_api_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hierarchy": {
+      "get": {
+        "summary": "Hierarchy",
+        "operationId": "hierarchy_api_hierarchy_get",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HierarchyNode"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/timeseries": {
+      "get": {
+        "summary": "Timeseries",
+        "operationId": "timeseries_api_timeseries_get",
+        "parameters": [
+          {
+            "name": "level",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "global",
+                "l1",
+                "l2",
+                "l3",
+                "product",
+                "uncategorised"
+              ],
+              "type": "string",
+              "default": "global",
+              "title": "Level"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "all",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "week",
+                "month"
+              ],
+              "type": "string",
+              "default": "month",
+              "title": "Bucket"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimeSeries"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BucketTotals": {
+        "properties": {
+          "spend": {
+            "type": "integer",
+            "title": "Spend"
+          },
+          "units": {
+            "type": "integer",
+            "title": "Units"
+          },
+          "orders": {
+            "type": "integer",
+            "title": "Orders"
+          },
+          "start": {
+            "type": "string",
+            "format": "date",
+            "title": "Start"
+          }
+        },
+        "type": "object",
+        "required": [
+          "spend",
+          "units",
+          "orders",
+          "start"
+        ],
+        "title": "BucketTotals"
+      },
+      "Crumb": {
+        "properties": {
+          "level": {
+            "type": "string",
+            "enum": [
+              "global",
+              "l1",
+              "l2",
+              "l3",
+              "product",
+              "uncategorised"
+            ],
+            "title": "Level"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "level",
+          "id",
+          "name"
+        ],
+        "title": "Crumb"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HierarchyNode": {
+        "properties": {
+          "spend": {
+            "type": "integer",
+            "title": "Spend"
+          },
+          "units": {
+            "type": "integer",
+            "title": "Units"
+          },
+          "orders": {
+            "type": "integer",
+            "title": "Orders"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "global",
+              "l1",
+              "l2",
+              "l3",
+              "product",
+              "uncategorised"
+            ],
+            "title": "Level"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/HierarchyNode"
+            },
+            "type": "array",
+            "title": "Children"
+          }
+        },
+        "type": "object",
+        "required": [
+          "spend",
+          "units",
+          "orders",
+          "level",
+          "id",
+          "name",
+          "children"
+        ],
+        "title": "HierarchyNode"
+      },
+      "LoginRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "LoginRequest"
+      },
+      "Me": {
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "title": "User Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id"
+        ],
+        "title": "Me"
+      },
+      "Summary": {
+        "properties": {
+          "spend": {
+            "type": "integer",
+            "title": "Spend"
+          },
+          "units": {
+            "type": "integer",
+            "title": "Units"
+          },
+          "orders": {
+            "type": "integer",
+            "title": "Orders"
+          },
+          "first_order": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Order"
+          },
+          "last_order": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Order"
+          },
+          "order_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "spend",
+          "units",
+          "orders",
+          "first_order",
+          "last_order",
+          "order_total"
+        ],
+        "title": "Summary"
+      },
+      "TimeSeries": {
+        "properties": {
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/Crumb"
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "bucket": {
+            "type": "string",
+            "enum": [
+              "week",
+              "month"
+            ],
+            "title": "Bucket"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/Summary"
+          },
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/BucketTotals"
+            },
+            "type": "array",
+            "title": "Buckets"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "bucket",
+          "summary",
+          "buckets"
+        ],
+        "title": "TimeSeries"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
