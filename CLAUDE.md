@@ -545,6 +545,14 @@ Copy `.env.example` to `.env` and fill in your values.
 
 ---
 
+## Testing
+
+Keep local test runs fast and focused on the code being changed. Run the full
+test suite locally **only when explicitly asked**; it runs automatically on
+merge requests, so full-suite verification is already covered remotely.
+
+---
+
 ## Key Commands
 
 ```bash
