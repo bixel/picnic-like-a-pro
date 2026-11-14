@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -50,6 +51,36 @@ class PicnicRateLimited(RuntimeError):
 __all__ = ["PicnicLoginPending", "PicnicLoginRequired"]  # re-exported for callers of this module
 
 logger = logging.getLogger(__name__)
+
+# A bulk run stops on a login demand, or once the rate-limit backoff gives up.
+STOP_ERRORS = (PicnicLoginRequired, PicnicLoginPending, PicnicRateLimited)
+
+# A Retry-After beyond this ends a bulk run's request loop instead of waiting.
+MAX_BACKOFF_SECONDS = 15 * 60
+
+_sleep = asyncio.sleep  # replaced by the tests
+
+
+async def with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
+    """``await func(*args)``, waiting and retrying while Picnic rate limits.
+
+    Raises :class:`PicnicRateLimited` once the retries are used up, or when
+    Picnic asks for a wait longer than :data:`MAX_BACKOFF_SECONDS`.  The
+    many-request scripts (``import_history``, ``repair_order_prices``) share
+    this one policy.
+    """
+    retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
+    base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
+    for attempt in range(retries + 1):
+        try:
+            return await func(*args)
+        except PicnicRateLimited as exc:
+            wait = exc.retry_after if exc.retry_after is not None else base * 2**attempt
+            if attempt == retries or wait > MAX_BACKOFF_SECONDS:
+                raise
+            print(f"  {exc} Waiting {wait:.0f} s (retry {attempt + 1}/{retries})...", flush=True)
+            await _sleep(wait)
+    raise AssertionError("unreachable")
 
 _client = None  # PicnicAPI | MockPicnicAPI | None
 _saved_token: str | None = None  # last token written to / read from the DB
@@ -411,6 +442,32 @@ async def get_category_ids(product_id: str) -> tuple[int | None, int, int] | Non
     return None if article is None else _category_ids(article)
 
 
+async def get_article_price(product_id: str) -> int | None:
+    """The current catalogue price (cents) of a product, from its product page.
+
+    One request.  Used by the repair script to backfill ``products.unit_price``.
+    ``None`` when Picnic has no page for the product any more, or the page has
+    no price.  The value is the *current* price — possibly an on-sale price —
+    which matches what ``search_products`` stores as ``unit_price``.  Bundles
+    and multipacks are skipped (``None``): their page exposes only a per-unit
+    price, which would not match the pack price search stores.  Login errors
+    propagate.
+    """
+    article = await _call("get_article", product_id)
+    if article is None:
+        return None
+    if isinstance(article, dict):  # the mock client
+        price = article.get("price")
+        return int(price) if price else None
+    if getattr(article, "is_bundle", False):
+        # Bundle/multipack pages expose only a per-unit price; search stores the
+        # pack price, so skip rather than write a per-unit value under a pack's
+        # product id.
+        return None
+    price = getattr(article, "price", None)
+    return price if isinstance(price, int) else None
+
+
 async def get_l3_names(l2_id: int, l3_id: int) -> dict[int, str]:
     """``{l3_id: name}`` for every L3 category on an L2 category page.
 
@@ -506,7 +563,77 @@ def _normalise_product(raw: dict) -> dict:
 def _price_per_unit(line_price: Any, quantity: int) -> int | None:
     if not isinstance(line_price, int) or quantity <= 0:
         return None
+    # A per-unit price is an integer, so a line total not divisible by the
+    # quantity is reproduced to within half a unit (199 over 2 stores 100, a
+    # 1-cent over-count).  The exact paid total is not stored separately, so
+    # this is the closest the schema allows.
     return round(line_price / quantity)
+
+
+#: The sentinel Picnic used to put in ``ORDER_ARTICLE.price`` for mixed-promo
+#: lines (4321.99 €).  It is not a real price and must never be stored.
+PLACEHOLDER_PRICE = 432199
+
+
+def _article_price_or_none(entry: dict, article: dict) -> int | None:
+    """The article's own price, or ``None`` when it is the placeholder.
+
+    Only used when a nested line carries no line-level paid price.  A real
+    article price is kept; the 432199 placeholder from historical payloads is
+    rejected so it is never stored as spend.
+    """
+    price = entry.get("unit_price") or article.get("unit_price") or article.get("price")
+    return price if isinstance(price, int) and price != PLACEHOLDER_PRICE else None
+
+
+def _line_paid_price(line: dict) -> int | None:
+    """The price actually paid for a delivery line, in cents.
+
+    A ``PRICE`` decorator carries the paid price (``display_price``) and is
+    present only when a promotion applied; otherwise the line's own ``price``
+    is the paid price.  ``price`` is the pre-promotion price when the decorator
+    is present, so it must never be read in that case.
+    """
+    for decorator in line.get("decorators") or []:
+        if decorator.get("type") == "PRICE" and isinstance(
+            decorator.get("display_price"), int
+        ):
+            return decorator["display_price"]
+    price = line.get("price")
+    return price if isinstance(price, int) else None
+
+
+def _split_price(total: int, quantities: list[int]) -> list[int]:
+    """Split ``total`` cents across articles in proportion to ``quantities``.
+
+    Returns one per-unit price per article.  ``sum(p * q for p, q in
+    zip(result, quantities)) == total`` whenever the remainder can be formed
+    from the quantities — in particular for a mix-and-match line ("3 für
+    5.99€"), where every article has quantity 1 and the split is always exact.
+
+    For mixed quantities the split can be lossy: a +1 cent goes to a per-*unit*
+    price, so it moves the line total by that article's quantity, and a
+    remainder no combination of quantities reaches cannot be represented at all
+    (e.g. ``[5, 5]`` can only hit multiples of 5).  The greedy in-order fill can
+    also leave a remainder it could have avoided.  The unassigned leftover is
+    therefore up to the smallest quantity minus one in the uniform case, and a
+    little more for mixed quantities — several cents, not one or two — which is
+    acceptable for a split Picnic does not specify.
+    """
+    if not quantities:
+        return []
+    total_units = sum(quantities)
+    if total_units <= 0:
+        return [0] * len(quantities)
+    base, remainder = divmod(total, total_units)
+    prices = [base] * len(quantities)
+    for index, quantity in enumerate(quantities):
+        if quantity <= remainder:
+            prices[index] += 1
+            remainder -= quantity
+        if remainder <= 0:
+            break
+    return prices
 
 
 def _article_quantity(article: dict) -> int | None:
@@ -531,40 +658,73 @@ def delivery_id(summary: dict) -> str | None:
 def delivery_line_items(detail: dict) -> list[dict]:
     """Flatten a delivery's orders into ``{product, quantity, unit_price}`` dicts.
 
-    The real API nests ``orders -> ORDER_LINE -> ORDER_ARTICLE``: the line
-    carries the price actually paid for the whole line, the article carries
-    the product and, in a ``QUANTITY`` decorator, the count.  The mock skips
-    the line level and puts flat articles straight into ``order["items"]``;
-    an item without nested ``items`` is treated as that flat article.  Such an
-    item may also wrap the article as ``{"product": {...}, "count", "unit_price"}``,
-    in which case the wrapper's count and paid price win over the product's.
+    The real API nests ``orders -> ORDER_LINE -> ORDER_ARTICLE``.  A line
+    carries the price for the whole line — ``price`` is the pre-promotion price
+    and, when a promotion applied, a ``PRICE`` decorator's ``display_price`` is
+    what was actually paid (see :func:`_line_paid_price`).  Each article carries
+    the product and, in a ``QUANTITY`` decorator, the count.  A line holding
+    several articles is a mix-and-match promotion whose paid price is split
+    across them.  A line with no paid price at all falls back to each article's
+    own price, unless that price is the 432199 placeholder.
+
+    ``unit_price`` is the paid price per unit and feeds ``order_items`` (spend).
+    The product dict deliberately carries no ``unit_price``: order data is not a
+    catalogue price, and ``products.unit_price`` is populated from search and
+    the repair backfill instead.
+
+    The mock skips the line level and puts flat articles straight into
+    ``order["items"]``; an item without nested ``items`` is treated as that flat
+    article, and its own price fields are kept.  Such an item may also wrap the
+    article as ``{"product": {...}, "count", "unit_price"}``, in which case the
+    wrapper's count and paid price win over the product's.
     """
     result: list[dict] = []
     for order in detail.get("orders") or [detail]:
         for line in order.get("items") or []:
             nested = line.get("items")
-            articles = nested if isinstance(nested, list) else [line]
-            for entry in articles:
+            entries: list[tuple[dict, dict, str, int]] = []
+            for entry in (nested if isinstance(nested, list) else [line]):
                 article = entry.get("product") or entry
                 product_id = article.get("id") or article.get("article_id")
                 if not product_id:
                     continue
                 quantity = _article_quantity(entry) or _article_quantity(article) or 1
-                # Only a line holding a single article has a line price that
-                # belongs to that article alone.
-                line_price = line.get("price") if nested and len(articles) == 1 else None
-                unit_price = (
-                    _price_per_unit(line_price, quantity)
-                    or entry.get("unit_price")
+                entries.append((entry, article, product_id, quantity))
+
+            if not entries:
+                continue
+
+            if isinstance(nested, list):
+                # Real payload: the paid price comes from the line (``PRICE``
+                # decorator, else the line's own price).  When the line carries
+                # none, fall back to the article's own price — but never the
+                # 432199 placeholder.
+                paid = _line_paid_price(line)
+                if isinstance(paid, int):
+                    if len(entries) == 1:
+                        unit_prices = [_price_per_unit(paid, entries[0][3])]
+                    else:
+                        unit_prices = _split_price(paid, [q for _, _, _, q in entries])
+                else:
+                    unit_prices = [
+                        _article_price_or_none(entry, article)
+                        for entry, article, _, _ in entries
+                    ]
+            else:
+                # Flat mock / legacy wrapper: keep the article's own price.
+                unit_prices = [
+                    entry.get("unit_price")
                     or article.get("unit_price")
                     or article.get("price")
-                )
+                    for entry, article, _, _ in entries
+                ]
+
+            for (_, article, product_id, quantity), unit_price in zip(entries, unit_prices):
                 image_ids = article.get("image_ids") or []
                 result.append({
                     "product": {
                         "id": product_id,
                         "name": article.get("name", ""),
-                        "unit_price": unit_price,
                         "unit_quantity": article.get("unit_quantity"),
                         "image_id": article.get("image_id") or (image_ids[0] if image_ids else None),
                     },

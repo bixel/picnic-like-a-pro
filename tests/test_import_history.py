@@ -55,7 +55,7 @@ def fake_picnic(monkeypatch):
     async def sleep(seconds):
         state["sleeps"].append(seconds)
 
-    monkeypatch.setattr(import_history, "_sleep", sleep)
+    monkeypatch.setattr(picnic, "_sleep", sleep)
 
     async def get_deliveries():
         return list(state["summaries"])
