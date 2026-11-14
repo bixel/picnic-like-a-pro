@@ -1,4 +1,7 @@
-"""Order-history aggregation for the reporting UI (pure Python, no DB access).
+"""Order-history aggregation shared by the reporting web app and the MCP server.
+
+Pure Python, no DB access: both callers load raw rows through
+``db.queries.report_*`` and pass them in.
 
 The category tree is Global → L1 → L2 → L3 → product.  A node is addressed by
 ``(level, id)`` with string ids; products without a category sit under one

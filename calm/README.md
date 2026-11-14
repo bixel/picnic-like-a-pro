@@ -94,7 +94,7 @@ hops (`metadata.transport: "in-process call"`).
 | `chat-model-cli` | service | `scripts/chat_model.py` | |
 | `preflight-cli` | service | `scripts/preflight.py` | |
 | `inspect-category-cli` | service | `scripts/inspect_category.py` | diagnostic dump of a product's category pages |
-| `reporting-web` | service | `web/app.py`, `web/login.py`, `web/reports.py`, `access.py` | the FastAPI process (`uv run web`): read-only reports, login links, session cookie; not in the container |
+| `reporting-web` | service | `web/app.py`, `web/login.py`, `reporting.py`, `access.py` | the FastAPI process (`uv run web`): read-only reports, login links, session cookie; not in the container |
 | `reporting-frontend` | webclient | `frontend/` | the React app in the browser; only talks to `reporting-web` |
 | `web-login-tokens` | data-asset | table `web_login_tokens` | a credential while unused; only hashes are stored |
 
@@ -131,7 +131,7 @@ protocol list has no SSH). In-process edges have no protocol and have `metadata.
 | `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged) → `history.commit_turn` |
 | `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `backfill_parent_names` (`get_l1_names`, `upsert_category_parent`), then `refresh_category_names` (`get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
 | `picnic-2fa-login` | `bot.cmd_picnic_login` → `client.start_login` → `auth.LoginFlow.start`; `cmd_picnic_code` → `submit_login_code` → `_install` → `auth.save_token` |
-| `report-login` | `bot.cmd_report` → `web.login.create_login_link` → `web_login_tokens` (the bot and the web app meet only in the database); browser → `POST /api/auth/login` → `redeem_login_token` → cookie; then `/api/hierarchy` and `/api/timeseries` → `queries.report_*` → `web/reports.py` |
+| `report-login` | `bot.cmd_report` → `web.login.create_login_link` → `web_login_tokens` (the bot and the web app meet only in the database); browser → `POST /api/auth/login` → `redeem_login_token` → cookie; then `/api/hierarchy` and `/api/timeseries` → `queries.report_*` → `reporting.py` |
 | `build-and-deploy` | `deploy.yml`: `build-and-push` job, then the `deploy` job over SSH |
 
 Each transition refers to a relationship by id, so a flow is a route through the graph above.

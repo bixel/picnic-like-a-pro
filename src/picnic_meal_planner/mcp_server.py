@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
+from . import reporting
 from .db import queries as db
 from .db.engine import SchemaOutOfDateError, ensure_schema
 from .picnic import client as picnic
@@ -238,6 +239,83 @@ async def get_reorder_due() -> list[dict]:
     async with db.get_db() as conn:
         all_stats = await db.get_all_product_stats(conn)
     return forecasting.get_reorder_due(all_stats)
+
+
+# ---------------------------------------------------------------------------
+# Reporting tools (shared aggregation with the reporting web app)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_report_hierarchy(
+    date_from: str | None = None, date_to: str | None = None
+) -> dict:
+    """Return the order-history category tree with totals per node.
+
+    Mirrors the reporting web app's ``/api/hierarchy``: the tree runs
+    Global → L1 → L2 → L3 → product, each node carrying ``spend`` (cents),
+    ``units`` and ``orders``, with children sorted by spend.
+
+    Args:
+        date_from: Inclusive start day (``YYYY-MM-DD``). Optional.
+        date_to: Inclusive end day (``YYYY-MM-DD``). Optional.
+    """
+    async with db.get_db() as conn:
+        orders = await db.report_orders(conn)
+        order_lines = await db.report_order_lines(conn)
+        products = await db.report_products(conn)
+    days = reporting.order_days(
+        orders, reporting.parse_day(date_from), reporting.parse_day(date_to)
+    )
+    return reporting.hierarchy(reporting.build_lines(days, order_lines), products)
+
+
+@mcp.tool()
+async def get_report_timeseries(
+    level: str = "global",
+    id: str = "all",  # noqa: A002 — the tool argument's name
+    bucket: str = "month",
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    """Return order-history totals over time for one node, with a summary.
+
+    Mirrors the reporting web app's ``/api/timeseries``.
+
+    Args:
+        level: ``global``, ``l1``, ``l2``, ``l3``, ``product`` or
+            ``uncategorised``.
+        id: The node id (``all`` for the global node).
+        bucket: ``week`` or ``month``.
+        date_from: Inclusive start day (``YYYY-MM-DD``). Optional.
+        date_to: Inclusive end day (``YYYY-MM-DD``). Optional.
+    """
+    if bucket not in ("week", "month"):
+        return {"error": f"bucket must be 'week' or 'month', got {bucket!r}."}
+    async with db.get_db() as conn:
+        orders = await db.report_orders(conn)
+        order_lines = await db.report_order_lines(conn)
+        products = await db.report_products(conn)
+    selected = reporting.select_node(products, level, id)
+    if selected is None:
+        return {"error": f"No such category or product: level={level!r} id={id!r}."}
+    path, product_ids = selected
+    days = reporting.order_days(
+        orders, reporting.parse_day(date_from), reporting.parse_day(date_to)
+    )
+    lines = [
+        line
+        for line in reporting.build_lines(days, order_lines)
+        if line.product_id in product_ids
+    ]
+    order_total = None
+    if level == "global":
+        order_total = sum(o["total_price"] or 0 for o in orders if o["id"] in days)
+    return {
+        "path": path,
+        "bucket": bucket,
+        "summary": {**reporting.summary(lines), "order_total": order_total},
+        "buckets": reporting.timeseries(lines, bucket),
+    }
 
 
 # ---------------------------------------------------------------------------

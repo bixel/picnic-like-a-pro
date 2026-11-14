@@ -163,7 +163,8 @@ src/picnic_meal_planner/
 │                     #   caching, persistence, opt-out, deletion
 ├── access.py         # The Telegram user allowlist (bot handlers and the web app)
 ├── api_log.py        # Best-effort Picnic/OpenRouter request logging (URLs, headers, bodies)
-├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting
+├── mcp_server.py     # FastMCP server; 15 tools across Picnic, DB, forecasting, reporting
+├── reporting.py      # Order-history aggregation shared by the web app and MCP server
 ├── db/
 │   ├── __init__.py   # Re-exports: Base, models, get_db, init_db
 │   ├── engine.py     # Async engine, session factory, init_db()
@@ -176,8 +177,7 @@ src/picnic_meal_planner/
 │   └── engine.py     # Urgency-score model (pure Python, no DB access)
 └── web/
     ├── app.py        # FastAPI app: report API, login, serves the built frontend
-    ├── login.py      # One-time login links and the signed session cookie
-    └── reports.py    # Hierarchy / time-series aggregation (pure Python, no DB access)
+    └── login.py      # One-time login links and the signed session cookie
 
 frontend/             # Reporting UI: Vite + React + TypeScript, shadcn/ui, Recharts,
                       #   TanStack Query and Router
@@ -465,7 +465,7 @@ now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
   `queries.py`.  Never add a route that reads conversations, `api_requests`
   or `picnic_auth`.
 - **Aggregation is Python, not SQL.**  The helpers return raw rows and
-  `web/reports.py` (pure, like `forecasting/engine.py`) builds the tree and
+  `reporting.py` (pure, like `forecasting/engine.py`) builds the tree and
   the buckets.  The data is one family's orders, and a parent's order count
   is a distinct count that cannot be summed from its children.
 - **Spend is `quantity × unit_price` of the order lines** at every level, so

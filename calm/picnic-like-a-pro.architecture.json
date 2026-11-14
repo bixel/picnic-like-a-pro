@@ -400,7 +400,7 @@
       "unique-id": "mcp-tool-server",
       "node-type": "service",
       "name": "MCP tool server",
-      "description": "FastMCP server with 15 tools (Picnic, order history, forecasting). The bot calls the tools in-process via get_tool_schemas()/call_tool(); `uv run mcp-server` exposes the same tools over stdio, SSE or streamable HTTP. Tool exceptions are returned as an error result carrying str(exc).",
+      "description": "FastMCP server with 15 tools (Picnic, order history, forecasting, reporting). The bot calls the tools in-process via get_tool_schemas()/call_tool(); `uv run mcp-server` exposes the same tools over stdio, SSE or streamable HTTP. Tool exceptions are returned as an error result carrying str(exc).",
       "interfaces": [
         {
           "unique-id": "mcp-in-process",
@@ -471,6 +471,10 @@
           "forecasting": [
             "forecast_order",
             "get_reorder_due"
+          ],
+          "reporting": [
+            "get_report_hierarchy",
+            "get_report_timeseries"
           ]
         },
         "entrypoint": "mcp-server = picnic_meal_planner.mcp_server:main"
@@ -809,7 +813,7 @@
       "unique-id": "reporting-web",
       "node-type": "service",
       "name": "Reporting web app",
-      "description": "FastAPI app (`uv run web`): read-only reports over the order history, redeeming the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in web/reports.py. Refuses to start when the schema is behind.",
+      "description": "FastAPI app (`uv run web`): read-only reports over the order history, redeeming the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in reporting.py. Refuses to start when the schema is behind.",
       "interfaces": [
         {
           "unique-id": "reports-http",
@@ -896,7 +900,7 @@
         "code": [
           "src/picnic_meal_planner/web/app.py",
           "src/picnic_meal_planner/web/login.py",
-          "src/picnic_meal_planner/web/reports.py",
+          "src/picnic_meal_planner/reporting.py",
           "src/picnic_meal_planner/access.py"
         ]
       }

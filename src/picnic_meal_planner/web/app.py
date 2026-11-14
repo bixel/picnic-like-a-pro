@@ -24,10 +24,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .. import access
+from .. import access, reporting
 from ..db import queries as db
 from ..db.engine import ensure_schema
-from . import login, reports
+from . import login
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +159,8 @@ def create_app() -> FastAPI:
             orders = await db.report_orders(session)
             order_lines = await db.report_order_lines(session)
             products = await db.report_products(session)
-        days = reports.order_days(orders, date_from, date_to)
-        return reports.hierarchy(reports.build_lines(days, order_lines), products)
+        days = reporting.order_days(orders, date_from, date_to)
+        return reporting.hierarchy(reporting.build_lines(days, order_lines), products)
 
     @app.get("/api/timeseries", response_model=TimeSeries)
     async def timeseries(
@@ -175,14 +175,14 @@ def create_app() -> FastAPI:
             orders = await db.report_orders(session)
             order_lines = await db.report_order_lines(session)
             products = await db.report_products(session)
-        selected = reports.select_node(products, level, id)
+        selected = reporting.select_node(products, level, id)
         if selected is None:
             raise HTTPException(status_code=404, detail="No such category or product.")
         path, product_ids = selected
-        days = reports.order_days(orders, date_from, date_to)
+        days = reporting.order_days(orders, date_from, date_to)
         lines = [
             line
-            for line in reports.build_lines(days, order_lines)
+            for line in reporting.build_lines(days, order_lines)
             if line.product_id in product_ids
         ]
         order_total = None
@@ -191,8 +191,8 @@ def create_app() -> FastAPI:
         return {
             "path": path,
             "bucket": bucket,
-            "summary": {**reports.summary(lines), "order_total": order_total},
-            "buckets": reports.timeseries(lines, bucket),
+            "summary": {**reporting.summary(lines), "order_total": order_total},
+            "buckets": reporting.timeseries(lines, bucket),
         }
 
     @app.get("/{path:path}", include_in_schema=False)
