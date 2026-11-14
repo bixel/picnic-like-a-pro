@@ -71,7 +71,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 # Ensure the src package is importable when run as a script
@@ -91,38 +90,10 @@ from picnic_meal_planner.picnic import client as picnic
 SKIP_STATUSES = {"CANCELLED"}
 DEFER_STATUSES = {"CURRENT"}
 
-# Every further request would fail the same way.  PicnicRateLimited gets here
-# only once the backoff has given up.
-_STOP_ERRORS = (
-    picnic.PicnicLoginRequired,
-    picnic.PicnicLoginPending,
-    picnic.PicnicRateLimited,
-)
-
-# A Retry-After beyond this ends the run's category work instead of waiting.
-_MAX_BACKOFF_SECONDS = 15 * 60
-
-_sleep = asyncio.sleep  # replaced by the tests
-
-
-async def _with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
-    """``await func(*args)``, waiting and retrying while Picnic rate limits.
-
-    Raises :class:`picnic.PicnicRateLimited` once the retries are used up, or
-    when Picnic asks for a wait longer than ``_MAX_BACKOFF_SECONDS``.
-    """
-    retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
-    base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
-    for attempt in range(retries + 1):
-        try:
-            return await func(*args)
-        except picnic.PicnicRateLimited as exc:
-            wait = exc.retry_after if exc.retry_after is not None else base * 2**attempt
-            if attempt == retries or wait > _MAX_BACKOFF_SECONDS:
-                raise
-            print(f"  {exc} Waiting {wait:.0f} s (retry {attempt + 1}/{retries})...", flush=True)
-            await _sleep(wait)
-    raise AssertionError("unreachable")
+# Shared with repair_order_prices.py, defined next to PicnicRateLimited.
+_STOP_ERRORS = picnic.STOP_ERRORS
+_MAX_BACKOFF_SECONDS = picnic.MAX_BACKOFF_SECONDS
+_with_backoff = picnic.with_backoff
 
 
 def _now() -> str:

@@ -143,7 +143,8 @@ SQLite's `INSERT … ON CONFLICT DO UPDATE/NOTHING` dialect is used via
 `sqlalchemy.dialects.sqlite.insert`.  This keeps the insert operations
 idempotent for re-imports.
 
-- `upsert_product`: full upsert (update all mutable columns on conflict).
+- `upsert_product`: full upsert (updates `name`, `unit_quantity`, `image_id`
+  and `last_seen_at` on conflict; `unit_price` only when the key is present).
   It never touches the category; see "Picnic Categories".
 - `upsert_category`: insert, or update the name (and `l1_id` when given) of
   an existing L3 — unless its stored `l2_id` differs, see below.
@@ -471,6 +472,9 @@ now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
 - **Spend is `quantity × unit_price` of the order lines** at every level, so
   a node equals the sum of its children.  `orders.total_price` (fees,
   deposits) is shown only for the global node, as `order_total`.
+- **`products.unit_price` is the current catalogue price**, never order data:
+  it is written by search and by `scripts/repair_order_prices.py`'s backfill,
+  and order imports leave it alone.
 - **An order's date** is `delivered_at`, else `ordered_at`, as the calendar
   day written in the stored string.  An order with neither is left out.
 - **Nodes are `(level, id)` with string ids.**  Names are `null` until the
@@ -531,10 +535,10 @@ now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
 | `WEB_BASE_URL` | `http://localhost:8080` | Base of the links `/report` sends; https makes the cookie `Secure` |
 | `WEB_SESSION_SECRET` | — | Signs the session cookie; unset = random per process (sessions end on restart) |
 | `WEB_STATIC_DIR` | `frontend/dist` | The built frontend served by `uv run web` |
-| `IMPORT_BATCH_SIZE` | `10` | Deliveries per batch in import script |
-| `IMPORT_DELAY_SECONDS` | `2` | Pause between import batches |
-| `IMPORT_BACKOFF_SECONDS` | `60` | First wait after Picnic rate limits a category lookup; doubles per retry |
-| `IMPORT_BACKOFF_RETRIES` | `4` | Retries after a rate limit before the run's category lookups stop |
+| `IMPORT_BATCH_SIZE` | `10` | Deliveries/orders/products per batch in the import and repair scripts |
+| `IMPORT_DELAY_SECONDS` | `2` | Pause between batches in the import and repair scripts |
+| `IMPORT_BACKOFF_SECONDS` | `60` | First wait after a Picnic rate limit; doubles per retry |
+| `IMPORT_BACKOFF_RETRIES` | `4` | Retries after a rate limit before the run stops |
 | `CATEGORY_REFRESH_DAYS` | `30` | Refresh category names older than this; `0` = never |
 | `CATEGORY_RETRY_DAYS` | `7` | Retry a name lookup that found nothing after this; `0` = every run |
 | `CATEGORY_REFRESH_LIMIT` | `20` | L2 pages refreshed per import run |
@@ -555,6 +559,7 @@ uv run web                            # start the reporting UI (http://localhost
 (cd frontend && npm ci && npm run build)  # build the UI that `uv run web` serves
 make api-types                        # regenerate the frontend's API types
 uv run python scripts/import_history.py  # import new Picnic deliveries (re-runnable)
+uv run python scripts/repair_order_prices.py  # one-off: repair stored order-line and catalogue prices
 uv run alembic upgrade head           # apply all pending migrations
 uv run alembic revision --autogenerate -m "msg"  # generate migration from model diff
 uv run alembic downgrade -1           # roll back one migration
