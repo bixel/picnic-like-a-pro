@@ -453,21 +453,11 @@ async def get_article_price(product_id: str) -> int | None:
     price, which would not match the pack price search stores.  Login errors
     propagate.
     """
-    from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
-
-    try:
-        article = await _call("get_article", product_id)
-    except PicnicParseError:
-        # TODO(review): dead code — get_article(add_category=False) never raises
-        # PicnicParseError (it returns None for a missing article), so this
-        # except never fires.
-        return None
+    article = await _call("get_article", product_id)
     if article is None:
         return None
     if isinstance(article, dict):  # the mock client
-        # TODO(review): mock articles carry only "price"; "display_price" is
-        # vestigial here (the real Article model has no display_price field).
-        price = article.get("display_price") or article.get("price")
+        price = article.get("price")
         return int(price) if price else None
     if getattr(article, "is_bundle", False):
         # Bundle/multipack pages expose only a per-unit price; search stores the
@@ -573,9 +563,10 @@ def _normalise_product(raw: dict) -> dict:
 def _price_per_unit(line_price: Any, quantity: int) -> int | None:
     if not isinstance(line_price, int) or quantity <= 0:
         return None
-    # TODO(review): round() is banker's rounding, so round(199/2) == 100 and a
-    # "2 for 1.99" line stores unit_price 100 -> total 200 (1 cent over). For a
-    # per-unit spend price consider rounding up (ceil) instead.
+    # A per-unit price is an integer, so a line total not divisible by the
+    # quantity is reproduced to within half a unit (199 over 2 stores 100, a
+    # 1-cent over-count).  The exact paid total is not stored separately, so
+    # this is the closest the schema allows.
     return round(line_price / quantity)
 
 
