@@ -1,4 +1,7 @@
-"""Order-history aggregation for the reporting UI (pure Python, no DB access).
+"""Order-history aggregation shared by the reporting web app and the MCP server.
+
+Pure Python, no DB access: both callers load raw rows through
+``db.queries.report_*`` and pass them in.
 
 The category tree is Global → L1 → L2 → L3 → product.  A node is addressed by
 ``(level, id)`` with string ids; products without a category sit under one
@@ -203,4 +206,48 @@ def summary(lines: list[Line]) -> dict:
         **totals.as_dict(),
         "first_order": min(days).isoformat() if days else None,
         "last_order": max(days).isoformat() if days else None,
+    }
+
+
+def hierarchy_report(
+    orders: list[dict],
+    order_lines: list[dict],
+    products: list[dict],
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict:
+    """Build the hierarchy report from raw query rows and inclusive date bounds."""
+    days = order_days(orders, date_from, date_to)
+    return hierarchy(build_lines(days, order_lines), products)
+
+
+def timeseries_report(
+    orders: list[dict],
+    order_lines: list[dict],
+    products: list[dict],
+    level: str,
+    node_id: str,
+    bucket: str,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict | None:
+    """Build a node's time-series report, or return ``None`` for an unknown node."""
+    selected = select_node(products, level, node_id)
+    if selected is None:
+        return None
+    path, product_ids = selected
+    days = order_days(orders, date_from, date_to)
+    lines = [
+        line
+        for line in build_lines(days, order_lines)
+        if line.product_id in product_ids
+    ]
+    order_total = None
+    if level == "global":
+        order_total = sum(o["total_price"] or 0 for o in orders if o["id"] in days)
+    return {
+        "path": path,
+        "bucket": bucket,
+        "summary": {**summary(lines), "order_total": order_total},
+        "buckets": timeseries(lines, bucket),
     }
