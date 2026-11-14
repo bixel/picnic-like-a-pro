@@ -1,6 +1,7 @@
 """Repair ``order_items.unit_price`` and backfill ``products.unit_price``.
 
-One-off repair for the order-price bug in ``ISSUE_ORDER_PRICES.md``.
+One-off repair for the wrong order-line-price bug (promotions ignored and
+the 432199 placeholder stored for mixed promo lines).
 
 The payloads of past deliveries are not stored, so every delivery is fetched
 again (one ``get_delivery`` each) and its order lines are re-read with the
@@ -58,6 +59,10 @@ _sleep = asyncio.sleep
 
 async def _with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
     """``await func(*args)``, waiting and retrying while Picnic rate limits."""
+    # TODO(review): duplicated verbatim from scripts/import_history.py
+    # (_with_backoff, _STOP_ERRORS, _MAX_BACKOFF_SECONDS). Keep them in sync or
+    # extract a shared helper — the import_history copy is test-covered via the
+    # `_sleep` monkeypatch, this one is not.
     retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
     base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
     for attempt in range(retries + 1):
@@ -114,6 +119,12 @@ async def repair_orders() -> None:
                 if order_id is None:
                     skipped += 1
                     continue
+                # TODO(review): re-inserting without upserting the product
+                # first. An order whose `products` row is missing (or whose
+                # re-fetched article id differs from the stored one) raises an
+                # unhandled FK IntegrityError at commit() and aborts the whole
+                # run. Upsert the product first (cf. import_history.py) or wrap
+                # this block in try/except + continue.
                 await db.delete_order_items(conn, order_id)
                 for item in items:
                     await db.insert_order_item(
@@ -170,6 +181,10 @@ async def backfill_product_prices() -> None:
         if prices:
             async with db.get_db() as conn:
                 for product_id, price in prices.items():
+                    # TODO(review): get_article_price() returns None for BOTH
+                    # "delisted" and "listed but price unreadable"; writing None
+                    # here clears a valid products.unit_price permanently.
+                    # Treat None as skip, not clear.
                     await db.set_product_unit_price(conn, product_id, price)
                 await conn.commit()
 
@@ -188,6 +203,11 @@ async def main() -> None:
     except SchemaOutOfDateError as exc:
         raise SystemExit(str(exc)) from None
     async with api_log.request_context("repair_order_prices"):
+        # TODO(review): repair_orders() swallows a rate-limit stop (returns None
+        # on _STOP_ERRORS) but main() still runs backfill_product_prices(), which
+        # issues more get_article calls against a blocked Picnic and wastes the
+        # full backoff sequence. Have repair_orders() return `stopped: bool` and
+        # skip the backfill when true.
         await repair_orders()
         await backfill_product_prices()
     removed = await api_log.prune_expired()

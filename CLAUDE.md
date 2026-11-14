@@ -144,6 +144,8 @@ SQLite's `INSERT … ON CONFLICT DO UPDATE/NOTHING` dialect is used via
 idempotent for re-imports.
 
 - `upsert_product`: full upsert (update all mutable columns on conflict).
+  <!-- TODO(review): "all mutable columns" is now inaccurate — `unit_price` is
+       written only when the key is present (see db/queries.py). Update this line. -->
   It never touches the category; see "Picnic Categories".
 - `upsert_category`: insert, or update the name (and `l1_id` when given) of
   an existing L3 — unless its stored `l2_id` differs, see below.
@@ -531,6 +533,9 @@ now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
 | `WEB_BASE_URL` | `http://localhost:8080` | Base of the links `/report` sends; https makes the cookie `Secure` |
 | `WEB_SESSION_SECRET` | — | Signs the session cookie; unset = random per process (sessions end on restart) |
 | `WEB_STATIC_DIR` | `frontend/dist` | The built frontend served by `uv run web` |
+<!-- TODO(review): the four IMPORT_* rows below are described as import-specific,
+     but scripts/repair_order_prices.py also reads them (delivery fetches and
+     product price lookups, not category lookups). Broaden the wording. -->
 | `IMPORT_BATCH_SIZE` | `10` | Deliveries per batch in import script |
 | `IMPORT_DELAY_SECONDS` | `2` | Pause between import batches |
 | `IMPORT_BACKOFF_SECONDS` | `60` | First wait after Picnic rate limits a category lookup; doubles per retry |

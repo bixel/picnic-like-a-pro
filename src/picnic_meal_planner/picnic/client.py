@@ -417,20 +417,32 @@ async def get_article_price(product_id: str) -> int | None:
     One request.  Used by the repair script to backfill ``products.unit_price``.
     ``None`` when Picnic has no page for the product any more, or the page has
     no price.  The value is the *current* price — possibly an on-sale price —
-    which matches what ``search_products`` stores as ``unit_price``.  Login
-    errors propagate.
+    which matches what ``search_products`` stores as ``unit_price``.  Bundles
+    and multipacks are skipped (``None``): their page exposes only a per-unit
+    price, which would not match the pack price search stores.  Login errors
+    propagate.
     """
     from python_picnic_api2 import PicnicParseError  # noqa: PLC0415
 
     try:
         article = await _call("get_article", product_id)
     except PicnicParseError:
+        # TODO(review): dead code — get_article(add_category=False) never raises
+        # PicnicParseError (it returns None for a missing article), so this
+        # except never fires.
         return None
     if article is None:
         return None
     if isinstance(article, dict):  # the mock client
+        # TODO(review): mock articles carry only "price"; "display_price" is
+        # vestigial here (the real Article model has no display_price field).
         price = article.get("display_price") or article.get("price")
         return int(price) if price else None
+    if getattr(article, "is_bundle", False):
+        # Bundle/multipack pages expose only a per-unit price; search stores the
+        # pack price, so skip rather than write a per-unit value under a pack's
+        # product id.
+        return None
     price = getattr(article, "price", None)
     return price if isinstance(price, int) else None
 
@@ -530,7 +542,26 @@ def _normalise_product(raw: dict) -> dict:
 def _price_per_unit(line_price: Any, quantity: int) -> int | None:
     if not isinstance(line_price, int) or quantity <= 0:
         return None
+    # TODO(review): round() is banker's rounding, so round(199/2) == 100 and a
+    # "2 for 1.99" line stores unit_price 100 -> total 200 (1 cent over). For a
+    # per-unit spend price consider rounding up (ceil) instead.
     return round(line_price / quantity)
+
+
+#: The sentinel Picnic used to put in ``ORDER_ARTICLE.price`` for mixed-promo
+#: lines (4321.99 €).  It is not a real price and must never be stored.
+_PLACEHOLDER_PRICE = 432199
+
+
+def _article_price_or_none(entry: dict, article: dict) -> int | None:
+    """The article's own price, or ``None`` when it is the placeholder.
+
+    Only used when a nested line carries no line-level paid price.  A real
+    article price is kept; the 432199 placeholder from historical payloads is
+    rejected so it is never stored as spend.
+    """
+    price = entry.get("unit_price") or article.get("unit_price") or article.get("price")
+    return price if isinstance(price, int) and price != _PLACEHOLDER_PRICE else None
 
 
 def _line_paid_price(line: dict) -> int | None:
@@ -554,12 +585,18 @@ def _split_price(total: int, quantities: list[int]) -> list[int]:
     """Split ``total`` cents across articles in proportion to ``quantities``.
 
     Returns one per-unit price per article.  ``sum(p * q for p, q in
-    zip(result, quantities)) == total`` whenever a subset of the quantities sums
-    to the remainder — in particular for a mix-and-match line ("3 für 5.99€"),
-    where every article has quantity 1.  For mixed quantities a per-article
-    integer split can be unrepresentable (e.g. ``[2, 2]`` and an odd total);
-    the leftover cents are then left unassigned, so the line is at most a cent
-    or two off, which is acceptable for a split Picnic does not specify.
+    zip(result, quantities)) == total`` whenever the remainder can be formed
+    from the quantities — in particular for a mix-and-match line ("3 für
+    5.99€"), where every article has quantity 1 and the split is always exact.
+
+    For mixed quantities the split can be lossy: a +1 cent goes to a per-*unit*
+    price, so it moves the line total by that article's quantity, and a
+    remainder no combination of quantities reaches cannot be represented at all
+    (e.g. ``[5, 5]`` can only hit multiples of 5).  The greedy in-order fill can
+    also leave a remainder it could have avoided.  The unassigned leftover is
+    therefore up to the smallest quantity minus one in the uniform case, and a
+    little more for mixed quantities — several cents, not one or two — which is
+    acceptable for a split Picnic does not specify.
     """
     if not quantities:
         return []
@@ -605,7 +642,8 @@ def delivery_line_items(detail: dict) -> list[dict]:
     what was actually paid (see :func:`_line_paid_price`).  Each article carries
     the product and, in a ``QUANTITY`` decorator, the count.  A line holding
     several articles is a mix-and-match promotion whose paid price is split
-    across them.
+    across them.  A line with no paid price at all falls back to each article's
+    own price, unless that price is the 432199 placeholder.
 
     ``unit_price`` is the paid price per unit and feeds ``order_items`` (spend).
     The product dict deliberately carries no ``unit_price``: order data is not a
@@ -635,15 +673,21 @@ def delivery_line_items(detail: dict) -> list[dict]:
                 continue
 
             if isinstance(nested, list):
-                # Real payload: the paid price comes from the line, never from
-                # the article (its ``price`` is a placeholder in past deliveries).
+                # Real payload: the paid price comes from the line (``PRICE``
+                # decorator, else the line's own price).  When the line carries
+                # none, fall back to the article's own price — but never the
+                # 432199 placeholder.
                 paid = _line_paid_price(line)
-                if len(entries) == 1:
-                    unit_prices = [_price_per_unit(paid, entries[0][3])]
-                elif isinstance(paid, int):
-                    unit_prices = _split_price(paid, [q for _, _, _, q in entries])
+                if isinstance(paid, int):
+                    if len(entries) == 1:
+                        unit_prices = [_price_per_unit(paid, entries[0][3])]
+                    else:
+                        unit_prices = _split_price(paid, [q for _, _, _, q in entries])
                 else:
-                    unit_prices = [None] * len(entries)
+                    unit_prices = [
+                        _article_price_or_none(entry, article)
+                        for entry, article, _, _ in entries
+                    ]
             else:
                 # Flat mock / legacy wrapper: keep the article's own price.
                 unit_prices = [

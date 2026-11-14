@@ -123,6 +123,31 @@ class TestGetArticlePrice:
     async def test_unknown_product_is_none(self):
         assert await picnic.get_article_price("p_nonexistent") is None
 
+    async def test_bundle_is_skipped(self, monkeypatch):
+        # Bundle pages expose only a per-unit price; skip rather than store it.
+        class Article:
+            is_bundle = True
+            price = 250
+
+        class Api:
+            def get_article(self, article_id):
+                return Article()
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_article_price("s1") is None
+
+    async def test_ordinary_article_returns_price(self, monkeypatch):
+        class Article:
+            is_bundle = False
+            price = 250
+
+        class Api:
+            def get_article(self, article_id):
+                return Article()
+
+        monkeypatch.setattr(picnic, "_client", Api())
+        assert await picnic.get_article_price("s1") == 250
+
 
 class TestGetL3Names:
     async def test_names_every_l3_on_the_l2_page(self, monkeypatch):
@@ -455,6 +480,40 @@ class TestDeliveryLineItems:
         }
         items = picnic.delivery_line_items({"orders": [{"items": [line]}]})
         assert [i["unit_price"] for i in items] == [500, 499]
+
+    def test_nested_line_without_line_price_falls_back_to_article_price(self):
+        # No line-level price and no PRICE decorator: keep the article's price.
+        line = {
+            "items": [
+                {"id": "s1", "price": 189,
+                 "decorators": [{"type": "QUANTITY", "quantity": 2}]},
+            ],
+        }
+        [item] = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert item["unit_price"] == 189
+
+    def test_nested_line_without_line_price_rejects_placeholder(self):
+        # The 432199 placeholder is never stored, even via the fallback.
+        line = {
+            "items": [
+                {"id": "s1", "price": 432199,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            ],
+        }
+        [item] = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert item["unit_price"] is None
+
+    def test_nested_mixed_line_without_line_price_uses_each_article_price(self):
+        line = {
+            "items": [
+                {"id": "a", "price": 100,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+                {"id": "b", "price": 250,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            ],
+        }
+        items = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert [i["unit_price"] for i in items] == [100, 250]
 
     def test_article_without_id_is_skipped(self):
         detail = {"orders": [{"items": [{"items": [{"name": "?"}], "price": 5}]}]}
