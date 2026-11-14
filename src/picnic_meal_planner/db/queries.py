@@ -1193,7 +1193,7 @@ async def consume_login_token(session: AsyncSession, token_hash: str) -> int | N
 
 
 # ---------------------------------------------------------------------------
-# Reporting UI: raw rows (aggregated by web/reports.py)
+# Reporting: raw rows (aggregated by reporting.py, shared by the web app and MCP)
 # ---------------------------------------------------------------------------
 
 async def report_orders(session: AsyncSession) -> list[dict]:

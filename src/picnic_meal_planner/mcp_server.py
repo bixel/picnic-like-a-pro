@@ -1,4 +1,4 @@
-"""FastMCP server exposing Picnic, DB, and forecasting tools.
+"""FastMCP server exposing Picnic, DB, forecasting, and reporting tools.
 
 Transport is selected via MCP_TRANSPORT env var:
   stdio  (default) — for Claude Desktop
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
+from . import reporting
 from .db import queries as db
 from .db.engine import SchemaOutOfDateError, ensure_schema
 from .picnic import client as picnic
@@ -238,6 +239,97 @@ async def get_reorder_due() -> list[dict]:
     async with db.get_db() as conn:
         all_stats = await db.get_all_product_stats(conn)
     return forecasting.get_reorder_due(all_stats)
+
+
+# ---------------------------------------------------------------------------
+# Reporting tools (shared aggregation with the reporting web app)
+# ---------------------------------------------------------------------------
+
+def _parse_report_date(value: str | None, name: str) -> date | None:
+    """Parse a strict optional MCP date bound, unlike lenient stored timestamps."""
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be YYYY-MM-DD, got {value!r}.") from None
+    return parsed
+
+
+@mcp.tool()
+async def get_report_hierarchy(
+    date_from: str | None = None, date_to: str | None = None
+) -> dict:
+    """Return the order-history category tree with totals per node.
+
+    Mirrors the reporting web app's ``/api/hierarchy``: the tree runs
+    Global → L1 → L2 → L3 → product, each node carrying ``spend`` (cents),
+    ``units`` and ``orders``, with children sorted by spend.
+
+    Args:
+        date_from: Inclusive start day (``YYYY-MM-DD``). Optional.
+        date_to: Inclusive end day (``YYYY-MM-DD``). Optional.
+    """
+    try:
+        start = _parse_report_date(date_from, "date_from")
+        end = _parse_report_date(date_to, "date_to")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    async with db.get_db() as conn:
+        orders = await db.report_orders(conn)
+        order_lines = await db.report_order_lines(conn)
+        products = await db.report_products(conn)
+    return reporting.hierarchy_report(
+        orders, order_lines, products, date_from=start, date_to=end
+    )
+
+
+@mcp.tool()
+async def get_report_timeseries(
+    level: str = "global",
+    id: str = "all",  # noqa: A002 — the tool argument's name
+    bucket: str = "month",
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    """Return order-history totals over time for one node, with a summary.
+
+    Mirrors the reporting web app's ``/api/timeseries``.
+
+    Args:
+        level: ``global``, ``l1``, ``l2``, ``l3``, ``product`` or
+            ``uncategorised``.
+        id: The node id (``all`` for the global node).
+        bucket: ``week`` or ``month``.
+        date_from: Inclusive start day (``YYYY-MM-DD``). Optional.
+        date_to: Inclusive end day (``YYYY-MM-DD``). Optional.
+    """
+    if bucket not in ("week", "month"):
+        return {"error": f"bucket must be 'week' or 'month', got {bucket!r}."}
+    try:
+        start = _parse_report_date(date_from, "date_from")
+        end = _parse_report_date(date_to, "date_to")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    async with db.get_db() as conn:
+        orders = await db.report_orders(conn)
+        order_lines = await db.report_order_lines(conn)
+        products = await db.report_products(conn)
+    report = reporting.timeseries_report(
+        orders,
+        order_lines,
+        products,
+        level,
+        id,
+        bucket,
+        date_from=start,
+        date_to=end,
+    )
+    if report is None:
+        return {"error": f"No such category or product: level={level!r} id={id!r}."}
+    return report
 
 
 # ---------------------------------------------------------------------------
