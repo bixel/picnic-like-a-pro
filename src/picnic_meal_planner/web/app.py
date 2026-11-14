@@ -159,8 +159,9 @@ def create_app() -> FastAPI:
             orders = await db.report_orders(session)
             order_lines = await db.report_order_lines(session)
             products = await db.report_products(session)
-        days = reporting.order_days(orders, date_from, date_to)
-        return reporting.hierarchy(reporting.build_lines(days, order_lines), products)
+        return reporting.hierarchy_report(
+            orders, order_lines, products, date_from=date_from, date_to=date_to
+        )
 
     @app.get("/api/timeseries", response_model=TimeSeries)
     async def timeseries(
@@ -175,25 +176,19 @@ def create_app() -> FastAPI:
             orders = await db.report_orders(session)
             order_lines = await db.report_order_lines(session)
             products = await db.report_products(session)
-        selected = reporting.select_node(products, level, id)
-        if selected is None:
+        report = reporting.timeseries_report(
+            orders,
+            order_lines,
+            products,
+            level,
+            id,
+            bucket,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        if report is None:
             raise HTTPException(status_code=404, detail="No such category or product.")
-        path, product_ids = selected
-        days = reporting.order_days(orders, date_from, date_to)
-        lines = [
-            line
-            for line in reporting.build_lines(days, order_lines)
-            if line.product_id in product_ids
-        ]
-        order_total = None
-        if level == "global":
-            order_total = sum(o["total_price"] or 0 for o in orders if o["id"] in days)
-        return {
-            "path": path,
-            "bucket": bucket,
-            "summary": {**reporting.summary(lines), "order_total": order_total},
-            "buckets": reporting.timeseries(lines, bucket),
-        }
+        return report
 
     @app.get("/{path:path}", include_in_schema=False)
     async def frontend(path: str) -> FileResponse:

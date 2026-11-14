@@ -1,4 +1,4 @@
-"""Reporting UI: aggregation, login links, session cookies and the HTTP API."""
+"""Reporting UI: login links, session cookies and the HTTP API."""
 
 from __future__ import annotations
 

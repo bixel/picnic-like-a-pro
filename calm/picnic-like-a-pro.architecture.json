@@ -4,7 +4,7 @@
     "name": "Picnic Like a Pro",
     "description": "CALM architecture of the Picnic Like a Pro Telegram grocery and meal-planning assistant.",
     "repository": "https://github.com/bixel/picnic-like-a-pro",
-    "schema-revision": "0008"
+    "schema-revision": "0009"
   },
   "nodes": [
     {
@@ -554,6 +554,17 @@
       }
     },
     {
+      "unique-id": "reporting-engine",
+      "node-type": "service",
+      "name": "Reporting engine",
+      "description": "Pure-Python order-history aggregation shared by the MCP reporting tools and the reporting web app. Builds hierarchies, node selections, summaries and time buckets from caller-supplied rows. No I/O.",
+      "metadata": {
+        "code": [
+          "src/picnic_meal_planner/reporting.py"
+        ]
+      }
+    },
+    {
       "unique-id": "db-access-layer",
       "node-type": "service",
       "name": "Database access layer",
@@ -813,7 +824,7 @@
       "unique-id": "reporting-web",
       "node-type": "service",
       "name": "Reporting web app",
-      "description": "FastAPI app (`uv run web`): read-only reports over the order history, redeeming the one-time login links /report hands out, and the built frontend from the same origin. Aggregation is pure Python in reporting.py. Refuses to start when the schema is behind.",
+      "description": "FastAPI app (`uv run web`): read-only reports over the order history, redeeming the one-time login links /report hands out, and serving the built frontend from the same origin. Calls the shared reporting engine for aggregation. Refuses to start when the schema is behind.",
       "interfaces": [
         {
           "unique-id": "reports-http",
@@ -900,7 +911,6 @@
         "code": [
           "src/picnic_meal_planner/web/app.py",
           "src/picnic_meal_planner/web/login.py",
-          "src/picnic_meal_planner/reporting.py",
           "src/picnic_meal_planner/access.py"
         ]
       }
@@ -1292,6 +1302,23 @@
       }
     },
     {
+      "unique-id": "tools-report",
+      "description": "get_report_hierarchy and get_report_timeseries pass raw order rows to the shared reporting functions.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "mcp-tool-server"
+          },
+          "destination": {
+            "node": "reporting-engine"
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
       "unique-id": "picnic-client-calls-picnic",
       "description": "python-picnic-api2 is synchronous, so calls run in a thread-pool executor.",
       "relationship-type": {
@@ -1647,6 +1674,7 @@
             "picnic-client",
             "mock-picnic-api",
             "forecasting-engine",
+            "reporting-engine",
             "db-access-layer",
             "sqlite-db",
             "import-history-job",
@@ -1691,6 +1719,7 @@
             "mcp-tool-server",
             "picnic-client",
             "forecasting-engine",
+            "reporting-engine",
             "db-access-layer",
             "sqlite-db",
             "import-history-job",
@@ -1771,6 +1800,23 @@
           },
           "destination": {
             "node": "db-access-layer"
+          }
+        }
+      },
+      "metadata": {
+        "transport": "in-process call"
+      }
+    },
+    {
+      "unique-id": "reports-aggregate",
+      "description": "Report endpoints pass raw order rows to the shared hierarchy, selection, summary and time series functions.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "reporting-web"
+          },
+          "destination": {
+            "node": "reporting-engine"
           }
         }
       },
@@ -1866,23 +1912,28 @@
           "description": "Forecast tools rank products by urgency."
         },
         {
-          "relationship-unique-id": "bot-calls-llm",
+          "relationship-unique-id": "tools-report",
           "sequence-number": 17,
+          "description": "Reporting tools pass raw order rows to the shared aggregation functions."
+        },
+        {
+          "relationship-unique-id": "bot-calls-llm",
+          "sequence-number": 18,
           "description": "Loop: the conversation including tool results goes back to the model until it stops."
         },
         {
           "relationship-unique-id": "bot-uses-history",
-          "sequence-number": 18,
+          "sequence-number": 19,
           "description": "commit_turn() archives the turn if it ended cleanly."
         },
         {
           "relationship-unique-id": "history-persists",
-          "sequence-number": 19,
+          "sequence-number": 20,
           "description": "append_turn() writes all messages of the turn under one turn_id."
         },
         {
           "relationship-unique-id": "bot-polls-telegram",
-          "sequence-number": 20,
+          "sequence-number": 21,
           "description": "The reply is sent, split into 4096-character chunks."
         }
       ]
@@ -2051,7 +2102,12 @@
         {
           "relationship-unique-id": "reports-query-db",
           "sequence-number": 8,
-          "description": "Orders, order lines, products and categories are read and aggregated."
+          "description": "Orders, order lines, products and categories are loaded."
+        },
+        {
+          "relationship-unique-id": "reports-aggregate",
+          "sequence-number": 9,
+          "description": "The hierarchy, selected-node summary and time buckets are constructed."
         }
       ]
     }

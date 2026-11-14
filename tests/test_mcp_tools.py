@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -269,6 +270,12 @@ class TestGetReportHierarchyTool:
         tree = await get_report_hierarchy(date_from="2999-01-01")
         assert tree["orders"] == 0 and tree["children"] == []
 
+    @pytest.mark.parametrize("parameter", ["date_from", "date_to"])
+    @pytest.mark.parametrize("value", ["soon", "2026-02-30", "2026-01-01junk"])
+    async def test_invalid_dates_return_error(self, parameter, value):
+        result = await get_report_hierarchy(**{parameter: value})
+        assert result == {"error": f"{parameter} must be YYYY-MM-DD, got {value!r}."}
+
 
 class TestGetReportTimeseriesTool:
     async def test_global_series(self, seeded_db_path):
@@ -284,6 +291,22 @@ class TestGetReportTimeseriesTool:
         assert data["summary"]["spend"] == node["spend"]
         assert data["summary"]["order_total"] is None
         assert [c["level"] for c in data["path"]] == ["l1"]
+
+    async def test_global_series_respects_the_date_range(self, seeded_db_path):
+        full = await get_report_timeseries()
+        date_from = (datetime.now(timezone.utc) - timedelta(days=70)).date().isoformat()
+        filtered = await get_report_timeseries(date_from=date_from)
+
+        assert 0 < filtered["summary"]["orders"] < full["summary"]["orders"]
+        assert sum(b["spend"] for b in filtered["buckets"]) == filtered["summary"]["spend"]
+        assert filtered["summary"]["order_total"] == filtered["summary"]["spend"]
+        assert 0 < filtered["summary"]["order_total"] < full["summary"]["order_total"]
+
+    @pytest.mark.parametrize("parameter", ["date_from", "date_to"])
+    @pytest.mark.parametrize("value", ["soon", "2026-02-30", "2026-01-01junk"])
+    async def test_invalid_dates_return_error(self, parameter, value):
+        result = await get_report_timeseries(**{parameter: value})
+        assert result == {"error": f"{parameter} must be YYYY-MM-DD, got {value!r}."}
 
     async def test_unknown_node_returns_error(self, seeded_db_path):
         assert "error" in await get_report_timeseries(level="l3", id="999999")
@@ -330,6 +353,10 @@ class TestCallTool:
 
     async def test_dispatch_clear_cart_without_confirm(self):
         assert "warning" in await call_tool("clear_cart", {"confirm": False})
+
+    async def test_report_validation_error_reaches_the_bot(self):
+        result = await call_tool("get_report_hierarchy", {"date_from": "not-a-date"})
+        assert result == {"error": "date_from must be YYYY-MM-DD, got 'not-a-date'."}
 
     async def test_tool_exception_is_returned_as_error(self, monkeypatch):
         """A raising tool must not propagate — call_tool converts it to an error dict."""

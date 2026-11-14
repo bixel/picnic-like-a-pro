@@ -466,8 +466,13 @@ now, a local tool: it binds `127.0.0.1` and is not in the Docker image.
   or `picnic_auth`.
 - **Aggregation is Python, not SQL.**  The helpers return raw rows and
   `reporting.py` (pure, like `forecasting/engine.py`) builds the tree and
-  the buckets.  The data is one family's orders, and a parent's order count
-  is a distinct count that cannot be summed from its children.
+  the buckets.  Its `hierarchy_report` and `timeseries_report` functions own
+  the full response composition for both HTTP and MCP; adapters only load rows
+  and translate validation/errors.  MCP date bounds must be exact `YYYY-MM-DD`
+  strings, with invalid bounds returned as errors rather than ignored.  The
+  lenient `parse_day` remains reserved for stored order timestamps.  The data
+  is one family's orders, and a parent's order count is a distinct count that
+  cannot be summed from its children.
 - **Spend is `quantity × unit_price` of the order lines** at every level, so
   a node equals the sum of its children.  `orders.total_price` (fees,
   deposits) is shown only for the global node, as `order_total`.

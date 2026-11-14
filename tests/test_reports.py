@@ -127,3 +127,26 @@ class TestReporting:
             "spend": 1110, "units": 8, "orders": 2,
             "first_order": "2026-01-05", "last_order": "2026-03-20",
         }
+
+    def test_report_composition_applies_the_same_date_range(self):
+        date_to = date(2026, 1, 31)
+        tree = reporting.hierarchy_report(ORDERS, ORDER_LINES, PRODUCTS, date_to=date_to)
+        assert (tree["spend"], tree["units"], tree["orders"]) == (800, 3, 1)
+
+        report = reporting.timeseries_report(
+            ORDERS, ORDER_LINES, PRODUCTS, "global", "all", "month", date_to=date_to
+        )
+        assert report["summary"] == {
+            "spend": 800,
+            "units": 3,
+            "orders": 1,
+            "first_order": "2026-01-05",
+            "last_order": "2026-01-05",
+            "order_total": 1000,
+        }
+        assert report["buckets"] == [
+            {"start": "2026-01-01", "spend": 800, "units": 3, "orders": 1}
+        ]
+        assert reporting.timeseries_report(
+            ORDERS, ORDER_LINES, PRODUCTS, "l3", "999", "month"
+        ) is None

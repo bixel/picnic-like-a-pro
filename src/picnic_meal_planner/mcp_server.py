@@ -1,4 +1,4 @@
-"""FastMCP server exposing Picnic, DB, and forecasting tools.
+"""FastMCP server exposing Picnic, DB, forecasting, and reporting tools.
 
 Transport is selected via MCP_TRANSPORT env var:
   stdio  (default) — for Claude Desktop
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,19 @@ async def get_reorder_due() -> list[dict]:
 # Reporting tools (shared aggregation with the reporting web app)
 # ---------------------------------------------------------------------------
 
+def _parse_report_date(value: str | None, name: str) -> date | None:
+    """Parse a strict optional MCP date bound, unlike lenient stored timestamps."""
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be YYYY-MM-DD, got {value!r}.") from None
+    return parsed
+
+
 @mcp.tool()
 async def get_report_hierarchy(
     date_from: str | None = None, date_to: str | None = None
@@ -259,14 +272,18 @@ async def get_report_hierarchy(
         date_from: Inclusive start day (``YYYY-MM-DD``). Optional.
         date_to: Inclusive end day (``YYYY-MM-DD``). Optional.
     """
+    try:
+        start = _parse_report_date(date_from, "date_from")
+        end = _parse_report_date(date_to, "date_to")
+    except ValueError as exc:
+        return {"error": str(exc)}
     async with db.get_db() as conn:
         orders = await db.report_orders(conn)
         order_lines = await db.report_order_lines(conn)
         products = await db.report_products(conn)
-    days = reporting.order_days(
-        orders, reporting.parse_day(date_from), reporting.parse_day(date_to)
+    return reporting.hierarchy_report(
+        orders, order_lines, products, date_from=start, date_to=end
     )
-    return reporting.hierarchy(reporting.build_lines(days, order_lines), products)
 
 
 @mcp.tool()
@@ -291,31 +308,28 @@ async def get_report_timeseries(
     """
     if bucket not in ("week", "month"):
         return {"error": f"bucket must be 'week' or 'month', got {bucket!r}."}
+    try:
+        start = _parse_report_date(date_from, "date_from")
+        end = _parse_report_date(date_to, "date_to")
+    except ValueError as exc:
+        return {"error": str(exc)}
     async with db.get_db() as conn:
         orders = await db.report_orders(conn)
         order_lines = await db.report_order_lines(conn)
         products = await db.report_products(conn)
-    selected = reporting.select_node(products, level, id)
-    if selected is None:
-        return {"error": f"No such category or product: level={level!r} id={id!r}."}
-    path, product_ids = selected
-    days = reporting.order_days(
-        orders, reporting.parse_day(date_from), reporting.parse_day(date_to)
+    report = reporting.timeseries_report(
+        orders,
+        order_lines,
+        products,
+        level,
+        id,
+        bucket,
+        date_from=start,
+        date_to=end,
     )
-    lines = [
-        line
-        for line in reporting.build_lines(days, order_lines)
-        if line.product_id in product_ids
-    ]
-    order_total = None
-    if level == "global":
-        order_total = sum(o["total_price"] or 0 for o in orders if o["id"] in days)
-    return {
-        "path": path,
-        "bucket": bucket,
-        "summary": {**reporting.summary(lines), "order_total": order_total},
-        "buckets": reporting.timeseries(lines, bucket),
-    }
+    if report is None:
+        return {"error": f"No such category or product: level={level!r} id={id!r}."}
+    return report
 
 
 # ---------------------------------------------------------------------------

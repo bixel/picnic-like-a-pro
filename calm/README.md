@@ -6,7 +6,7 @@ flows and controls, validated against the CALM 1.2 schema.
 
 | File | What it is |
 |---|---|
-| `picnic-like-a-pro.architecture.json` | The architecture: 34 nodes, 43 relationships, 5 flows, 19 controls |
+| `picnic-like-a-pro.architecture.json` | The architecture: 35 nodes, 45 relationships, 5 flows, 19 controls |
 | `controls/*.requirement.json` | JSON Schemas for the 5 control kinds; every control's `config` is validated against one |
 | `url-mapping.json` | Maps the controls' published `requirement-url`s to the local files, so validation works offline and before merge |
 | `diagrams/` | PNGs rendered by `calm docify` (overview + one per flow) |
@@ -82,6 +82,7 @@ hops (`metadata.transport: "in-process call"`).
 | `picnic-client` | service | `picnic/client.py`, `picnic/auth.py` | the only code that talks to Picnic; token-first login, 2FA `LoginFlow`, category lookups |
 | `mock-picnic-api` | service | `picnic/mock_client.py` | swapped in by `PICNIC_MOCK=true` |
 | `forecasting-engine` | service | `forecasting/engine.py` | pure functions, no I/O |
+| `reporting-engine` | service | `reporting.py` | shared pure report composition and aggregation, no I/O |
 | `db-access-layer` | service | `db/engine.py`, `db/models.py`, `db/queries.py`, `alembic/` | the only code that touches SQLAlchemy; two engines on one file (`get_db`, and `get_log_db` with a 0.2 s lock timeout) |
 | `sqlite-db` | database | the file at `DB_PATH` | shared by every process in the container |
 | `order-history` | data-asset | tables `products`, `categories`, `category_parents`, `orders`, `order_items`, `import_checkpoints` | |
@@ -94,7 +95,7 @@ hops (`metadata.transport: "in-process call"`).
 | `chat-model-cli` | service | `scripts/chat_model.py` | |
 | `preflight-cli` | service | `scripts/preflight.py` | |
 | `inspect-category-cli` | service | `scripts/inspect_category.py` | diagnostic dump of a product's category pages |
-| `reporting-web` | service | `web/app.py`, `web/login.py`, `reporting.py`, `access.py` | the FastAPI process (`uv run web`): read-only reports, login links, session cookie; not in the container |
+| `reporting-web` | service | `web/app.py`, `web/login.py`, `access.py` | the FastAPI process (`uv run web`): read-only reports via `reporting-engine`, login links, session cookie; not in the container |
 | `reporting-frontend` | webclient | `frontend/` | the React app in the browser; only talks to `reporting-web` |
 | `web-login-tokens` | data-asset | table `web_login_tokens` | a credential while unused; only hashes are stored |
 
@@ -109,8 +110,8 @@ Interfaces name **what a caller uses**, and `connects` relationships refer to th
 - External endpoints carry a URL: `bot-api-https`, `chat-completions`, `picnic-storefront`, `oci-registry`.
 - In-process interfaces list the functions that form the module's surface, e.g.
   `history-api` → `get_context, commit_turn, …`, `mcp-in-process` → `get_tool_schemas, call_tool`.
-- `mcp-tool-server` has three interfaces (in-process, stdio, sse/http). They match the three transports
-  in `ARCHITECTURE.md`.
+- `mcp-tool-server` has three interfaces (in-process, stdio, sse/http). They match the `MCP_TRANSPORT`
+  settings documented in `CLAUDE.md`.
 
 ### Relationships
 
@@ -128,10 +129,10 @@ protocol list has no SSH). In-process edges have no protocol and have `metadata.
 
 | Flow | Code path |
 |---|---|
-| `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged) → `history.commit_turn` |
+| `chat-turn` | `bot._chat` → `_run_llm` (inside `api_log.request_context`) → `history.get_context` → `llm.create_message` ↔ `mcp_server.call_tool` (loop, every HTTP call logged, reporting tools call `reporting-engine`) → `history.commit_turn` |
 | `history-import` | `scripts/import_history.py`: `import_deliveries`, then `backfill_categories` (`get_category_ids`, `get_l3_names`, `upsert_category`), then `backfill_parent_names` (`get_l1_names`, `upsert_category_parent`), then `refresh_category_names` (`get_l3_names`, `upsert_category`), then `api_log.prune_expired` |
 | `picnic-2fa-login` | `bot.cmd_picnic_login` → `client.start_login` → `auth.LoginFlow.start`; `cmd_picnic_code` → `submit_login_code` → `_install` → `auth.save_token` |
-| `report-login` | `bot.cmd_report` → `web.login.create_login_link` → `web_login_tokens` (the bot and the web app meet only in the database); browser → `POST /api/auth/login` → `redeem_login_token` → cookie; then `/api/hierarchy` and `/api/timeseries` → `queries.report_*` → `reporting.py` |
+| `report-login` | `bot.cmd_report` → `web.login.create_login_link` → `web_login_tokens` (the bot and the web app meet only in the database); browser → `POST /api/auth/login` → `redeem_login_token` → cookie; then `/api/hierarchy` and `/api/timeseries` → `queries.report_*` → `reporting-engine` |
 | `build-and-deploy` | `deploy.yml`: `build-and-push` job, then the `deploy` job over SSH |
 
 Each transition refers to a relationship by id, so a flow is a route through the graph above.
