@@ -116,6 +116,14 @@ class TestGetCategoryIds:
         assert await picnic.get_category_ids("s1") is None
 
 
+class TestGetArticlePrice:
+    async def test_mock_product_price(self):
+        assert await picnic.get_article_price("p_milk_whole") == 119
+
+    async def test_unknown_product_is_none(self):
+        assert await picnic.get_article_price("p_nonexistent") is None
+
+
 class TestGetL3Names:
     async def test_names_every_l3_on_the_l2_page(self, monkeypatch):
         l2_page = {"children": [
@@ -397,15 +405,56 @@ class TestDeliveryLineItems:
     def test_real_payload_unit_price_from_line_price(self):
         [item] = picnic.delivery_line_items(REAL_DELIVERY)
         assert item["unit_price"] == 169
-        assert item["product"]["unit_price"] == 169
+        assert "unit_price" not in item["product"]
 
-    def test_multi_article_line_falls_back_to_article_price(self):
-        line = {"items": [
-            {"id": "a", "price": 100, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
-            {"id": "b", "price": 250, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
-        ], "price": 999}
+    def test_promo_decorator_wins_over_line_price(self):
+        # "jetzt 1.99€": the line's regular price is 299, the paid price 199.
+        line = {
+            "price": 299,
+            "decorators": [{"type": "PRICE", "display_price": 199}],
+            "items": [
+                {"id": "s1", "price": 432199,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            ],
+        }
+        [item] = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert item["unit_price"] == 199
+
+    def test_mixed_promo_line_splits_paid_price(self):
+        # Three different products grouped by "3 für 5.99€"; each article's
+        # ``price`` is the 432199 placeholder and must be ignored.
+        line = {
+            "price": 747,
+            "decorators": [
+                {"type": "PRICE", "display_price": 599},
+                {"type": "PROMO", "text": "3 für 5.99€"},
+            ],
+            "items": [
+                {"id": "s1024698", "price": 432199,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+                {"id": "s1030505", "price": 432199,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+                {"id": "s1030462", "price": 432199,
+                 "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            ],
+        }
         items = picnic.delivery_line_items({"orders": [{"items": [line]}]})
-        assert [i["unit_price"] for i in items] == [100, 250]
+        assert [i["unit_price"] for i in items] == [200, 200, 199]
+        assert sum(i["unit_price"] * i["quantity"] for i in items) == 599
+        for item in items:
+            assert item["unit_price"] != 432199
+            assert "unit_price" not in item["product"]
+
+    def test_mixed_line_without_promo_splits_line_price(self):
+        line = {
+            "price": 999,
+            "items": [
+                {"id": "a", "price": 100, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+                {"id": "b", "price": 250, "decorators": [{"type": "QUANTITY", "quantity": 1}]},
+            ],
+        }
+        items = picnic.delivery_line_items({"orders": [{"items": [line]}]})
+        assert [i["unit_price"] for i in items] == [500, 499]
 
     def test_article_without_id_is_skipped(self):
         detail = {"orders": [{"items": [{"items": [{"name": "?"}], "price": 5}]}]}

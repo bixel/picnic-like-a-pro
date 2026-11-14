@@ -53,6 +53,14 @@ class TestUpsertProduct:
         await db_session.commit()
         assert (await db.get_product(db_session, "p_test_milk"))["unit_price"] is None
 
+    async def test_upsert_without_unit_price_key_keeps_existing_price(self, db_session):
+        await db.upsert_product(db_session, SAMPLE_PRODUCT)
+        await db.upsert_product(db_session, {"id": SAMPLE_PRODUCT["id"], "name": "Renamed"})
+        await db_session.commit()
+        row = await db.get_product(db_session, "p_test_milk")
+        assert row["name"] == "Renamed"
+        assert row["unit_price"] == 119
+
     async def test_upsert_sets_last_seen_at(self, db_session):
         await db.upsert_product(db_session, SAMPLE_PRODUCT)
         await db_session.commit()

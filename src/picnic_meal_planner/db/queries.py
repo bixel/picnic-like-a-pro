@@ -68,8 +68,21 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
     """Insert or update a product row (keyed on ``product["id"]``).
 
     The category is not touched: only :func:`set_product_category` sets it.
+
+    ``unit_price`` is written only when the key is present.  Order data never
+    carries it (``delivery_line_items`` omits it), so an import leaves the
+    catalogue price set by a search or the repair backfill untouched; an
+    explicit ``"unit_price": None`` still clears it.
     """
     insert = sqlite_insert(Product)
+    updates = dict(
+        name=product.get("name", ""),
+        unit_quantity=product.get("unit_quantity"),
+        image_id=product.get("image_id"),
+        last_seen_at=_now(),
+    )
+    if "unit_price" in product:
+        updates["unit_price"] = product.get("unit_price")
     stmt = (
         insert
         .values(
@@ -82,16 +95,19 @@ async def upsert_product(session: AsyncSession, product: dict) -> None:
         )
         .on_conflict_do_update(
             index_elements=["id"],
-            set_=dict(
-                name=product.get("name", ""),
-                unit_price=product.get("unit_price"),
-                unit_quantity=product.get("unit_quantity"),
-                image_id=product.get("image_id"),
-                last_seen_at=_now(),
-            ),
+            set_=updates,
         )
     )
     await session.execute(stmt)
+
+
+async def set_product_unit_price(
+    session: AsyncSession, product_id: str, unit_price: int | None
+) -> None:
+    """Set a product's catalogue price, leaving every other column alone."""
+    await session.execute(
+        update(Product).where(Product.id == product_id).values(unit_price=unit_price)
+    )
 
 
 async def get_product(session: AsyncSession, product_id: str) -> dict | None:
@@ -425,6 +441,19 @@ async def insert_order_item(
             unit_price=unit_price,
         )
     )
+
+
+async def delete_order_items(session: AsyncSession, order_id: int) -> None:
+    """Delete every order line of *order_id* (used by the price repair)."""
+    await session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
+
+
+async def ordered_product_ids(session: AsyncSession) -> list[str]:
+    """Distinct product ids that appear in at least one order line."""
+    rows = await session.scalars(
+        select(OrderItem.product_id).distinct().order_by(OrderItem.product_id)
+    )
+    return list(rows)
 
 
 async def get_order_history(
