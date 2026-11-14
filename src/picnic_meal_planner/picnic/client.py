@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -50,6 +51,36 @@ class PicnicRateLimited(RuntimeError):
 __all__ = ["PicnicLoginPending", "PicnicLoginRequired"]  # re-exported for callers of this module
 
 logger = logging.getLogger(__name__)
+
+# A bulk run stops on a login demand, or once the rate-limit backoff gives up.
+STOP_ERRORS = (PicnicLoginRequired, PicnicLoginPending, PicnicRateLimited)
+
+# A Retry-After beyond this ends a bulk run's request loop instead of waiting.
+MAX_BACKOFF_SECONDS = 15 * 60
+
+_sleep = asyncio.sleep  # replaced by the tests
+
+
+async def with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
+    """``await func(*args)``, waiting and retrying while Picnic rate limits.
+
+    Raises :class:`PicnicRateLimited` once the retries are used up, or when
+    Picnic asks for a wait longer than :data:`MAX_BACKOFF_SECONDS`.  The
+    many-request scripts (``import_history``, ``repair_order_prices``) share
+    this one policy.
+    """
+    retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
+    base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
+    for attempt in range(retries + 1):
+        try:
+            return await func(*args)
+        except PicnicRateLimited as exc:
+            wait = exc.retry_after if exc.retry_after is not None else base * 2**attempt
+            if attempt == retries or wait > MAX_BACKOFF_SECONDS:
+                raise
+            print(f"  {exc} Waiting {wait:.0f} s (retry {attempt + 1}/{retries})...", flush=True)
+            await _sleep(wait)
+    raise AssertionError("unreachable")
 
 _client = None  # PicnicAPI | MockPicnicAPI | None
 _saved_token: str | None = None  # last token written to / read from the DB
@@ -550,7 +581,7 @@ def _price_per_unit(line_price: Any, quantity: int) -> int | None:
 
 #: The sentinel Picnic used to put in ``ORDER_ARTICLE.price`` for mixed-promo
 #: lines (4321.99 €).  It is not a real price and must never be stored.
-_PLACEHOLDER_PRICE = 432199
+PLACEHOLDER_PRICE = 432199
 
 
 def _article_price_or_none(entry: dict, article: dict) -> int | None:
@@ -561,7 +592,7 @@ def _article_price_or_none(entry: dict, article: dict) -> int | None:
     rejected so it is never stored as spend.
     """
     price = entry.get("unit_price") or article.get("unit_price") or article.get("price")
-    return price if isinstance(price, int) and price != _PLACEHOLDER_PRICE else None
+    return price if isinstance(price, int) and price != PLACEHOLDER_PRICE else None
 
 
 def _line_paid_price(line: dict) -> int | None:

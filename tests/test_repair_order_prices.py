@@ -3,10 +3,9 @@
 Picnic is replaced by in-memory fakes; the database is the per-test SQLite file
 from conftest.
 
-The three ``xfail`` tests pin the known-unfixed blockers (the foreign-key crash,
-the clear-to-NULL backfill, and the backfill running after a stop) so they show
-up as xfailed instead of staying silently uncovered.  Remove each marker when
-its blocker is fixed.
+The blocker fixes are covered directly: a missing `products` row is created
+before re-insert, a `None` lookup clears only a stored placeholder, and
+`main()` skips the backfill (and exits non-zero) after a stop.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.db.models import OrderItem
@@ -58,7 +56,7 @@ def fake_picnic(monkeypatch):
     async def sleep(seconds):
         state["sleeps"].append(seconds)
 
-    monkeypatch.setattr(repair, "_sleep", sleep)
+    monkeypatch.setattr(picnic, "_sleep", sleep)
 
     async def get_delivery(did):
         state["delivery_requests"].append(did)
@@ -202,17 +200,17 @@ async def test_skips_a_delivery_whose_fetch_fails(fake_picnic, capsys):
     assert "could not fetch delivery d1" in capsys.readouterr().out
 
 
-@pytest.mark.xfail(
-    reason="Blocker 2: repair re-inserts without upserting the product row",
-    raises=IntegrityError,
-)
-async def test_a_missing_product_row_aborts_the_run(fake_picnic):
+async def test_missing_product_row_is_created_before_reinsert(fake_picnic):
     # The stored order references p_old, but the re-fetched delivery now names
-    # p_new, which has no products row — the re-insert hits the foreign key.
+    # p_new, which has no products row — the repair must create it first.
     await _seed_order("d1", "p_old", unit_price=999)
     fake_picnic["details"] = {"d1": _detail("d1", product_id="p_new", line_price=300)}
 
     await repair.repair_orders()
+
+    assert await _line_items("d1") == [("p_new", 1, 300)]
+    async with db.get_db() as conn:
+        assert (await db.get_product(conn, "p_new")) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +239,6 @@ async def test_backfill_stops_on_a_rate_limit(fake_picnic, monkeypatch, capsys):
     assert "Stopped:" in capsys.readouterr().err
 
 
-@pytest.mark.xfail(
-    reason="Blocker 3: backfill clears a valid price when the lookup returns None"
-)
 async def test_backfill_keeps_a_valid_price_when_the_lookup_is_none(fake_picnic):
     await _seed_order("d1", "p_a", unit_price=999, catalogue_price=777)
     fake_picnic["prices"] = {"p_a": None}
@@ -252,6 +247,18 @@ async def test_backfill_keeps_a_valid_price_when_the_lookup_is_none(fake_picnic)
 
     async with db.get_db() as conn:
         assert (await db.get_product(conn, "p_a"))["unit_price"] == 777
+
+
+async def test_backfill_clears_a_stored_placeholder_when_delisted(fake_picnic):
+    await _seed_order(
+        "d1", "p_a", unit_price=999, catalogue_price=picnic.PLACEHOLDER_PRICE
+    )
+    fake_picnic["prices"] = {"p_a": None}
+
+    await repair.backfill_product_prices()
+
+    async with db.get_db() as conn:
+        assert (await db.get_product(conn, "p_a"))["unit_price"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -270,14 +277,13 @@ async def test_main_repairs_orders_then_backfills_prices(fake_picnic):
         assert (await db.get_product(conn, "p_milk"))["unit_price"] == 300
 
 
-@pytest.mark.xfail(
-    reason="Blocker 1: main() backfills even after repair_orders() stopped"
-)
 async def test_main_skips_the_backfill_after_a_stop(fake_picnic):
     await _seed_order("d1", "p_milk", unit_price=999, catalogue_price=777)
     fake_picnic["details"] = {"d1": picnic.PicnicLoginRequired("log in")}
     fake_picnic["prices"] = {"p_milk": 300}
 
-    await repair.main()
+    with pytest.raises(SystemExit) as exc:
+        await repair.main()
 
+    assert exc.value.code == 1
     assert fake_picnic["price_requests"] == []

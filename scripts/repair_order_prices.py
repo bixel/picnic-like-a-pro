@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections.abc import Awaitable, Callable
 
 # Ensure the src package is importable when run as a script
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -44,41 +43,17 @@ from picnic_meal_planner.db import queries as db
 from picnic_meal_planner.db.engine import SchemaOutOfDateError, ensure_schema
 from picnic_meal_planner.picnic import client as picnic
 
-# A login or a rate limit that has exhausted its retries ends the run.
-_STOP_ERRORS = (
-    picnic.PicnicLoginRequired,
-    picnic.PicnicLoginPending,
-    picnic.PicnicRateLimited,
-)
-
-# A Retry-After beyond this ends the run instead of waiting.
-_MAX_BACKOFF_SECONDS = 15 * 60
-
-_sleep = asyncio.sleep
+# Shared with import_history.py, defined next to PicnicRateLimited.
+_STOP_ERRORS = picnic.STOP_ERRORS
+_MAX_BACKOFF_SECONDS = picnic.MAX_BACKOFF_SECONDS
+_with_backoff = picnic.with_backoff
 
 
-async def _with_backoff[T](func: Callable[..., Awaitable[T]], *args) -> T:
-    """``await func(*args)``, waiting and retrying while Picnic rate limits."""
-    # TODO(review): duplicated verbatim from scripts/import_history.py
-    # (_with_backoff, _STOP_ERRORS, _MAX_BACKOFF_SECONDS). Keep them in sync or
-    # extract a shared helper — the import_history copy is test-covered via the
-    # `_sleep` monkeypatch, this one is not.
-    retries = int(os.getenv("IMPORT_BACKOFF_RETRIES", "4"))
-    base = float(os.getenv("IMPORT_BACKOFF_SECONDS", "60"))
-    for attempt in range(retries + 1):
-        try:
-            return await func(*args)
-        except picnic.PicnicRateLimited as exc:
-            wait = exc.retry_after if exc.retry_after is not None else base * 2**attempt
-            if attempt == retries or wait > _MAX_BACKOFF_SECONDS:
-                raise
-            print(f"  {exc} Waiting {wait:.0f} s (retry {attempt + 1}/{retries})...", flush=True)
-            await _sleep(wait)
-    raise AssertionError("unreachable")
+async def repair_orders() -> bool:
+    """Rewrite ``order_items.unit_price`` for every stored delivery.
 
-
-async def repair_orders() -> None:
-    """Rewrite ``order_items.unit_price`` for every stored delivery."""
+    Returns ``True`` when a login or rate-limit stop ended the run early.
+    """
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
@@ -86,7 +61,7 @@ async def repair_orders() -> None:
         imported_ids = await db.get_picnic_order_ids(conn)
     if not imported_ids:
         print("No orders to repair.")
-        return
+        return False
 
     order_ids = sorted(imported_ids)
     print(f"Repairing line prices for {len(order_ids)} delivery(ies)...")
@@ -101,7 +76,7 @@ async def repair_orders() -> None:
             except _STOP_ERRORS as exc:
                 print(f"\n  Stopped: {exc}", file=sys.stderr)
                 print(f"  Repaired {repaired}, skipped {skipped} of {len(order_ids)}.")
-                return
+                return True
             except Exception as exc:  # noqa: BLE001 — re-run the script to retry
                 print(f"\n  Warning: could not fetch delivery {picnic_id}: {exc}")
                 skipped += 1
@@ -119,12 +94,11 @@ async def repair_orders() -> None:
                 if order_id is None:
                     skipped += 1
                     continue
-                # TODO(review): re-inserting without upserting the product
-                # first. An order whose `products` row is missing (or whose
-                # re-fetched article id differs from the stored one) raises an
-                # unhandled FK IntegrityError at commit() and aborts the whole
-                # run. Upsert the product first (cf. import_history.py) or wrap
-                # this block in try/except + continue.
+                # A re-fetched delivery can name a product the order never stored
+                # (or one never imported): create it first so the re-insert does
+                # not hit the foreign key — as import_history does.
+                for item in items:
+                    await db.upsert_product(conn, item["product"])
                 await db.delete_order_items(conn, order_id)
                 for item in items:
                     await db.insert_order_item(
@@ -142,10 +116,17 @@ async def repair_orders() -> None:
             await asyncio.sleep(delay_seconds)
 
     print(f"\nDone: repaired {repaired}, skipped {skipped} of {len(order_ids)} delivery(ies).")
+    return False
 
 
-async def backfill_product_prices() -> None:
-    """Write the current catalogue price of every ordered product."""
+async def backfill_product_prices() -> bool:
+    """Write the current catalogue price of every ordered product.
+
+    Returns ``True`` when a rate limit stopped the run early.  A ``None``
+    lookup is not treated as "clear": it can mean the product is delisted *or*
+    that its page was unreadable, so only a stored placeholder (4321.99 €) is
+    cleared; a real price is left alone.
+    """
     batch_size = int(os.getenv("IMPORT_BATCH_SIZE", "10"))
     delay_seconds = float(os.getenv("IMPORT_DELAY_SECONDS", "2"))
 
@@ -153,12 +134,13 @@ async def backfill_product_prices() -> None:
         product_ids = await db.ordered_product_ids(conn)
     if not product_ids:
         print("No products to price.")
-        return
+        return False
 
     print(f"\nLooking up prices for {len(product_ids)} product(s)...")
 
     found = 0
     cleared = 0
+    kept = 0
     stop = False
     for i in range(0, len(product_ids), batch_size):
         batch = product_ids[i : i + batch_size]
@@ -173,19 +155,22 @@ async def backfill_product_prices() -> None:
             except Exception as exc:  # noqa: BLE001 — retried by a later run
                 print(f"  Warning: could not look up price of {product_id}: {exc}")
                 continue
-            if prices[product_id] is not None:
-                found += 1
-            else:
-                cleared += 1
 
         if prices:
             async with db.get_db() as conn:
                 for product_id, price in prices.items():
-                    # TODO(review): get_article_price() returns None for BOTH
-                    # "delisted" and "listed but price unreadable"; writing None
-                    # here clears a valid products.unit_price permanently.
-                    # Treat None as skip, not clear.
-                    await db.set_product_unit_price(conn, product_id, price)
+                    if price is not None:
+                        await db.set_product_unit_price(conn, product_id, price)
+                        found += 1
+                        continue
+                    # None means "delisted or unreadable", not free. Only clear a
+                    # stored placeholder; a real price is left alone.
+                    product = await db.get_product(conn, product_id)
+                    if product and product["unit_price"] == picnic.PLACEHOLDER_PRICE:
+                        await db.set_product_unit_price(conn, product_id, None)
+                        cleared += 1
+                    elif product and product["unit_price"] is not None:
+                        kept += 1
                 await conn.commit()
 
         print(f"  {min(i + batch_size, len(product_ids))}/{len(product_ids)} checked", flush=True)
@@ -194,7 +179,11 @@ async def backfill_product_prices() -> None:
         if i + batch_size < len(product_ids):
             await asyncio.sleep(delay_seconds)
 
-    print(f"Prices found for {found}, cleared for {cleared} of {len(product_ids)} product(s).")
+    print(
+        f"Prices found for {found}, cleared {cleared} placeholder(s), "
+        f"left {kept} unchanged of {len(product_ids)} product(s)."
+    )
+    return stop
 
 
 async def main() -> None:
@@ -202,17 +191,18 @@ async def main() -> None:
         await ensure_schema("the price repair")
     except SchemaOutOfDateError as exc:
         raise SystemExit(str(exc)) from None
+    stopped = False
     async with api_log.request_context("repair_order_prices"):
-        # TODO(review): repair_orders() swallows a rate-limit stop (returns None
-        # on _STOP_ERRORS) but main() still runs backfill_product_prices(), which
-        # issues more get_article calls against a blocked Picnic and wastes the
-        # full backoff sequence. Have repair_orders() return `stopped: bool` and
-        # skip the backfill when true.
-        await repair_orders()
-        await backfill_product_prices()
+        stopped = await repair_orders()
+        if stopped:
+            print("\nOrder repair stopped; skipping the price backfill.", file=sys.stderr)
+        else:
+            stopped = await backfill_product_prices()
     removed = await api_log.prune_expired()
     if removed:
         print(f"Pruned {removed} API request log row(s).")
+    if stopped:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
